@@ -14,16 +14,26 @@ import hashlib
 import json
 import re
 import io
+import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple, Optional, Set, Callable
 from enum import Enum
 from collections import defaultdict
 from datetime import datetime
+from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import pdfplumber
 except ImportError:
     pdfplumber = None
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError:
+    requests = None
+    BeautifulSoup = None
 
 # =============================================================================
 # 1) KERNEL CONSTANTS (INVARIANTS)
@@ -1425,36 +1435,230 @@ def _convert_qc_to_v31_row(qc: QCCandidate, atoms_by_qc: Dict[str, List[Atom]]) 
 # FONCTIONS COMPATIBLES V31
 # =============================================================================
 
+# =============================================================================
+# WEB SCRAPING — REAL MODE FOR V31
+# =============================================================================
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+REQ_TIMEOUT = 20
+MAX_PAGES_SCAN = 200
+MAX_PDF_MB = 30
+SLEEP_BETWEEN_PAGES = 0.15
+
+def _is_http(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return p.scheme in ("http", "https")
+    except Exception:
+        return False
+
+def _is_pdf_link(url: str) -> bool:
+    u = (url or "").lower()
+    return ".pdf" in u and (u.endswith(".pdf") or ".pdf?" in u)
+
+def _same_domain(seed: str, url: str) -> bool:
+    try:
+        return urlparse(seed).netloc == urlparse(url).netloc
+    except Exception:
+        return False
+
+def _safe_get(url: str) -> Optional[Any]:
+    if not requests:
+        return None
+    try:
+        return requests.get(url, headers={"User-Agent": UA}, timeout=REQ_TIMEOUT, allow_redirects=True)
+    except Exception:
+        return None
+
+def _normalize_key(name: str) -> str:
+    s = (name or "").lower()
+    s = re.sub(r"(corrig[eé]|correction|corrige|corr|solution|sujet|énoncé|enonce)", "", s)
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s.strip()
+
+def _filename_from_url(url: str) -> str:
+    try:
+        path = urlparse(url).path
+        fn = path.split("/")[-1] or "document.pdf"
+        if not fn.lower().endswith(".pdf"):
+            fn += ".pdf"
+        return fn
+    except Exception:
+        return "document.pdf"
+
+def _download_pdf_bytes(pdf_url: str) -> Optional[bytes]:
+    r = _safe_get(pdf_url)
+    if not r or r.status_code != 200:
+        return None
+    content = r.content or b""
+    if len(content) > MAX_PDF_MB * 1024 * 1024:
+        return None
+    if not content.startswith(b"%PDF"):
+        if b"%PDF" not in content[:1024]:
+            return None
+    return content
+
+def _crawl_pdf_links(seed_urls: List[str], target_pdf_count: int, progress_callback=None) -> List[str]:
+    if not requests or not BeautifulSoup:
+        return []
+    
+    seed_urls = [u.strip() for u in (seed_urls or []) if u.strip()]
+    seed_urls = [u if _is_http(u) else "https://" + u for u in seed_urls]
+
+    queue = []
+    visited = set()
+    pdfs = []
+
+    for s in seed_urls:
+        queue.append(s)
+
+    pages_scanned = 0
+
+    while queue and pages_scanned < MAX_PAGES_SCAN and len(pdfs) < target_pdf_count:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        pages_scanned += 1
+
+        if progress_callback:
+            progress_callback(0.05 + 0.30 * min(1.0, pages_scanned / MAX_PAGES_SCAN))
+
+        r = _safe_get(url)
+        if not r or r.status_code != 200:
+            continue
+
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "application/pdf" in ctype or _is_pdf_link(url):
+            if url not in pdfs:
+                pdfs.append(url)
+            continue
+
+        html = r.text or ""
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "").strip()
+            if not href:
+                continue
+            nxt = urljoin(url, href)
+
+            if not _is_http(nxt):
+                continue
+
+            if _is_pdf_link(nxt):
+                if nxt not in pdfs:
+                    pdfs.append(nxt)
+                continue
+
+            if any(_same_domain(s, nxt) for s in seed_urls):
+                if nxt not in visited:
+                    queue.append(nxt)
+
+        time.sleep(SLEEP_BETWEEN_PAGES)
+
+    return pdfs
+
 def ingest_real(
     url_list: List[str],
     volume: int,
     matiere: str,
     chapter_filter: Optional[str],
-    progress_callback: Optional[Callable[[float], None]] = None
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
+    progress_callback: Optional[Callable[[float], None]] = None,
+    gte_mode: bool = True
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Fonction d'ingestion compatible V31.
-    
-    En mode Streamlit Cloud, le scraping web peut être limité.
-    Cette fonction accepte aussi des PDFs uploadés directement.
-    
-    Returns:
-        df_src: DataFrame des sujets traités (Fichier, Nature, Année, Téléchargement, Qi_Data)
-        df_atoms: DataFrame des atoms (pour debug)
-        all_qis: Liste de toutes les Qi extraites (format V31)
+    Scrape + download PDFs depuis url_list, puis appelle ingest_from_pdfs().
+    Retourne le même format que ingest_from_pdfs() pour compatibilité UI V31.
     """
     
-    # Pour l'instant, on utilise un mode simplifié sans scraping web
-    # L'utilisateur doit uploader les PDFs directement
-    
-    df_src = pd.DataFrame(columns=["Fichier", "Nature", "Annee", "Telechargement", "Qi_Data"])
-    df_atoms = pd.DataFrame()
-    all_qis = []
-    
+    empty_result = (
+        pd.DataFrame(), 
+        pd.DataFrame(), 
+        [], 
+        {"all_results": [], "total_qi": 0, "total_posable": 0, "total_qc": 0, "total_gte_preview": 0}
+    )
+
     if progress_callback:
-        progress_callback(1.0)
-    
-    return df_src, df_atoms, all_qis
+        progress_callback(0.02)
+
+    # 1) Crawl : récupérer un pool de pdf
+    target_pool = max(20, int(volume) * 6)
+    pdf_links = _crawl_pdf_links(url_list, target_pool, progress_callback=progress_callback)
+
+    if not pdf_links:
+        return empty_result
+
+    # 2) Séparer "corrigés" vs "sujets"
+    corr_words = ("corrig", "correction", "solution", "corr")
+    subjects = []
+    corrections = []
+
+    for u in pdf_links:
+        low = u.lower()
+        if any(w in low for w in corr_words):
+            corrections.append(u)
+        else:
+            subjects.append(u)
+
+    if len(subjects) < volume:
+        subjects = pdf_links[:max(volume, 1)]
+
+    subjects = subjects[:volume]
+
+    # 3) Download en parallèle
+    if progress_callback:
+        progress_callback(0.35)
+
+    downloaded_subjects: List[Tuple[str, bytes]] = []
+    downloaded_corrections: List[Tuple[str, bytes]] = []
+
+    def _dl(u: str):
+        b = _download_pdf_bytes(u)
+        return (u, b)
+
+    # Téléchargement sujets
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(_dl, u): u for u in subjects}
+        done = 0
+        for f in as_completed(futs):
+            done += 1
+            u, b = f.result()
+            if b:
+                downloaded_subjects.append((_filename_from_url(u), b))
+            if progress_callback:
+                progress_callback(0.35 + 0.35 * (done / max(1, len(subjects))))
+
+    # Téléchargement corrigés
+    corr_pool = corrections[:max(10, volume * 3)]
+    if corr_pool:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = {ex.submit(_dl, u): u for u in corr_pool}
+            done = 0
+            for f in as_completed(futs):
+                done += 1
+                u, b = f.result()
+                if b:
+                    downloaded_corrections.append((_filename_from_url(u), b))
+                if progress_callback:
+                    progress_callback(0.70 + 0.15 * (done / max(1, len(corr_pool))))
+
+    if not downloaded_subjects:
+        return empty_result
+
+    # 4) Pipeline standard : ingest_from_pdfs
+    if progress_callback:
+        progress_callback(0.86)
+
+    df_src, df_atoms, all_qis, v104_results = ingest_from_pdfs(
+        pdf_files=downloaded_subjects,
+        matiere=matiere,
+        chapter_filter=chapter_filter,
+        correction_files=downloaded_corrections if downloaded_corrections else None,
+        gte_mode=gte_mode,
+        progress_callback=lambda p: progress_callback(0.86 + 0.14 * p) if progress_callback else None
+    )
+
+    return df_src, df_atoms, all_qis, v104_results
 
 
 def ingest_from_pdfs(
@@ -2005,35 +2209,52 @@ with tab_usine:
         )
 
     # --- EXÉCUTION ---
-    if run and subject_files:
+    if run:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        status_text.text("🔍 Extraction et analyse des PDFs...")
-        
         try:
-            # Préparer les fichiers
-            pdf_list = [(f.name, f.read()) for f in subject_files]
-            for f in subject_files:
-                f.seek(0)
-            
-            corr_list = None
-            if correction_files:
-                corr_list = [(f.name, f.read()) for f in correction_files]
-                for f in correction_files:
-                    f.seek(0)
-            
             chapter_filter = sel_chapitres[0] if sel_chapitres else None
             
-            # Appel adapter V10.4
-            df_src, df_atoms, all_qis, v104_results = ingest_from_pdfs(
-                pdf_files=pdf_list,
-                matiere=sel_matiere,
-                chapter_filter=chapter_filter,
-                correction_files=corr_list,
-                gte_mode=gte_mode,
-                progress_callback=lambda p: progress_bar.progress(p)
-            )
+            # 1) Si PDFs uploadés → pipeline upload
+            if subject_files:
+                status_text.text("🔍 Extraction et analyse des PDFs uploadés...")
+                
+                pdf_list = [(f.name, f.read()) for f in subject_files]
+                for f in subject_files:
+                    f.seek(0)
+                
+                corr_list = None
+                if correction_files:
+                    corr_list = [(f.name, f.read()) for f in correction_files]
+                    for f in correction_files:
+                        f.seek(0)
+                
+                df_src, df_atoms, all_qis, v104_results = ingest_from_pdfs(
+                    pdf_files=pdf_list,
+                    matiere=sel_matiere,
+                    chapter_filter=chapter_filter,
+                    correction_files=corr_list,
+                    gte_mode=gte_mode,
+                    progress_callback=lambda p: progress_bar.progress(p)
+                )
+            
+            # 2) Sinon → pipeline web (scraping + download PDFs)
+            else:
+                url_list = [u.strip() for u in (urls or "").splitlines() if u.strip()]
+                if not url_list:
+                    raise ValueError("Aucune URL fournie et aucun PDF uploadé.")
+                
+                status_text.text("🌐 Scraping des URLs et téléchargement des PDFs...")
+                
+                df_src, df_atoms, all_qis, v104_results = ingest_real(
+                    url_list=url_list,
+                    volume=int(vol),
+                    matiere=sel_matiere,
+                    chapter_filter=chapter_filter,
+                    progress_callback=lambda p: progress_bar.progress(p),
+                    gte_mode=gte_mode
+                )
             
             if all_qis:
                 status_text.text("🧠 Génération des QC...")
@@ -2053,7 +2274,7 @@ with tab_usine:
             else:
                 status_text.empty()
                 progress_bar.empty()
-                st.warning("⚠️ Aucune Qi extraite. Vérifiez les PDFs.")
+                st.warning("⚠️ Aucune Qi extraite. Vérifiez les PDFs ou les URLs.")
                 
         except Exception as e:
             status_text.empty()
