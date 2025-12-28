@@ -185,24 +185,46 @@ def _extract_pdf_text_layout(pdf_bytes: bytes) -> Tuple[str, List[Dict]]:
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
-                # Extraire les mots avec leurs coordonnées
+                # MODE A (prioritaire): extract_text() - souvent meilleur sur BAC
+                text = page.extract_text() or ""
+                
+                if text:
+                    # Vérifier le "glue rate" (mots collés)
+                    words_in_text = text.split()
+                    long_tokens = [w for w in words_in_text if len(w) > 25 and ' ' not in w]
+                    glue_rate = len(long_tokens) / max(len(words_in_text), 1)
+                    
+                    # Si glue rate < 3%, extract_text() est OK
+                    if glue_rate < 0.03:
+                        lines = text.split('\n')
+                        for line in lines:
+                            if line.strip():
+                                all_lines.append((page_num, line.strip()))
+                        pages_info.append({
+                            "page": page_num,
+                            "lines": [l.strip() for l in lines if l.strip()],
+                            "text": text
+                        })
+                        continue
+                
+                # MODE B (fallback): extract_words() si glue rate trop élevé
                 words = page.extract_words(
-                    x_tolerance=3,
+                    x_tolerance=2,
                     y_tolerance=3,
-                    keep_blank_chars=True,
-                    use_text_flow=True
+                    keep_blank_chars=False,
+                    use_text_flow=False
                 )
                 
                 if not words:
-                    # Fallback sur extract_text si extract_words échoue
-                    text = page.extract_text() or ""
+                    # Dernier recours: utiliser extract_text() même avec glue
                     if text:
                         lines = text.split('\n')
                         for line in lines:
-                            all_lines.append((page_num, line))
+                            if line.strip():
+                                all_lines.append((page_num, line.strip()))
                         pages_info.append({
                             "page": page_num,
-                            "lines": lines,
+                            "lines": [l.strip() for l in lines if l.strip()],
                             "text": text
                         })
                     continue
@@ -210,26 +232,16 @@ def _extract_pdf_text_layout(pdf_bytes: bytes) -> Tuple[str, List[Dict]]:
                 # Regrouper les mots par ligne (basé sur coordonnée top)
                 lines_dict = defaultdict(list)
                 for word in words:
-                    # Arrondir top pour grouper les mots sur la même ligne
                     line_key = round(word['top'] / 5) * 5
                     lines_dict[line_key].append(word)
                 
-                # Trier et reconstruire les lignes
+                # Trier et reconstruire les lignes avec espaces
                 page_lines = []
                 for line_key in sorted(lines_dict.keys()):
                     line_words = sorted(lines_dict[line_key], key=lambda w: w['x0'])
                     
-                    # Reconstruire la ligne avec espaces appropriés
-                    line_text = ""
-                    prev_x1 = None
-                    for word in line_words:
-                        if prev_x1 is not None:
-                            # Ajouter espace si gap > seuil
-                            gap = word['x0'] - prev_x1
-                            if gap > 3:
-                                line_text += " "
-                        line_text += word['text']
-                        prev_x1 = word['x1']
+                    # Toujours joindre avec espace par défaut
+                    line_text = " ".join(w['text'] for w in line_words)
                     
                     if line_text.strip():
                         page_lines.append(line_text.strip())
@@ -431,6 +443,7 @@ class BACAtomizer:
     """
     Atomiseur pour sujets de BAC.
     Extrait les vraies questions avec localisation précise.
+    Approche ligne par ligne avec liste noire de contextes.
     """
     
     # Patterns pour détecter les structures
@@ -444,17 +457,38 @@ class BACAtomizer:
         re.IGNORECASE | re.MULTILINE
     )
     
-    QUESTION_PATTERNS = [
-        # "1." ou "1)" ou "1 -" ou "1°"
-        re.compile(r'(?:^|\n)\s*(\d+)\s*[.\)\-°]\s*(.+?)(?=(?:\n\s*\d+\s*[.\)\-°]|\n\s*[a-z]\s*[.\)]|\Z))', re.DOTALL),
-        # "Question 1" ou "Q1"
-        re.compile(r'(?:^|\n)\s*(?:Question|Q)\s*(\d+)\s*[:\-\.]?\s*(.+?)(?=(?:\n\s*(?:Question|Q)\s*\d+|\Z))', re.IGNORECASE | re.DOTALL),
+    # Pattern pour détecter le début d'une question
+    QUESTION_START_PATTERN = re.compile(
+        r'^(\d+)\s*[.\)\-°]\s*(.+)$'
+    )
+    
+    # Pattern pour sous-question
+    SOUS_QUESTION_START_PATTERN = re.compile(
+        r'^([a-z])\s*[.\)]\s*(.+)$'
+    )
+    
+    # Liste noire : lignes qui ne sont PAS des questions (contexte)
+    CONTEXT_BLACKLIST = [
+        "on obtient", "on admet", "on considère", "on suppose", "on sait",
+        "ainsi", "donc", "le réel", "la courbe", "la proportion", 
+        "il existe", "pour modéliser", "pour tout", "soit",
+        "on note", "on pose", "on appelle", "on rappelle",
+        "la figure", "le graphique", "le tableau", "ci-dessous", "ci-dessus",
+        "page", "session", "baccalauréat", "coefficient",
+        "les deux parties", "les parties", "cet exercice",
+        "commun à tous", "candidats ayant",
+        "on définit", "on a donc", "le nombre", "le point",
+        "la tangente", "la droite", "le plan"
     ]
     
-    SOUS_QUESTION_PATTERN = re.compile(
-        r'(?:^|\n)\s*([a-z])\s*[.\)]\s*(.+?)(?=(?:\n\s*[a-z]\s*[.\)]|\n\s*\d+\s*[.\)]|\Z))',
-        re.DOTALL
-    )
+    # Verbes qui indiquent une vraie question
+    QUESTION_VERBS = [
+        "justifier", "démontrer", "montrer", "prouver", "vérifier",
+        "calculer", "déterminer", "trouver", "résoudre", 
+        "exprimer", "simplifier", "développer", "factoriser",
+        "tracer", "représenter", "construire",
+        "déduire", "conclure", "interpréter", "expliquer"
+    ]
     
     def __init__(self, source_file: str):
         self.source_file = source_file
@@ -545,65 +579,124 @@ class BACAtomizer:
             self._extract_questions(block_text, offset, line_to_page)
     
     def _extract_questions(self, text: str, offset: int, line_to_page: Dict):
-        """Extrait les questions numérotées."""
+        """
+        Extrait les questions ligne par ligne.
+        Une question = ligne qui commence par un numéro + continuation contrôlée.
+        """
+        lines = text.split('\n')
         
-        # Essayer les différents patterns
-        questions_found = []
+        current_question = None
+        current_q_num = None
+        current_q_start = offset
         
-        for pattern in self.QUESTION_PATTERNS:
-            for match in pattern.finditer(text):
-                q_num = match.group(1)
-                q_text = match.group(2).strip()
+        line_offset = offset
+        
+        for line in lines:
+            line_stripped = line.strip()
+            
+            if not line_stripped:
+                line_offset += len(line) + 1
+                continue
+            
+            # Vérifier si c'est le début d'une nouvelle question
+            q_match = self.QUESTION_START_PATTERN.match(line_stripped)
+            sq_match = self.SOUS_QUESTION_START_PATTERN.match(line_stripped)
+            
+            if q_match:
+                # Sauvegarder la question précédente
+                if current_question and len(current_question) > 15:
+                    self._save_question(current_question, current_q_num, None, current_q_start, line_to_page)
                 
-                if len(q_text) > 15:  # Filtrer les questions trop courtes
-                    questions_found.append({
-                        'num': q_num,
-                        'text': q_text,
-                        'start': match.start(),
-                        'end': match.end()
-                    })
+                # Nouvelle question
+                current_q_num = q_match.group(1)
+                current_question = q_match.group(2).strip()
+                current_q_start = line_offset
+                
+            elif sq_match:
+                # Sauvegarder la question précédente
+                if current_question and len(current_question) > 15:
+                    self._save_question(current_question, current_q_num, None, current_q_start, line_to_page)
+                
+                # Nouvelle sous-question
+                sq_letter = sq_match.group(1)
+                current_question = sq_match.group(2).strip()
+                current_q_start = line_offset
+                # Garder le numéro de question parent, ajouter la sous-question
+                self._save_question(current_question, current_q_num, sq_letter, current_q_start, line_to_page)
+                current_question = None
+                
+            elif current_question:
+                # Vérifier si c'est une continuation valide ou un contexte à ignorer
+                if self._is_context_line(line_stripped):
+                    # Sauvegarder la question et reset
+                    if len(current_question) > 15:
+                        self._save_question(current_question, current_q_num, None, current_q_start, line_to_page)
+                    current_question = None
+                else:
+                    # Continuation limitée (max 150 chars supplémentaires)
+                    if len(current_question) < 200:
+                        current_question += " " + line_stripped
+            
+            line_offset += len(line) + 1
         
-        # Dédupliquer par position
-        seen_positions = set()
-        unique_questions = []
-        for q in sorted(questions_found, key=lambda x: x['start']):
-            if q['start'] not in seen_positions:
-                unique_questions.append(q)
-                seen_positions.add(q['start'])
+        # Sauvegarder la dernière question
+        if current_question and len(current_question) > 15:
+            self._save_question(current_question, current_q_num, None, current_q_start, line_to_page)
+    
+    def _is_context_line(self, line: str) -> bool:
+        """Vérifie si une ligne est du contexte (pas une question)."""
+        line_lower = line.lower()
         
-        # Créer les AtomizedQuestion
-        for q in unique_questions:
-            page = self._get_page_for_position(offset + q['start'], text, line_to_page)
-            
-            locator = QuestionLocator(
-                page=page,
-                exercice=self.current_exercice,
-                partie=self.current_partie,
-                question=q['num'],
-                line_start=offset + q['start'],
-                line_end=offset + q['end']
-            )
-            
-            # Extraire les sous-questions
-            sous_questions = list(self.SOUS_QUESTION_PATTERN.finditer(q['text']))
-            
-            if sous_questions:
-                for sq in sous_questions:
-                    sq_locator = QuestionLocator(
-                        page=page,
-                        exercice=self.current_exercice,
-                        partie=self.current_partie,
-                        question=q['num'],
-                        sous_question=sq.group(1),
-                        line_start=locator.line_start,
-                        line_end=locator.line_end
-                    )
-                    
-                    sq_text = sq.group(2).strip()
-                    if len(sq_text) > 15:
-                        self._add_question(sq_text, sq_locator)
-            else:
-                self._add_question(q['text'], locator)
+        # Vérifier la liste noire
+        for bl in self.CONTEXT_BLACKLIST:
+            if line_lower.startswith(bl):
+                return True
+        
+        # Lignes très courtes sans verbe = probablement contexte
+        if len(line) < 10 and not any(v in line_lower for v in ["?", "calculer", "démontrer", "justifier", "vérifier"]):
+            return True
+        
+        return False
+    
+    def _save_question(self, text: str, q_num: Optional[str], sq_letter: Optional[str], 
+                       start_pos: int, line_to_page: Dict):
+        """Sauvegarde une question extraite si elle est valide."""
+        # Nettoyer
+        text = self._clean_question_text(text)
+        
+        if len(text) < 15:
+            return
+        
+        # Vérifier que c'est une vraie question (contient un verbe de question)
+        text_lower = text.lower()
+        has_question_verb = any(v in text_lower for v in self.QUESTION_VERBS)
+        has_question_mark = "?" in text
+        
+        # Rejeter si commence par un contexte
+        for bl in self.CONTEXT_BLACKLIST:
+            if text_lower.startswith(bl):
+                return
+        
+        # Accepter si verbe de question OU point d'interrogation
+        if not has_question_verb and not has_question_mark:
+            # Accepter quand même si c'est court et bien formaté
+            if len(text) > 100:
+                return
+        
+        # Obtenir la page
+        page = self._get_page_for_position(start_pos, "", line_to_page)
+        
+        # Créer le locator
+        locator = QuestionLocator(
+            page=page,
+            exercice=self.current_exercice,
+            partie=self.current_partie,
+            question=q_num,
+            sous_question=sq_letter,
+            line_start=start_pos
+        )
+        
+        self._add_question(text, locator)
     
     def _add_question(self, text: str, locator: QuestionLocator):
         """Ajoute une question après validation."""
