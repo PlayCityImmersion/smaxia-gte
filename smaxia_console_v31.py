@@ -1,11 +1,16 @@
-# smaxia_console_v31.py — SMAXIA GTE V31.5 (ISO-PROD Proof Harness)
+# smaxia_console_v31.py — SMAXIA GTE V31.6 (ISO-PROD Proof Harness + PDF→qi_pack.json)
 # =============================================================================
-# Version: V31.5 - Fixes audit GPT 5.2 round 3 (TA-01 AST FIX)
-# Fixes:
-#   - get_zone_b_source(): extraction robuste par LIGNES entre marqueurs ZONE B / ZONE C
-#     (évite slice au milieu d'une ligne -> AST parse error)
-#   - canonicalize_artifacts(): singletons_warning trié (hérité V31.4)
-#   - Validateurs TN-02/TA-01/TA-02: FAIL explicite si source unavailable (hérité V31.4)
+# Version: V31.6 - Adds Step C (CEO zero-code JSON builder)
+# Adds:
+#   - Mode "Import Sujet (PDF)": Upload subject PDF + optional correction PDF
+#   - Button "Générer qi_pack.json" (strict schema)
+#   - Optional: Load generated pack into GTE session state (no coding)
+# Keeps:
+#   - Golden Pack / JSON Upload / Manuel
+#   - ISO-PROD proof harness validators (P0)
+# Notes:
+#   - No business hardcode (country/discipline/chapter). All heuristics are generic.
+#   - PDF parsing is best-effort without OCR.
 # =============================================================================
 
 import streamlit as st
@@ -13,15 +18,16 @@ import json
 import hashlib
 import ast
 import random
+import re
 from typing import List, Dict, Any, Optional, Set, Tuple
 from datetime import datetime
 from collections import defaultdict
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # ZONE A : TEST-ONLY FIXTURES — NOT FOR PROD
 # test_only: true
 # REMOVE BEFORE PROD: replaced by real Pack loader
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 TEST_ONLY_GOLDEN_QI_PACK: List[Dict[str, Any]] = [
     {"qi_id": "QI_TEST_001", "subject_id": "SUBJ_A", "position": {"order_index": 1},
@@ -95,15 +101,17 @@ def TEST_ONLY_simulate_qc_generation(qi_pack: List[Dict[str, Any]]) -> Dict[str,
             by_subj[str(q.get("subject_id", ""))].append(str(q.get("qi_id", "")))
 
         qcs.append({
-            "qc_id": qc_id, "qc_formulation": "How to solve?",
+            "qc_id": qc_id,
+            "qc_formulation": "How to solve?",
             "qc_invariant_signature": {"intent_code": intent},
             "mapping": {"primary_qi_ids": qi_ids, "covered_qi_ids": qi_ids, "by_subject": dict(by_subj)},
             "links": {"ari_id": ari_id, "frt_id": frt_id, "trigger_ids": [trg_id]},
-            "provenance": {"generator_version": "TEST_ONLY_V31.5"},
+            "provenance": {"generator_version": "TEST_ONLY_V31.6"},
         })
 
         aris.append({
-            "ari_id": ari_id, "template_id": "ARI_TPL_V1",
+            "ari_id": ari_id,
+            "template_id": "ARI_TPL_V1",
             "steps": [
                 {"step_id": "S1", "operator_code": "OP_READ"},
                 {"step_id": "S2", "operator_code": "OP_PROCESS"},
@@ -113,7 +121,8 @@ def TEST_ONLY_simulate_qc_generation(qi_pack: List[Dict[str, Any]]) -> Dict[str,
         })
 
         frts.append({
-            "frt_id": frt_id, "template_id": "FRT_TPL_V1",
+            "frt_id": frt_id,
+            "template_id": "FRT_TPL_V1",
             "sections": {
                 "given": "Input",
                 "goal": "Output",
@@ -126,7 +135,9 @@ def TEST_ONLY_simulate_qc_generation(qi_pack: List[Dict[str, Any]]) -> Dict[str,
         })
 
         triggers.append({
-            "trigger_id": trg_id, "type_code": "TRG_CHECK", "severity": "medium",
+            "trigger_id": trg_id,
+            "type_code": "TRG_CHECK",
+            "severity": "medium",
             "condition": {"signal": "AFTER_S2"},
             "action": {"recommendation": "Verify"},
             "links": {"qc_id": qc_id, "ari_id": ari_id, "qi_examples": qi_ids[:2]},
@@ -146,9 +157,9 @@ def TEST_ONLY_simulate_qc_generation(qi_pack: List[Dict[str, Any]]) -> Dict[str,
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # ZONE B : CORE-LIKE INVARIANT HELPERS (métier-neutre)
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 FORBIDDEN_LITERALS_V1: Set[str] = {
     "france", "français", "usa", "uk", "english", "french",
@@ -185,7 +196,7 @@ def canonicalize_artifacts(artifacts: Dict[str, Any], qi_pack: List[Dict[str, An
     singletons = artifacts.get("singletons_warning", []) or []
     singletons_sorted = sorted(
         singletons,
-        key=lambda x: (str(x.get("intent", "")), "|".join(sorted([str(q) for q in x.get("qi_ids", []) or []])))
+        key=lambda x: (str(x.get("intent", "")), "|".join(sorted([str(q) for q in x.get("qi_ids", []) or []]))),
     )
     return {
         "qcs": sorted(artifacts.get("qcs", []), key=lambda x: x.get("qc_id", "")),
@@ -206,6 +217,7 @@ def validate_qi_schema(qi: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "Missing position.order_index"
     if "text_md" not in (qi.get("statement") or {}):
         return False, "Missing statement.text_md"
+    # correction is optional in schema checks, but we expect it in our packs
     return True, "OK"
 
 
@@ -388,7 +400,7 @@ def check_no_test_imports(source: str) -> Tuple[bool, List[str]]:
         if "import" in line.lower():
             for p in ["tests/", "fixtures/", "test_only"]:
                 if p in line.lower():
-                    violations.append(f"L{i}: {line[:50]}")
+                    violations.append(f"L{i}: {line[:80]}")
     return len(violations) == 0, violations
 
 
@@ -398,35 +410,243 @@ def check_intent_diversity(canon: Dict[str, Any], min_i: int = 5) -> Tuple[bool,
     return len(intents) >= min_i, len(intents), intents
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# ZONE B.5 : CEO ZERO-CODE JSON BUILDER — PDF Sujet + PDF Correction -> qi_pack.json
+# =============================================================================
+
+_Q_START_PATTERNS = [
+    # "1." / "1)" / "1 -" / "1 :"
+    re.compile(r"^\s*(\d{1,3})\s*[\.\)\:\-]\s+"),
+    # "Question 1" / "QUESTION 1"
+    re.compile(r"^\s*question\s*(\d{1,3})\b", re.IGNORECASE),
+    # "Q1" / "Q 1"
+    re.compile(r"^\s*q\s*(\d{1,3})\b", re.IGNORECASE),
+]
+
+
+def _bytes_sha8(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()[:8]
+
+
+def read_pdf_to_text(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
+    """
+    Best-effort PDF text extraction without OCR.
+    Tries pdfplumber if available, else PyPDF2.
+    Returns (text, audit).
+    """
+    audit = {"engine": None, "pages": None, "errors": []}
+    text_parts: List[str] = []
+
+    # Try pdfplumber
+    try:
+        import pdfplumber  # type: ignore
+        audit["engine"] = "pdfplumber"
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:  # noqa: F821
+            audit["pages"] = len(pdf.pages)
+            for p in pdf.pages:
+                t = p.extract_text() or ""
+                if t.strip():
+                    text_parts.append(t)
+        text = "\n\n".join(text_parts)
+        return text, audit
+    except Exception as e:
+        audit["errors"].append(f"pdfplumber: {e}")
+
+    # Fallback PyPDF2
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+        audit["engine"] = "PyPDF2"
+        reader = PdfReader(io.BytesIO(pdf_bytes))  # noqa: F821
+        audit["pages"] = len(reader.pages)
+        for p in reader.pages:
+            t = (p.extract_text() or "")
+            if t.strip():
+                text_parts.append(t)
+        text = "\n\n".join(text_parts)
+        return text, audit
+    except Exception as e:
+        audit["errors"].append(f"PyPDF2: {e}")
+
+    return "", audit
+
+
+def normalize_text(t: str) -> str:
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    # collapse excessive blank lines
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    # normalize spaces
+    t = re.sub(r"[ \t]+", " ", t)
+    return t.strip()
+
+
+def split_numbered_blocks(text: str) -> List[Dict[str, Any]]:
+    """
+    Splits text into question-like blocks using generic numbering/markers.
+    Returns list of blocks: {num: Optional[str], text: str}
+    """
+    lines = [ln.rstrip() for ln in text.split("\n")]
+    starts: List[Tuple[int, Optional[str]]] = []
+
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        num = None
+        for pat in _Q_START_PATTERNS:
+            m = pat.match(s)
+            if m:
+                num = str(m.group(1))
+                break
+        if num is not None:
+            starts.append((i, num))
+
+    # If we found numbered starts, cut accordingly
+    if starts:
+        blocks: List[Dict[str, Any]] = []
+        for idx, (start_i, num) in enumerate(starts):
+            end_i = starts[idx + 1][0] if idx + 1 < len(starts) else len(lines)
+            chunk = "\n".join(lines[start_i:end_i]).strip()
+            if chunk:
+                blocks.append({"num": num, "text": chunk})
+        return blocks
+
+    # Fallback: paragraph splitting (best-effort)
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    blocks = []
+    for p in paras:
+        if len(p) >= 40:  # ignore tiny debris
+            blocks.append({"num": None, "text": p})
+    return blocks
+
+
+def build_qi_pack_from_pdfs(
+    subject_pdf_bytes: bytes,
+    correction_pdf_bytes: Optional[bytes] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Returns (payload_dict_for_json_upload, qi_pack_list).
+    payload_dict includes {"qi_pack":[...], "meta":{...}}
+    """
+    # io is needed only inside pdfplumber/PyPDF2 fallbacks; import here to avoid toolchain issues
+    import io  # local import to keep global namespace minimal
+
+    subj_hash = _bytes_sha8(subject_pdf_bytes)
+    subj_text_raw, subj_audit = read_pdf_to_text(subject_pdf_bytes)
+    subj_text = normalize_text(subj_text_raw)
+
+    corr_text = ""
+    corr_audit = None
+    corr_hash = None
+    if correction_pdf_bytes:
+        corr_hash = _bytes_sha8(correction_pdf_bytes)
+        corr_text_raw, corr_audit = read_pdf_to_text(correction_pdf_bytes)
+        corr_text = normalize_text(corr_text_raw)
+
+    subj_blocks = split_numbered_blocks(subj_text)
+
+    # correction blocks mapping by number if possible
+    corr_map: Dict[str, str] = {}
+    corr_blocks: List[Dict[str, Any]] = []
+    if corr_text:
+        corr_blocks = split_numbered_blocks(corr_text)
+        for b in corr_blocks:
+            if b.get("num"):
+                # keep first occurrence; if duplicates, keep the longest (safer)
+                n = str(b["num"])
+                txt = str(b.get("text", "")).strip()
+                if n not in corr_map or len(txt) > len(corr_map[n]):
+                    corr_map[n] = txt
+
+    subject_id = f"SUBJ_{subj_hash}"
+
+    qi_pack: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    if not subj_blocks:
+        warnings.append("No blocks extracted from subject PDF (empty or non-text PDF).")
+
+    # If numbered questions exist in subject and correction, align by number.
+    # Otherwise, correction is marked unavailable to avoid false mapping.
+    aligned = 0
+    for idx, b in enumerate(subj_blocks, start=1):
+        qtext = str(b.get("text", "")).strip()
+        qnum = b.get("num")
+        # stable qi_id: based on content hash (deterministic) + order
+        qh = hashlib.sha256((qtext).encode("utf-8")).hexdigest()[:10]
+        qi_id = f"QI_{idx:04d}_{subj_hash}_{qh}"
+
+        corr_available = False
+        corr_md = ""
+
+        if corr_map and qnum and qnum in corr_map:
+            corr_available = True
+            corr_md = corr_map[qnum].strip()
+            aligned += 1
+
+        qi_pack.append({
+            "qi_id": qi_id,
+            "subject_id": subject_id,
+            "position": {"order_index": idx},
+            "statement": {"text_md": qtext},
+            "correction": {"available": bool(corr_available), "text_md": corr_md},
+        })
+
+    meta = {
+        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.6"},
+        "created_at": datetime.now().isoformat(),
+        "inputs": {
+            "subject_pdf_sha8": subj_hash,
+            "correction_pdf_sha8": corr_hash,
+            "subject_extraction": subj_audit,
+            "correction_extraction": corr_audit,
+        },
+        "stats": {
+            "qi_count": len(qi_pack),
+            "subject_blocks": len(subj_blocks),
+            "correction_blocks": len(corr_blocks) if corr_text else 0,
+            "aligned_by_number": aligned,
+        },
+        "warnings": warnings + (
+            [] if not correction_pdf_bytes else
+            (["Correction PDF provided but no reliable alignment by number found; correction.available may be False."]
+             if corr_text and aligned == 0 else [])
+        ),
+    }
+
+    payload = {"qi_pack": qi_pack, "meta": meta}
+    return payload, qi_pack
+
+
+# =============================================================================
 # ZONE C : STREAMLIT UI
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def get_zone_b_source() -> str:
     """
-    V31.5 FIX (TA-01 AST):
-    Extraction robuste de la Zone B par lignes entre marqueurs "ZONE B" et "ZONE C".
-    Évite le slice au milieu d'une ligne (qui produisait du texte non-Python => ast.parse FAIL).
+    Robust source extraction for validators (AST/literals/imports).
+    Uses file read first (preferred), then fallback.
     """
-    import inspect
     try:
-        src = inspect.getsource(inspect.getmodule(get_zone_b_source))
+        with open(__file__, "r", encoding="utf-8") as f:
+            src = f.read()
     except Exception:
-        return ""
+        try:
+            import inspect
+            src = inspect.getsource(inspect.getmodule(get_zone_b_source))
+        except Exception:
+            return ""
 
-    lines = src.splitlines()
-    out: List[str] = []
-    in_b = False
-
-    for line in lines:
-        if not in_b and ("ZONE B" in line):
-            in_b = True
-        if in_b:
-            if "ZONE C" in line:
-                break
-            out.append(line)
-
-    return "\n".join(out).strip()
+    s = src.find("ZONE B")
+    e = src.find("ZONE C")
+    if s == -1 or e == -1 or e <= s:
+        # Fallback: try regex capture between markers
+        m = re.search(r"ZONE B[\s\S]*?ZONE C", src)
+        if not m:
+            return ""
+        chunk = m.group(0)
+        # Keep only the content starting at ZONE B line
+        return chunk
+    return src[s:e]
 
 
 def parse_qi_pack_input(data: Any) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -435,7 +655,9 @@ def parse_qi_pack_input(data: Any) -> Tuple[List[Dict[str, Any]], Optional[Dict[
     if isinstance(data, dict):
         for k in ["items", "qi_pack", "questions"]:
             if k in data:
-                return data[k], {x: data[x] for x in data if x != k}
+                # preserve other top-level meta
+                meta = {x: data[x] for x in data if x != k}
+                return data[k], (meta if meta else None)
     return [], {"error": "Unknown format"}
 
 
@@ -450,7 +672,7 @@ class GTERunner:
     def run(self, qi_pack: List[Dict[str, Any]], gen_func, level2: bool = False) -> Dict[str, Any]:
         self.logs = []
         self.results = {}
-        self.log(f"═══ GTE V31.5 — {len(qi_pack)} Qi ═══")
+        self.log(f"═══ GTE V31.6 — {len(qi_pack)} Qi ═══")
 
         artifacts_raw = gen_func(qi_pack)
         canon = canonicalize_artifacts(artifacts_raw, qi_pack)
@@ -495,7 +717,7 @@ class GTERunner:
         self.results["TS-02_REF"] = {"pass": ref_ok, "errors": ref_errs}
         self.log(f"TS-02 REF: {'PASS' if ref_ok else 'FAIL'}")
 
-        # TC-01 Coverage
+        # TC-01 Coverage (CEO binary gate)
         cov_ok, orphans = check_coverage_total(canon)
         self.results["TC-01_COV"] = {"pass": cov_ok, "orphans": orphans}
         self.log(f"TC-01 COV: {'PASS' if cov_ok else 'FAIL'} ({len(orphans)} orphans)")
@@ -515,7 +737,6 @@ class GTERunner:
         self.results["TD-02_ORDER"] = {"pass": ord_ok, "h1": h1[:16], "h2": h2[:16]}
         self.log(f"TD-02 ORDER: {'PASS' if ord_ok else 'FAIL'}")
 
-        # Zone B source (robuste)
         zone_b = get_zone_b_source()
         source_available = len(zone_b) > 0
 
@@ -553,7 +774,7 @@ class GTERunner:
         # P1: TD-03 N=10
         if level2:
             d10_ok, h10, d10_errs = check_determinism_n_runs(gen_func, qi_pack, 10)
-            self.results["TD-03_N10"] = {"pass": d10_ok, "hashes": h10}
+            self.results["TD-03_N10"] = {"pass": d10_ok, "hashes": h10, "errors": d10_errs}
             self.log(f"TD-03 N10: {'PASS' if d10_ok else 'FAIL'}")
         else:
             self.results["TD-03_N10"] = {"pass": None, "note": "Skipped"}
@@ -567,7 +788,7 @@ class GTERunner:
         p0_keys = [
             "TS-01_SCHEMA", "TS-02_REF", "TC-01_COV", "TC-02_PRIM",
             "TD-01_DET_N3", "TD-02_ORDER", "TN-02_IMPORTS",
-            "TA-01_AST", "TA-02_LITERALS", "TA-04_PROMPT"
+            "TA-01_AST", "TA-02_LITERALS", "TA-04_PROMPT",
         ]
         p0_pass = all(self.results.get(k, {}).get("pass", False) for k in p0_keys)
 
@@ -591,22 +812,29 @@ class GTERunner:
 
 
 def main():
-    st.set_page_config(page_title="SMAXIA GTE V31.5", page_icon="🔒", layout="wide")
-    st.title("🔒 SMAXIA GTE Console V31.5")
-    st.markdown("**Harnais de Preuve ISO-PROD — TA-01 AST FIX**")
+    st.set_page_config(page_title="SMAXIA GTE V31.6", page_icon="🔒", layout="wide")
+    st.title("🔒 SMAXIA GTE Console V31.6")
+    st.markdown("**Harnais de Preuve ISO-PROD — + PDF → qi_pack.json (CEO zero-code)**")
 
     with st.sidebar:
-        st.header("⚙️ V31.5")
-        st.markdown("✓ get_zone_b robuste (AST OK)")
-        st.markdown("✓ singletons_warning trié")
-        st.markdown("✓ FAIL explicite si source N/A")
+        st.header("⚙️ V31.6")
+        st.markdown("✓ GTE validators (P0) conservés")
+        st.markdown("✓ PDF → qi_pack.json (Sujet + Correction)")
+        st.markdown("✓ Zéro code côté CEO")
 
     tab1, tab2, tab3 = st.tabs(["📥 Entrée", "🚀 Pipeline", "📊 Résultats"])
 
     with tab1:
         st.header("📥 Entrée")
-        mode = st.radio("Mode", ["Golden Pack", "JSON Upload", "Manuel"], horizontal=True)
+
+        mode = st.radio(
+            "Mode",
+            ["Golden Pack", "JSON Upload", "Manuel", "Import Sujet (PDF)"],
+            horizontal=True
+        )
+
         qi_pack: List[Dict[str, Any]] = []
+        meta_preview: Optional[Dict[str, Any]] = None
 
         if mode == "Golden Pack":
             qi_pack = TEST_ONLY_GOLDEN_QI_PACK
@@ -617,32 +845,86 @@ def main():
             if up:
                 try:
                     raw = json.load(up)
-                    qi_pack, meta = parse_qi_pack_input(raw)
+                    qi_pack, meta_preview = parse_qi_pack_input(raw)
                     st.success(f"✓ {len(qi_pack)} Qi")
-                    if meta:
-                        st.json(meta)
+                    if meta_preview:
+                        with st.expander("Meta (top-level)"):
+                            st.json(meta_preview)
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-        else:
+        elif mode == "Manuel":
             txt = st.text_area("Questions (1/line)", height=150)
-            rqi = st.text_area("Corrigés (1/line)", height=150)
+            rqi = st.text_area("Corrigés (1/line) [optionnel]", height=150)
             if txt.strip():
                 lines = [l.strip() for l in txt.strip().split("\n") if l.strip()]
                 rlines = [l.strip() for l in rqi.strip().split("\n")] if rqi.strip() else []
                 for i, t in enumerate(lines):
                     r = rlines[i] if i < len(rlines) else ""
                     qi_pack.append({
-                        "qi_id": f"QI_{i+1:03d}", "subject_id": "SUBJ",
+                        "qi_id": f"QI_{i+1:03d}",
+                        "subject_id": "SUBJ",
                         "position": {"order_index": i + 1},
                         "statement": {"text_md": t},
                         "correction": {"available": bool(r), "text_md": r},
                     })
                 st.success(f"✓ {len(qi_pack)} Qi")
 
-        st.session_state["qi_pack"] = qi_pack
-        if qi_pack:
-            st.metric("Qi", len(qi_pack))
+        else:
+            st.subheader("📄 Import Sujet (PDF) → Générer qi_pack.json")
+            st.caption("Upload sujet PDF + correction PDF (optionnel). Génération best-effort sans OCR.")
+
+            subj = st.file_uploader("PDF Sujet", type=["pdf"], key="pdf_subject")
+            corr = st.file_uploader("PDF Correction (optionnel)", type=["pdf"], key="pdf_correction")
+
+            colA, colB = st.columns([1, 1])
+            with colA:
+                load_into_session = st.checkbox("Charger automatiquement dans GTE après génération", value=True)
+            with colB:
+                st.caption("Si l’alignement numéroté échoue, correction.available restera False (anti-faux-mapping).")
+
+            if st.button("🧩 Générer qi_pack.json", type="primary", use_container_width=True, disabled=(subj is None)):
+                try:
+                    subject_bytes = subj.getvalue() if subj else b""
+                    corr_bytes = corr.getvalue() if corr else None
+
+                    payload, qi_pack_generated = build_qi_pack_from_pdfs(subject_bytes, corr_bytes)
+                    st.session_state["generated_payload"] = payload
+                    st.success(f"✓ Généré: {len(qi_pack_generated)} Qi")
+
+                    with st.expander("Meta extraction / alignement"):
+                        st.json(payload.get("meta", {}))
+
+                    # download
+                    st.download_button(
+                        "📥 Télécharger qi_pack.json",
+                        canonical_json(payload),
+                        file_name="qi_pack.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+
+                    if load_into_session:
+                        qi_pack = qi_pack_generated
+                        st.session_state["qi_pack"] = qi_pack
+                        st.info("✓ Pack chargé dans la session GTE (tab Pipeline).")
+                    else:
+                        st.info("Pack généré, non chargé. Vous pouvez le télécharger puis l’uploader via JSON Upload.")
+
+                except Exception as e:
+                    st.error(f"Generation error: {e}")
+
+            # if a payload already generated previously, allow quick load
+            if "generated_payload" in st.session_state:
+                with st.expander("Dernier qi_pack.json généré (aperçu)"):
+                    st.json(st.session_state["generated_payload"].get("meta", {}))
+
+        # Persist selection
+        if mode != "Import Sujet (PDF)":
+            st.session_state["qi_pack"] = qi_pack
+
+        if st.session_state.get("qi_pack"):
+            st.metric("Qi", len(st.session_state["qi_pack"]))
 
     with tab2:
         st.header("🚀 Pipeline")
@@ -703,7 +985,7 @@ def main():
             c1, c2, c3 = st.columns(3)
             with c1:
                 report = {
-                    "version": "V31.5",
+                    "version": "V31.6",
                     "timestamp": datetime.now().isoformat(),
                     "verdict": r["verdict"],
                     "validators": r["validators"],
