@@ -1,9 +1,11 @@
 # smaxia_console_v31.py — SMAXIA GTE V31.5 (ISO-PROD Proof Harness)
 # =============================================================================
-# Version: V31.5 - Fixes audit GPT 5.2 round 4
+# Version: V31.5 - Fixes audit GPT 5.2 round 3 (TA-01 AST FIX)
 # Fixes:
-#   - TA-01 AST: Fix get_zone_b_source() slice (regex on full comment line)
-#   - No regression: UI, validators, exports unchanged
+#   - get_zone_b_source(): extraction robuste par LIGNES entre marqueurs ZONE B / ZONE C
+#     (évite slice au milieu d'une ligne -> AST parse error)
+#   - canonicalize_artifacts(): singletons_warning trié (hérité V31.4)
+#   - Validateurs TN-02/TA-01/TA-02: FAIL explicite si source unavailable (hérité V31.4)
 # =============================================================================
 
 import streamlit as st
@@ -11,7 +13,6 @@ import json
 import hashlib
 import ast
 import random
-import re
 from typing import List, Dict, Any, Optional, Set, Tuple
 from datetime import datetime
 from collections import defaultdict
@@ -103,22 +104,31 @@ def TEST_ONLY_simulate_qc_generation(qi_pack: List[Dict[str, Any]]) -> Dict[str,
 
         aris.append({
             "ari_id": ari_id, "template_id": "ARI_TPL_V1",
-            "steps": [{"step_id": "S1", "operator_code": "OP_READ"},
-                      {"step_id": "S2", "operator_code": "OP_PROCESS"},
-                      {"step_id": "S3", "operator_code": "OP_CONCLUDE"}],
+            "steps": [
+                {"step_id": "S1", "operator_code": "OP_READ"},
+                {"step_id": "S2", "operator_code": "OP_PROCESS"},
+                {"step_id": "S3", "operator_code": "OP_CONCLUDE"},
+            ],
             "provenance": {"qc_id": qc_id},
         })
 
         frts.append({
             "frt_id": frt_id, "template_id": "FRT_TPL_V1",
-            "sections": {"given": "Input", "goal": "Output", "method": "Steps",
-                         "checks": ["Verify"], "common_traps": ["Avoid"], "final_form": "Result"},
+            "sections": {
+                "given": "Input",
+                "goal": "Output",
+                "method": "Steps",
+                "checks": ["Verify"],
+                "common_traps": ["Avoid"],
+                "final_form": "Result",
+            },
             "provenance": {"qc_id": qc_id, "ari_id": ari_id},
         })
 
         triggers.append({
             "trigger_id": trg_id, "type_code": "TRG_CHECK", "severity": "medium",
-            "condition": {"signal": "AFTER_S2"}, "action": {"recommendation": "Verify"},
+            "condition": {"signal": "AFTER_S2"},
+            "action": {"recommendation": "Verify"},
             "links": {"qc_id": qc_id, "ari_id": ari_id, "qi_examples": qi_ids[:2]},
         })
 
@@ -171,7 +181,6 @@ def sort_qi_canonical(qi_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(qi_list, key=lambda x: (x.get("position", {}).get("order_index", 0), x.get("qi_id", "")))
 
 
-# singletons_warning trié pour canonicalisation complète
 def canonicalize_artifacts(artifacts: Dict[str, Any], qi_pack: List[Dict[str, Any]]) -> Dict[str, Any]:
     singletons = artifacts.get("singletons_warning", []) or []
     singletons_sorted = sorted(
@@ -393,19 +402,31 @@ def check_intent_diversity(canon: Dict[str, Any], min_i: int = 5) -> Tuple[bool,
 # ZONE C : STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# FIX V31.5: get_zone_b_source() returns a valid python slice starting at a full comment line
 def get_zone_b_source() -> str:
+    """
+    V31.5 FIX (TA-01 AST):
+    Extraction robuste de la Zone B par lignes entre marqueurs "ZONE B" et "ZONE C".
+    Évite le slice au milieu d'une ligne (qui produisait du texte non-Python => ast.parse FAIL).
+    """
     import inspect
     try:
         src = inspect.getsource(inspect.getmodule(get_zone_b_source))
     except Exception:
-        return ""  # validateurs géreront le cas
-
-    m1 = re.search(r"(?m)^\s*#\s*ZONE B\b.*$", src)
-    m2 = re.search(r"(?m)^\s*#\s*ZONE C\b.*$", src)
-    if not m1 or not m2 or m2.start() <= m1.start():
         return ""
-    return src[m1.start():m2.start()]
+
+    lines = src.splitlines()
+    out: List[str] = []
+    in_b = False
+
+    for line in lines:
+        if not in_b and ("ZONE B" in line):
+            in_b = True
+        if in_b:
+            if "ZONE C" in line:
+                break
+            out.append(line)
+
+    return "\n".join(out).strip()
 
 
 def parse_qi_pack_input(data: Any) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -494,6 +515,7 @@ class GTERunner:
         self.results["TD-02_ORDER"] = {"pass": ord_ok, "h1": h1[:16], "h2": h2[:16]}
         self.log(f"TD-02 ORDER: {'PASS' if ord_ok else 'FAIL'}")
 
+        # Zone B source (robuste)
         zone_b = get_zone_b_source()
         source_available = len(zone_b) > 0
 
@@ -542,9 +564,11 @@ class GTERunner:
         self.log(f"TN-03 DIVERSITY: {'PASS' if div_ok else 'FAIL'} ({div_c} intents)")
 
         # Final Verdict
-        p0_keys = ["TS-01_SCHEMA", "TS-02_REF", "TC-01_COV", "TC-02_PRIM",
-                   "TD-01_DET_N3", "TD-02_ORDER", "TN-02_IMPORTS",
-                   "TA-01_AST", "TA-02_LITERALS", "TA-04_PROMPT"]
+        p0_keys = [
+            "TS-01_SCHEMA", "TS-02_REF", "TC-01_COV", "TC-02_PRIM",
+            "TD-01_DET_N3", "TD-02_ORDER", "TN-02_IMPORTS",
+            "TA-01_AST", "TA-02_LITERALS", "TA-04_PROMPT"
+        ]
         p0_pass = all(self.results.get(k, {}).get("pass", False) for k in p0_keys)
 
         input_hash = compute_hash(sort_qi_canonical(qi_pack))
@@ -569,11 +593,11 @@ class GTERunner:
 def main():
     st.set_page_config(page_title="SMAXIA GTE V31.5", page_icon="🔒", layout="wide")
     st.title("🔒 SMAXIA GTE Console V31.5")
-    st.markdown("**Harnais de Preuve ISO-PROD — Final**")
+    st.markdown("**Harnais de Preuve ISO-PROD — TA-01 AST FIX**")
 
     with st.sidebar:
         st.header("⚙️ V31.5")
-        st.markdown("✓ get_zone_b_source regex (AST parseable)")
+        st.markdown("✓ get_zone_b robuste (AST OK)")
         st.markdown("✓ singletons_warning trié")
         st.markdown("✓ FAIL explicite si source N/A")
 
@@ -678,8 +702,13 @@ def main():
 
             c1, c2, c3 = st.columns(3)
             with c1:
-                report = {"version": "V31.5", "timestamp": datetime.now().isoformat(),
-                          "verdict": r["verdict"], "validators": r["validators"], "metrics": r["metrics"]}
+                report = {
+                    "version": "V31.5",
+                    "timestamp": datetime.now().isoformat(),
+                    "verdict": r["verdict"],
+                    "validators": r["validators"],
+                    "metrics": r["metrics"],
+                }
                 st.download_button("📥 run_report.json", canonical_json(report), "run_report.json")
 
             with c2:
