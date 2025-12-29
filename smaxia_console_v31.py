@@ -1,10 +1,9 @@
-# smaxia_console_v31.py — SMAXIA GTE V31.4 (ISO-PROD Proof Harness)
+# smaxia_console_v31.py — SMAXIA GTE V31.5 (ISO-PROD Proof Harness)
 # =============================================================================
-# Version: V31.4 - Fixes audit GPT 5.2 round 3
+# Version: V31.5 - Fixes audit GPT 5.2 round 4
 # Fixes:
-#   - get_zone_b_source(): try/except pour éviter crash
-#   - canonicalize_artifacts(): singletons_warning trié
-#   - Validateurs TN-02/TA-01/TA-02: FAIL explicite si source unavailable
+#   - TA-01 AST: Fix get_zone_b_source() slice (regex on full comment line)
+#   - No regression: UI, validators, exports unchanged
 # =============================================================================
 
 import streamlit as st
@@ -12,6 +11,7 @@ import json
 import hashlib
 import ast
 import random
+import re
 from typing import List, Dict, Any, Optional, Set, Tuple
 from datetime import datetime
 from collections import defaultdict
@@ -82,7 +82,7 @@ def TEST_ONLY_simulate_qc_generation(qi_pack: List[Dict[str, Any]]) -> Dict[str,
     for intent in sorted(clusters.keys()):
         grp = sorted(clusters[intent], key=lambda x: x.get("qi_id", ""))
         qi_ids = [q.get("qi_id", "") for q in grp if q.get("qi_id")]
-        
+
         if len(qi_ids) < 2:
             singletons.append({"intent": intent, "qi_ids": qi_ids})
 
@@ -98,18 +98,21 @@ def TEST_ONLY_simulate_qc_generation(qi_pack: List[Dict[str, Any]]) -> Dict[str,
             "qc_invariant_signature": {"intent_code": intent},
             "mapping": {"primary_qi_ids": qi_ids, "covered_qi_ids": qi_ids, "by_subject": dict(by_subj)},
             "links": {"ari_id": ari_id, "frt_id": frt_id, "trigger_ids": [trg_id]},
-            "provenance": {"generator_version": "TEST_ONLY_V31.4"},
+            "provenance": {"generator_version": "TEST_ONLY_V31.5"},
         })
 
         aris.append({
             "ari_id": ari_id, "template_id": "ARI_TPL_V1",
-            "steps": [{"step_id": "S1", "operator_code": "OP_READ"}, {"step_id": "S2", "operator_code": "OP_PROCESS"}, {"step_id": "S3", "operator_code": "OP_CONCLUDE"}],
+            "steps": [{"step_id": "S1", "operator_code": "OP_READ"},
+                      {"step_id": "S2", "operator_code": "OP_PROCESS"},
+                      {"step_id": "S3", "operator_code": "OP_CONCLUDE"}],
             "provenance": {"qc_id": qc_id},
         })
 
         frts.append({
             "frt_id": frt_id, "template_id": "FRT_TPL_V1",
-            "sections": {"given": "Input", "goal": "Output", "method": "Steps", "checks": ["Verify"], "common_traps": ["Avoid"], "final_form": "Result"},
+            "sections": {"given": "Input", "goal": "Output", "method": "Steps",
+                         "checks": ["Verify"], "common_traps": ["Avoid"], "final_form": "Result"},
             "provenance": {"qc_id": qc_id, "ari_id": ari_id},
         })
 
@@ -168,7 +171,7 @@ def sort_qi_canonical(qi_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(qi_list, key=lambda x: (x.get("position", {}).get("order_index", 0), x.get("qi_id", "")))
 
 
-# FIX V31.4: singletons_warning trié pour canonicalisation complète
+# singletons_warning trié pour canonicalisation complète
 def canonicalize_artifacts(artifacts: Dict[str, Any], qi_pack: List[Dict[str, Any]]) -> Dict[str, Any]:
     singletons = artifacts.get("singletons_warning", []) or []
     singletons_sorted = sorted(
@@ -390,16 +393,19 @@ def check_intent_diversity(canon: Dict[str, Any], min_i: int = 5) -> Tuple[bool,
 # ZONE C : STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# FIX V31.4: try/except pour éviter crash si inspect.getsource() échoue
+# FIX V31.5: get_zone_b_source() returns a valid python slice starting at a full comment line
 def get_zone_b_source() -> str:
     import inspect
     try:
         src = inspect.getsource(inspect.getmodule(get_zone_b_source))
     except Exception:
-        return ""  # Retourne vide, les validateurs géreront le cas
-    s = src.find("ZONE B")
-    e = src.find("ZONE C")
-    return src[s:e] if s != -1 and e != -1 else ""
+        return ""  # validateurs géreront le cas
+
+    m1 = re.search(r"(?m)^\s*#\s*ZONE B\b.*$", src)
+    m2 = re.search(r"(?m)^\s*#\s*ZONE C\b.*$", src)
+    if not m1 or not m2 or m2.start() <= m1.start():
+        return ""
+    return src[m1.start():m2.start()]
 
 
 def parse_qi_pack_input(data: Any) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -423,11 +429,11 @@ class GTERunner:
     def run(self, qi_pack: List[Dict[str, Any]], gen_func, level2: bool = False) -> Dict[str, Any]:
         self.logs = []
         self.results = {}
-        self.log(f"═══ GTE V31.4 — {len(qi_pack)} Qi ═══")
+        self.log(f"═══ GTE V31.5 — {len(qi_pack)} Qi ═══")
 
         artifacts_raw = gen_func(qi_pack)
         canon = canonicalize_artifacts(artifacts_raw, qi_pack)
-        
+
         qcs = canon["qcs"]
         aris = canon["aris"]
         frts = canon["frts"]
@@ -488,7 +494,6 @@ class GTERunner:
         self.results["TD-02_ORDER"] = {"pass": ord_ok, "h1": h1[:16], "h2": h2[:16]}
         self.log(f"TD-02 ORDER: {'PASS' if ord_ok else 'FAIL'}")
 
-        # FIX V31.4: Get zone_b with fallback, FAIL explicitly if unavailable
         zone_b = get_zone_b_source()
         source_available = len(zone_b) > 0
 
@@ -562,13 +567,13 @@ class GTERunner:
 
 
 def main():
-    st.set_page_config(page_title="SMAXIA GTE V31.4", page_icon="🔒", layout="wide")
-    st.title("🔒 SMAXIA GTE Console V31.4")
+    st.set_page_config(page_title="SMAXIA GTE V31.5", page_icon="🔒", layout="wide")
+    st.title("🔒 SMAXIA GTE Console V31.5")
     st.markdown("**Harnais de Preuve ISO-PROD — Final**")
 
     with st.sidebar:
-        st.header("⚙️ V31.4")
-        st.markdown("✓ try/except get_zone_b")
+        st.header("⚙️ V31.5")
+        st.markdown("✓ get_zone_b_source regex (AST parseable)")
         st.markdown("✓ singletons_warning trié")
         st.markdown("✓ FAIL explicite si source N/A")
 
@@ -673,7 +678,7 @@ def main():
 
             c1, c2, c3 = st.columns(3)
             with c1:
-                report = {"version": "V31.4", "timestamp": datetime.now().isoformat(),
+                report = {"version": "V31.5", "timestamp": datetime.now().isoformat(),
                           "verdict": r["verdict"], "validators": r["validators"], "metrics": r["metrics"]}
                 st.download_button("📥 run_report.json", canonical_json(report), "run_report.json")
 
