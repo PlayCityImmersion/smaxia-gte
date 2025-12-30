@@ -1,23 +1,23 @@
 # =============================================================================
-# SMAXIA — GTE Console V31.9.4 (ISO-PROD TEST)
+# SMAXIA — GTE Console V31.9.5 (ISO-PROD TEST)
 # =============================================================================
-# OBJECTIF (TEST ISO-PROD) :
-# - Extraire correctement les Qi d'un PDF (énoncé) + aligner le corrigé
-# - Générer plusieurs QC (éviter collapse "1 QC") sans hardcode chapitre/pays/langue
-# - Respecter la règle QC : commence par "Comment" et finit par "?"
-# - Zéro régression UI : mêmes 3 onglets + exports + validateurs
+# V31.9.5 — Demandés par CEO :
+# 1) Chargement "tout academic Pays = France" visualisable Sidebar (pack-driven)
+# 2) Lancement automatique scraping sujets+corrections : user saisit Volume => RUN
+# 3) Les sujets/corrigés scrappés deviennent sélectionnables dans Entrée (Import PDF)
+#    puis on déroule: générer qi_pack.json -> RUN GTE -> Résultats
+# 4) Nouveau espace: "Explorer Chapitre" => QC du chapitre + ARI/FRT/TRG + Qi associés
 #
-# EXTENSION V31.9.4 :
-# - Zone Activation Pays (UI) + auto-load du Pack (via upload academic_pack.json)
-# - Harvester par volumes via sources.json (DATA)
-# - Boucle Saturation : itérations, ΔQC par volume, stop si ΔQC==0 ET orphans==0
-# - Module "QC par chapitre (pack-driven)" + Validateurs B BLOQUANTS
-# - Export saturation_report.json + chapter_report preuves
+# CONTRAT INVARIANT (ULTRA CRITIQUE) :
+# - Aucun hardcode métier/pays/chapitre/langue dans le code source.
+# - La variabilité vient UNIQUEMENT du academic_pack.json (Pack).
+# - Scraping: SEEDS + règles (regex/selectors) doivent être fournis par le Pack.
+# - Chapitre: JAMAIS déduit du texte; uniquement pack-driven via intent_allowlist.
 #
-# NOTE CONTRAT INVARIANT :
-# - Interdit : listes/keywords métier, heuristiques "BAC/France", mots-clés linguistiques
-# - Autorisé (TEST) : clustering STRUCTUREL par marker parseur générique (EXn-Qm[a/b/c])
-# - Chapitre : JAMAIS déduit par texte. Seulement pack-driven (academic_pack.json).
+# LIMITATION STREAMLIT :
+# - On ne peut pas "remplir" automatiquement un file_uploader existant.
+#   Solution V31.9.5: une "Bibliothèque Harvest" + Selectbox -> charge bytes en session
+#   et déclenche "Générer qi_pack" sans uploader.
 # =============================================================================
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ import io
 import json
 import random
 import re
+import time
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
@@ -304,7 +306,7 @@ def check_intent_diversity(canon: Dict[str, Any], min_i: int = 5) -> Tuple[bool,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ZONE B.5 : PDF → Qi Builder (robuste markers EXn-Qm[a/b/c])
+# ZONE B.5 : PDF → Qi Builder (markers EXn-Qm[a/b/c])
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -459,7 +461,7 @@ def build_qi_pack_from_pdfs(subject_bytes: bytes, correction_bytes: Optional[byt
         })
 
     meta = {
-        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.9.4"},
+        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.9.5"},
         "created_at": datetime.now().isoformat(),
         "stats": {
             "qi_count": len(qi_pack),
@@ -497,12 +499,6 @@ def _parse_marker(marker: str) -> Tuple[str, str, str]:
 
 
 def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Générateur TEST invariant :
-    - Groupe par (EX, Qmain) => une QC par "question principale" structurelle.
-    - Sous-questions (a/b/c) rattachées au même groupe.
-    - Fallback STRUCT_UNK.
-    """
     groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     for qi in qi_pack:
@@ -530,7 +526,6 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
         for q in grp:
             by_subj[str(q.get("subject_id", ""))].append(str(q.get("qi_id", "")))
 
-        # QC formulation minimale contractuelle (sans verbes métier)
         qc_formulation = "Comment procéder ?"
 
         qcs.append({
@@ -539,7 +534,7 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
             "qc_invariant_signature": {"intent_code": gkey},
             "mapping": {"primary_qi_ids": qi_ids, "covered_qi_ids": qi_ids, "by_subject": dict(by_subj)},
             "links": {"ari_id": ari_id, "frt_id": frt_id, "trigger_ids": [trg_id]},
-            "provenance": {"generator_version": "TEST_ONLY_V31.9.4"},
+            "provenance": {"generator_version": "TEST_ONLY_V31.9.5"},
         })
 
         aris.append({
@@ -593,9 +588,7 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ZONE B.8 : ACADEMIC PACK (TEST) + VALIDATEURS B (BLOQUANTS)
-# - Chapitre jamais déduit du texte : uniquement pack-driven via intent_allowlist
-# - Le pack est DATA; le code ne contient aucun savoir métier.
+# ZONE B.8 : ACADEMIC PACK + VALIDATEURS B (BLOQUANTS)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_academic_pack_json(uploaded) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -620,7 +613,8 @@ def validate_pack_schema(pack: Dict[str, Any]) -> Tuple[bool, List[str]]:
       "chapters": [
         {"chapter_id":"CH_...", "title":"...", "intent_allowlist":["STRUCT_EX1_Q1", ...]},
         ...
-      ]
+      ],
+      "harvest": { ... }  # optional but required for auto-scrape V31.9.5
     }
     """
     errs = []
@@ -652,6 +646,44 @@ def validate_pack_schema(pack: Dict[str, Any]) -> Tuple[bool, List[str]]:
     return len(errs) == 0, errs
 
 
+def validate_pack_harvest(pack: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    V31.9.5 auto-scrape requires pack.harvest:
+    {
+      "sequencing": {"dimensions": ["level","track","year"]},
+      "seeds": [
+        {"index_url":"https://...","pdf_regex": "....pdf", "corr_hint_regex":"corrige|correction", "pairing_mode":"adjacent|same_page|by_year"},
+        ...
+      ],
+      "http": {"user_agent":"...", "timeout_sec": 25, "max_bytes_pdf": 25000000, "max_index_pages": 30}
+    }
+    IMPORTANT: These are DATA. No site hardcode in code.
+    """
+    errs = []
+    h = pack.get("harvest")
+    if h is None:
+        return False, ["Missing pack.harvest (required for auto-scrape)"]
+    if not isinstance(h, dict):
+        return False, ["pack.harvest must be object"]
+    seeds = h.get("seeds")
+    if not isinstance(seeds, list) or len(seeds) < 1:
+        errs.append("pack.harvest.seeds must be non-empty list")
+    else:
+        for i, s in enumerate(seeds, 1):
+            if not isinstance(s, dict):
+                errs.append(f"seeds[{i}] must be object")
+                continue
+            if not str(s.get("index_url", "")).strip():
+                errs.append(f"seeds[{i}] missing index_url")
+            if not str(s.get("pdf_regex", "")).strip():
+                errs.append(f"seeds[{i}] missing pdf_regex")
+            # corr_hint_regex optional
+    http = h.get("http", {})
+    if http is not None and not isinstance(http, dict):
+        errs.append("pack.harvest.http must be object")
+    return len(errs) == 0, errs
+
+
 def _pack_intent_to_chapter(pack: Dict[str, Any]) -> Dict[str, str]:
     m: Dict[str, str] = {}
     for ch in pack.get("chapters", []) or []:
@@ -660,21 +692,12 @@ def _pack_intent_to_chapter(pack: Dict[str, Any]) -> Dict[str, str]:
             it = str(intent).strip()
             if not it:
                 continue
-            # if duplicated across chapters -> violation handled in validators_B
             if it not in m:
                 m[it] = cid
     return m
 
 
 def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    B Validators = BLOQUANTS dès qu’un pack est présent.
-    - B-01_PACK_SCHEMA
-    - B-02_INTENT_UNIQUE (no intent in multiple chapters)
-    - B-03_QC_CHAPTER_MAPPING (every QC intent maps to a chapter)
-    - B-04_QI_COVERAGE_PER_CHAPTER (orphans=0 per chapter on corpus)
-    Evidence: chapter_report
-    """
     out: Dict[str, Any] = {}
     chapter_report = {
         "pack_ref": None,
@@ -695,7 +718,6 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
         out["_chapter_report"] = chapter_report
         return out
 
-    # B-02: intent uniqueness across chapters
     seen: Dict[str, str] = {}
     dups: List[Dict[str, str]] = []
     for ch in pack.get("chapters", []) or []:
@@ -712,7 +734,6 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
 
     intent_to_chapter = _pack_intent_to_chapter(pack)
 
-    # B-03: all QC mapped
     unmapped_qc = []
     qc_to_chapter: Dict[str, str] = {}
     for qc in canon.get("qcs", []) or []:
@@ -725,18 +746,15 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
             qc_to_chapter[qc_id] = cid
     out["B-03_QC_CHAPTER_MAPPING"] = {"pass": len(unmapped_qc) == 0, "unmapped_qc": unmapped_qc}
 
-    # Build chapter-wise coverage evidence on corpus
     all_qi = [q for q in (canon.get("qi_pack") or [])]
     qi_ids_all = [str(q.get("qi_id", "")).strip() for q in all_qi if str(q.get("qi_id", "")).strip()]
 
-    # Map QC -> its covered qi_ids
     qc_cov: Dict[str, Set[str]] = {}
     for qc in canon.get("qcs", []) or []:
         qc_id = str(qc.get("qc_id", "")).strip()
         cov_ids = set([str(x).strip() for x in (qc.get("mapping") or {}).get("covered_qi_ids", []) if str(x).strip()])
         qc_cov[qc_id] = cov_ids
 
-    # Assign each Qi to a chapter = union of chapters of QCs that cover it
     qi_to_chapters: Dict[str, Set[str]] = {qid: set() for qid in qi_ids_all}
     for qc_id, cov_ids in qc_cov.items():
         ch_id = qc_to_chapter.get(qc_id)
@@ -746,7 +764,6 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
             if qi_id in qi_to_chapters:
                 qi_to_chapters[qi_id].add(ch_id)
 
-    # Violations: Qi covered by QCs from multiple chapters (cross-leak) or no chapter
     cross = [qi_id for qi_id, s in qi_to_chapters.items() if len(s) > 1]
     no_ch = [qi_id for qi_id, s in qi_to_chapters.items() if len(s) == 0]
 
@@ -757,22 +774,23 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
         "counts": {"cross_leak": len(cross), "unassigned": len(no_ch)},
     }
 
-    # Evidence per chapter (on corpus): Qi that belong to that chapter = those whose assigned set == {chapter}
-    chapters_ids = [str(ch.get("chapter_id", "")).strip() for ch in (pack.get("chapters") or []) if str(ch.get("chapter_id", "")).strip()]
+    chapters_ids = [
+        str(ch.get("chapter_id", "")).strip()
+        for ch in (pack.get("chapters") or [])
+        if str(ch.get("chapter_id", "")).strip()
+    ]
     chapter_report["pack_ref"] = {
         "pack_id": pack.get("pack_id"),
         "country_code": pack.get("country_code"),
         "pack_hash": (pack.get("signature") or {}).get("pack_hash"),
     }
 
-    # Determine QC list per chapter
     chapter_qc: Dict[str, List[str]] = defaultdict(list)
     for qc_id, ch_id in qc_to_chapter.items():
         chapter_qc[ch_id].append(qc_id)
     for ch in chapters_ids:
         chapter_qc[ch] = sorted(list(set(chapter_qc.get(ch, []))))
 
-    # Qi per chapter: those uniquely assigned to that chapter
     chapter_qi: Dict[str, List[str]] = defaultdict(list)
     for qi_id, s in qi_to_chapters.items():
         if len(s) == 1:
@@ -780,13 +798,11 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
     for ch in chapters_ids:
         chapter_qi[ch] = sorted(chapter_qi.get(ch, []))
 
-    # Coverage per chapter: Qi covered by QCs of that chapter
     chapter_cov: Dict[str, Set[str]] = defaultdict(set)
     for ch in chapters_ids:
         for qc_id in chapter_qc.get(ch, []):
             chapter_cov[ch].update(qc_cov.get(qc_id, set()))
 
-    # Orphans per chapter = Qi assigned to chapter but not covered by its QCs (should be zero)
     chapter_orphans: Dict[str, List[str]] = {}
     for ch in chapters_ids:
         assigned = set(chapter_qi.get(ch, []))
@@ -801,12 +817,12 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
         "orphans_preview": all_orphans[:200],
     }
 
-    # Fill report chapters
     for ch in chapters_ids:
         qi_total = len(chapter_qi.get(ch, []))
         orph = chapter_orphans.get(ch, [])
         qc_count = len(chapter_qc.get(ch, []))
         chapter_report["chapters"][ch] = {
+            "title": next((str(x.get("title", "")) for x in (pack.get("chapters") or []) if str(x.get("chapter_id", "")).strip() == ch), ""),
             "qc_count": qc_count,
             "qi_total": qi_total,
             "qi_covered": max(0, qi_total - len(orph)),
@@ -815,7 +831,6 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
             "qc_ids": chapter_qc.get(ch, [])[:500],
         }
 
-    # Global violations
     if dups:
         chapter_report["violations"].append({"type": "intent_duplicate_across_chapters", "items": dups[:200]})
     if unmapped_qc:
@@ -832,175 +847,183 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ZONE B.9 : HARVEST + SATURATION (TEST ISO-PROD)
-# - sources.json = DATA (URLs or local paths)
-# - Volume iteration: process batches, track ΔQC and orphans
-# - Stop when ΔQC == 0 AND orphans == 0
+# ZONE B.9 : AUTO-SCRAPER (pack-driven)
+# - Collecte liens PDF depuis des pages index (seeds)
+# - Pairing sujet/corrigé : heuristique générique PARAMÉTRÉE par pack.harvest
+# - Télécharge bytes + stocke en session_state["harvest_items"]
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_sources_json(uploaded) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Expected formats:
-    A) {"country_code":"FR","items":[{"subject_url":"...pdf","correction_url":"...pdf"}, ...]}
-    B) {"items":[{"subject_path":"local.pdf","correction_path":"local.pdf"}, ...]}  # optional local mode
-    """
-    if not uploaded:
-        return None, None
+def _http_get(url: str, ua: str, timeout: int) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _extract_links_html(html_bytes: bytes, base_url: str) -> List[str]:
+    # Extraction générique de href, sans connaissance de site
     try:
-        raw = json.load(uploaded)
-        if not isinstance(raw, dict):
-            return None, "sources.json doit être un objet JSON"
-        items = raw.get("items")
-        if not isinstance(items, list) or len(items) < 1:
-            return None, "sources.items doit être une liste non vide"
-        for i, it in enumerate(items, 1):
-            if not isinstance(it, dict):
-                return None, f"items[{i}] must be object"
-            if not (it.get("subject_url") or it.get("subject_path")):
-                return None, f"items[{i}] missing subject_url/subject_path"
-        return raw, None
-    except Exception as e:
-        return None, f"Parse error: {e}"
+        html = html_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        html = str(html_bytes)
+    hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.I)
+    out = []
+    for h in hrefs:
+        h = h.strip()
+        if not h:
+            continue
+        absu = urllib.parse.urljoin(base_url, h)
+        out.append(absu)
+    return out
 
 
-def fetch_pdf_bytes(item: Dict[str, Any], key: str) -> Optional[bytes]:
+def _filter_pdf_links(links: List[str], pdf_regex: str) -> List[str]:
+    rx = re.compile(pdf_regex, re.I)
+    pdfs = []
+    for u in links:
+        if rx.search(u):
+            pdfs.append(u)
+    # de-dup stable
+    seen = set()
+    out = []
+    for u in pdfs:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _pair_subject_correction(pdfs: List[str], corr_hint_regex: str) -> List[Tuple[str, Optional[str]]]:
     """
-    key in {"subject","correction"}.
-    Uses either *_url or *_path. For URL, downloads bytes.
+    Pairing générique (sans hardcode) :
+    - On sépare PDF en "corr-like" vs "subject-like" via corr_hint_regex (pack-driven).
+    - Puis on associe par similarité de clé (basename normalisée sans tokens corr_hint).
     """
-    url = item.get(f"{key}_url")
-    path = item.get(f"{key}_path")
-    if url:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return resp.read()
-    if path:
-        p = Path(str(path))
-        if p.exists() and p.is_file():
-            return p.read_bytes()
-    return None
+    hint = re.compile(corr_hint_regex, re.I) if corr_hint_regex else None
+
+    def norm_key(u: str) -> str:
+        b = urllib.parse.urlparse(u).path.split("/")[-1]
+        b = re.sub(r"\.pdf$", "", b, flags=re.I)
+        b = re.sub(r"[^a-zA-Z0-9]+", "_", b).lower().strip("_")
+        if hint:
+            b = hint.sub("", b)
+            b = re.sub(r"__+", "_", b).strip("_")
+        return b
+
+    corr, subj = [], []
+    for u in pdfs:
+        if hint and hint.search(u):
+            corr.append(u)
+        else:
+            subj.append(u)
+
+    corr_map: Dict[str, str] = {}
+    for u in corr:
+        corr_map[norm_key(u)] = u
+
+    pairs: List[Tuple[str, Optional[str]]] = []
+    for s in subj:
+        k = norm_key(s)
+        pairs.append((s, corr_map.get(k)))
+    return pairs
 
 
-def harvest_build_qi_pack(items: List[Dict[str, Any]], limit: int) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    merged: List[Dict[str, Any]] = []
-    meta_all = {
-        "generator": {"name": "SMAXIA_HARVESTER", "version": "V31.9.4"},
-        "created_at": datetime.now().isoformat(),
-        "limit": limit,
-        "items_total": len(items),
-        "items_used": 0,
-        "per_item": [],
-        "errors": [],
-    }
+def pack_auto_scrape(pack: Dict[str, Any], volume: int) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        "meta": {...},
+        "items": [
+          {"subject_url":..., "correction_url":..., "subject_bytes":..., "correction_bytes":..., "label":...},
+          ...
+        ]
+      }
+    """
+    okh, herrs = validate_pack_harvest(pack)
+    if not okh:
+        return {"meta": {"ok": False, "errors": herrs, "created_at": datetime.now().isoformat()}, "items": []}
 
-    used = 0
-    for idx, it in enumerate(items[:limit], 1):
+    h = pack["harvest"]
+    http = h.get("http", {}) or {}
+    ua = str(http.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    timeout = int(http.get("timeout_sec") or 25)
+    max_pdf = int(http.get("max_bytes_pdf") or 25_000_000)
+    max_index_pages = int(http.get("max_index_pages") or 30)
+
+    seeds = h.get("seeds") or []
+    collected_pairs: List[Tuple[str, Optional[str]]] = []
+    crawl_log = []
+
+    for s in seeds[:max_index_pages]:
+        index_url = str(s.get("index_url", "")).strip()
+        if not index_url:
+            continue
+        pdf_regex = str(s.get("pdf_regex", "")).strip()
+        corr_hint = str(s.get("corr_hint_regex", "")).strip()
+
         try:
-            sb = fetch_pdf_bytes(it, "subject")
-            cb = fetch_pdf_bytes(it, "correction") if (it.get("correction_url") or it.get("correction_path")) else None
-            if not sb:
-                meta_all["errors"].append({"item": idx, "error": "subject bytes missing"})
-                continue
-            meta_i, qi_i = build_qi_pack_from_pdfs(sb, cb)
-            merged.extend(qi_i)
-            meta_all["per_item"].append({
-                "item": idx,
-                "subject_ref": it.get("subject_url") or it.get("subject_path"),
-                "correction_ref": it.get("correction_url") or it.get("correction_path"),
-                "qi_count": meta_i.get("stats", {}).get("qi_count", len(qi_i)),
-                "aligned": meta_i.get("stats", {}).get("aligned", 0),
-                "warnings": meta_i.get("warnings", []),
-            })
-            used += 1
+            html = _http_get(index_url, ua=ua, timeout=timeout)
+            links = _extract_links_html(html, base_url=index_url)
+            pdfs = _filter_pdf_links(links, pdf_regex=pdf_regex)
+            pairs = _pair_subject_correction(pdfs, corr_hint_regex=corr_hint)
+            collected_pairs.extend(pairs)
+            crawl_log.append({"seed": index_url, "pdf_found": len(pdfs), "pairs": len(pairs)})
         except Exception as e:
-            meta_all["errors"].append({"item": idx, "error": str(e)})
+            crawl_log.append({"seed": index_url, "error": str(e)})
 
-    meta_all["items_used"] = used
-    meta_all["qi_total"] = len(merged)
-    return meta_all, merged
+    # Deduplicate by subject_url
+    seen_subj = set()
+    pairs_unique = []
+    for subj_url, corr_url in collected_pairs:
+        if subj_url in seen_subj:
+            continue
+        seen_subj.add(subj_url)
+        pairs_unique.append((subj_url, corr_url))
 
+    # Limit to requested volume
+    pairs_unique = pairs_unique[:max(0, int(volume))]
 
-def saturation_step(gen_func, qi_pack: List[Dict[str, Any]], pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    artifacts_raw = gen_func(qi_pack)
-    canon = canonicalize_artifacts(artifacts_raw, qi_pack)
-    qc_ids = [q.get("qc_id") for q in (canon.get("qcs") or []) if q.get("qc_id")]
-    ok_cov, orphans = check_coverage_total(canon)
-    orphans = [] if ok_cov else (orphans or [])
+    items: List[Dict[str, Any]] = []
+    dl_log = []
+    for i, (subj_url, corr_url) in enumerate(pairs_unique, 1):
+        it = {"subject_url": subj_url, "correction_url": corr_url}
+        try:
+            sb = _http_get(subj_url, ua=ua, timeout=timeout)
+            if len(sb) > max_pdf:
+                raise Exception("subject_pdf_too_large")
+            cb = None
+            if corr_url:
+                cb = _http_get(corr_url, ua=ua, timeout=timeout)
+                if len(cb) > max_pdf:
+                    cb = None
+            label = urllib.parse.urlparse(subj_url).path.split("/")[-1] or f"subject_{i}.pdf"
+            items.append({
+                "label": label,
+                "subject_url": subj_url,
+                "correction_url": corr_url,
+                "subject_bytes": sb,
+                "correction_bytes": cb,
+            })
+            dl_log.append({"i": i, "ok": True, "label": label, "has_correction": bool(cb)})
+        except Exception as e:
+            dl_log.append({"i": i, "ok": False, "subject_url": subj_url, "error": str(e)})
 
-    vb = validators_B(canon, pack)
-    chapter_report = vb.pop("_chapter_report", None)
-
-    return {
-        "canon": canon,
-        "qc_ids": sorted(qc_ids),
-        "orphans": sorted(list(set(orphans))),
-        "validators_b": vb,
-        "chapter_report": chapter_report,
-        "hash_out": compute_hash(canon),
-        "hash_in": compute_hash(sort_qi_canonical(qi_pack)),
-        "counts": {"qi": len(qi_pack), "qc": len(qc_ids), "orphans": len(orphans)},
-    }
-
-
-def run_saturation_loop(items: List[Dict[str, Any]], pack: Dict[str, Any], gen_func, volumes: List[int]) -> Dict[str, Any]:
-    report = {
-        "version": "V31.9.4",
+    meta = {
+        "ok": True,
         "created_at": datetime.now().isoformat(),
-        "pack_ref": {"pack_id": pack.get("pack_id"), "country_code": pack.get("country_code"), "pack_hash": (pack.get("signature") or {}).get("pack_hash")},
-        "sources_items_total": len(items),
-        "volumes": [],
-        "stop_reason": None,
-        "final": None,
+        "requested_volume": int(volume),
+        "items_ok": len(items),
+        "crawl_log": crawl_log[:50],
+        "download_log": dl_log[:50],
+        "sequencing": (h.get("sequencing") or {}),
     }
-
-    prev_qc_set: Set[str] = set()
-    for v in volumes:
-        meta_h, qi_pack = harvest_build_qi_pack(items, v)
-        step = saturation_step(gen_func, qi_pack, pack)
-
-        qc_set = set(step["qc_ids"])
-        new_qc = sorted(list(qc_set - prev_qc_set))
-        delta_qc = len(new_qc)
-        orphans = step["orphans"]
-        orphans_n = len(orphans)
-
-        report["volumes"].append({
-            "volume": v,
-            "harvest_meta": meta_h,
-            "counts": step["counts"],
-            "delta_qc": delta_qc,
-            "new_qc_ids": new_qc[:500],
-            "orphans": orphans[:500],
-            "hash_in": step["hash_in"],
-            "hash_out": step["hash_out"],
-            "validators_b": step["validators_b"],
-            "chapter_report": step["chapter_report"],
-        })
-
-        prev_qc_set = qc_set
-
-        if delta_qc == 0 and orphans_n == 0:
-            report["stop_reason"] = f"SATURATED at volume={v} (ΔQC=0 & orphans=0)"
-            report["final"] = {"volume": v, "qc_total": len(prev_qc_set), "orphans": 0, "hash_out": step["hash_out"]}
-            return report
-
-    report["stop_reason"] = "MAX_VOLUMES_REACHED"
-    last = report["volumes"][-1] if report["volumes"] else None
-    if last:
-        report["final"] = {
-            "volume": last["volume"],
-            "qc_total": last["counts"]["qc"],
-            "orphans": last["counts"]["orphans"],
-            "hash_out": last["hash_out"],
-        }
-    return report
+    return {"meta": meta, "items": items}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ZONE C : STREAMLIT UI (structure conservée)
+# ZONE C : STREAMLIT UI (3 tabs conservés + nouveaux modules)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_zone_b_source() -> str:
-    """Extract ZONE B with AST validation."""
     try:
         src = Path(__file__).read_text(encoding="utf-8")
     except Exception:
@@ -1047,6 +1070,60 @@ def load_forbidden_literals_json(uploaded) -> Tuple[Set[str], Optional[str]]:
         return set(), f"Parse error: {e}"
 
 
+def artifacts_by_chapter(canon: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return:
+    {
+      "chapters": {
+         chapter_id: {
+            "qcs": [...],
+            "aris": {...},
+            "frts": {...},
+            "triggers": {...},
+            "qi": {...}
+         }
+      }
+    }
+    """
+    intent_to_ch = _pack_intent_to_chapter(pack)
+    qcs = canon.get("qcs", []) or []
+    aris = {a.get("ari_id"): a for a in (canon.get("aris", []) or [])}
+    frts = {f.get("frt_id"): f for f in (canon.get("frts", []) or [])}
+    trgs = {t.get("trigger_id"): t for t in (canon.get("triggers", []) or [])}
+    qi_map = {q.get("qi_id"): q for q in (canon.get("qi_pack", []) or [])}
+
+    by_ch: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"qcs": []})
+
+    for qc in qcs:
+        intent = str((qc.get("qc_invariant_signature") or {}).get("intent_code", "")).strip()
+        ch = intent_to_ch.get(intent)
+        if not ch:
+            continue
+        by_ch[ch]["qcs"].append(qc)
+
+    # Enrich per chapter
+    for ch, obj in by_ch.items():
+        qc_list = obj["qcs"]
+        ari_ids, frt_ids, trg_ids, qi_ids = set(), set(), set(), set()
+        for qc in qc_list:
+            links = qc.get("links") or {}
+            if links.get("ari_id"):
+                ari_ids.add(links["ari_id"])
+            if links.get("frt_id"):
+                frt_ids.add(links["frt_id"])
+            for tid in (links.get("trigger_ids") or []):
+                trg_ids.add(tid)
+            for qid in ((qc.get("mapping") or {}).get("covered_qi_ids") or []):
+                qi_ids.add(qid)
+
+        obj["aris"] = {aid: aris.get(aid) for aid in sorted(list(ari_ids)) if aris.get(aid)}
+        obj["frts"] = {fid: frts.get(fid) for fid in sorted(list(frt_ids)) if frts.get(fid)}
+        obj["triggers"] = {tid: trgs.get(tid) for tid in sorted(list(trg_ids)) if trgs.get(tid)}
+        obj["qi"] = {qid: qi_map.get(qid) for qid in sorted(list(qi_ids)) if qi_map.get(qid)}
+
+    return {"chapters": by_ch}
+
+
 class GTERunner:
     def __init__(self):
         self.results, self.logs = {}, []
@@ -1056,7 +1133,7 @@ class GTERunner:
 
     def run(self, qi_pack: List[Dict[str, Any]], gen_func, level2: bool, forbidden: Set[str], pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         self.logs, self.results = [], {}
-        self.log(f"═══ GTE V31.9.4 — {len(qi_pack)} Qi ═══")
+        self.log(f"═══ GTE V31.9.5 — {len(qi_pack)} Qi ═══")
 
         artifacts_raw = gen_func(qi_pack)
         canon = canonicalize_artifacts(artifacts_raw, qi_pack)
@@ -1066,7 +1143,6 @@ class GTERunner:
         if singletons:
             self.log(f"⚠️ Singletons: {len(singletons)}")
 
-        # A / core validators
         errs = []
         for qi in canon["qi_pack"]:
             ok, e = validate_qi_schema(qi)
@@ -1156,7 +1232,6 @@ class GTERunner:
         self.results["TN-03_DIVERSITY"] = {"pass": div_ok, "count": div_c, "intents": sorted(intents)}
         self.log(f"TN-03 DIVERSITY: {'PASS' if div_ok else 'FAIL'} ({div_c} intents)")
 
-        # B validators (pack-driven) - BLOQUANTS si pack présent
         vb = validators_B(canon, pack)
         chapter_report = vb.pop("_chapter_report", None)
         for k, v in vb.items():
@@ -1169,7 +1244,6 @@ class GTERunner:
             else:
                 self.log(f"{k}: SKIP")
 
-        # Verdict gating
         def is_green(k):
             p = self.results.get(k, {}).get("pass")
             return True if p is None else bool(p)
@@ -1178,10 +1252,9 @@ class GTERunner:
             "TS-01_SCHEMA", "TS-02_REF", "TC-01_COV", "TC-02_PRIM",
             "TD-01_DET_N3", "TD-02_ORDER", "TN-02_IMPORTS", "TA-01_AST",
             "TA-02_LITERALS", "TA-04_PROMPT",
-            "TN-03_DIVERSITY",  # BLOQUANT (fix OPUS)
+            "TN-03_DIVERSITY",
         ]
 
-        # If pack present and schema ok => all B must pass
         pack_present = (pack is not None)
         if pack_present and self.results.get("B-01_PACK_SCHEMA", {}).get("pass") is True:
             b_keys = [k for k in self.results.keys() if k.startswith("B-")]
@@ -1207,19 +1280,26 @@ class GTERunner:
 
 
 def main():
-    st.set_page_config(page_title="SMAXIA GTE V31.9.4", page_icon="🔒", layout="wide")
-    st.title("🔒 SMAXIA GTE Console V31.9.4")
-    st.markdown("**Harnais ISO-PROD — Extraction Qi + QC structure-driven (invariant) + Pack-driven Chapters + Saturation**")
+    st.set_page_config(page_title="SMAXIA GTE V31.9.5", page_icon="🔒", layout="wide")
+    st.title("🔒 SMAXIA GTE Console V31.9.5")
+    st.markdown("**Harnais ISO-PROD — Extraction Qi + QC structure-driven (invariant) + Pack-driven Chapters + Auto-Scrape**")
+
+    if "qi_pack" not in st.session_state:
+        st.session_state["qi_pack"] = []
+    if "harvest_items" not in st.session_state:
+        st.session_state["harvest_items"] = []
+    if "harvest_meta" not in st.session_state:
+        st.session_state["harvest_meta"] = None
 
     # Sidebar
     with st.sidebar:
-        st.header("⚙️ V31.9.4")
+        st.header("⚙️ V31.9.5")
         st.markdown("✓ QC anti-collapse : clustering structurel par markers (EXn-Qm)")
         st.markdown("✓ Zéro keywords métier/langue dans le générateur QC")
         st.markdown("✓ QC formulation conforme : 'Comment ... ?'")
         st.markdown("✓ UI inchangée : 3 tabs + exports + validateurs")
         st.markdown("✓ Chapitres pack-driven (academic_pack.json)")
-        st.markdown("✓ Saturation par volumes (sources.json)")
+        st.markdown("✓ Auto-scrape pack-driven (pack.harvest)")
         st.markdown("---")
 
         st.subheader("TA-02 (optionnel)")
@@ -1234,7 +1314,8 @@ def main():
 
         st.markdown("---")
         st.subheader("Activation Pays (TEST)")
-        st.caption("UI démonstrateur. Aucun hardcode : le pays est une sélection UI, la vérité vient du Pack.")
+
+        # V31.9.5: le pays est sélection UI, mais le "tout academic pays" vient du pack.
         country = st.selectbox("Pays", ["FR"], index=0)
         st.session_state["country_code"] = country
 
@@ -1247,22 +1328,52 @@ def main():
             okp, perrs = validate_pack_schema(pack)
             if okp:
                 st.success(f"Pack OK: {pack.get('pack_id')} ({pack.get('country_code')})")
+                # Visualisation "tout academic pays"
+                with st.expander("Voir Academic Pack (résumé)", expanded=False):
+                    st.json({
+                        "pack_id": pack.get("pack_id"),
+                        "country_code": pack.get("country_code"),
+                        "signature": pack.get("signature"),
+                        "chapters_count": len(pack.get("chapters") or []),
+                        "chapters_preview": (pack.get("chapters") or [])[:10],
+                        "has_harvest": bool(pack.get("harvest")),
+                        "harvest_keys": sorted(list((pack.get("harvest") or {}).keys())),
+                    })
             else:
                 st.error("Pack invalide (B-01)")
                 st.json(perrs)
         else:
-            st.warning("Uploader academic_pack.json pour activer 'QC par chapitre' + Validateurs B.")
+            st.warning("Uploader academic_pack.json (requis pour chapitres + auto-scrape).")
 
-        st.subheader("Sources Harvester (DATA)")
-        src_up = st.file_uploader("sources.json (URLs PDF sujet + correction)", type=["json"], key="sources")
-        sources, src_err = load_sources_json(src_up)
-        if src_err:
-            st.error(src_err)
-        elif sources:
-            st.success(f"Sources chargées: {len(sources.get('items', []))} items")
-            st.session_state["sources"] = sources
+        st.subheader("Auto-Scrape (pack-driven)")
+        st.caption("Vous donnez Volume; le scraping démarre. Les SEEDS + regex viennent du Pack (pas du code).")
+        vol = st.number_input("Volume (nb de sujets à récupérer)", min_value=1, value=20, step=5, key="auto_vol")
+
+        # Sequencement conseillé (sans hardcode): lire pack.harvest.sequencing.dimensions
+        seq_hint = None
+        if pack and isinstance(pack.get("harvest"), dict):
+            seq_hint = (pack.get("harvest") or {}).get("sequencing", {})
+        if seq_hint:
+            st.info(f"Séquencement (pack): {seq_hint}")
+
+        if st.button("⛽ LANCER AUTO-SCRAPE", type="primary", use_container_width=True, disabled=(pack is None)):
+            okh, herrs = (False, ["Pack requis"])
+            if pack:
+                okh, herrs = validate_pack_harvest(pack)
+            if not okh:
+                st.error("Auto-scrape impossible (pack.harvest invalide).")
+                st.json(herrs)
+            else:
+                with st.spinner("Scraping (pack-driven) ..."):
+                    out = pack_auto_scrape(pack, int(vol))
+                    st.session_state["harvest_meta"] = out.get("meta")
+                    st.session_state["harvest_items"] = out.get("items") or []
+                st.success(f"Harvest: {len(st.session_state['harvest_items'])} items (ok)")
+
+        if st.session_state.get("harvest_items"):
+            st.success(f"Bibliothèque Harvest prête: {len(st.session_state['harvest_items'])} items")
         else:
-            st.info("Uploader sources.json pour activer Harvester + Saturation.")
+            st.info("Aucun item harvest pour l’instant.")
 
     tab1, tab2, tab3 = st.tabs(["📥 Entrée", "🚀 Pipeline", "📊 Résultats"])
 
@@ -1308,28 +1419,75 @@ def main():
 
         else:
             st.subheader("📄 Import PDF")
+
             if pdfplumber is None:
                 st.error("pdfplumber non installé")
             else:
-                subj = st.file_uploader("PDF Sujet", type=["pdf"], key="subj")
-                corr = st.file_uploader("PDF Correction (opt)", type=["pdf"], key="corr")
+                # V31.9.5: Harvested Library selector (équivalent "apparaitre dans Import PDF")
+                st.markdown("#### Bibliothèque Harvest (Auto-Scrape)")
+                harvest_items = st.session_state.get("harvest_items") or []
+                if harvest_items:
+                    labels = [f"{i+1:03d} — {it.get('label','subject.pdf')} {'(corr)' if it.get('correction_bytes') else '(no corr)'}"
+                              for i, it in enumerate(harvest_items)]
+                    pick = st.selectbox("Choisir un sujet scrappé", list(range(len(labels))), format_func=lambda i: labels[i], key="harv_pick")
+                    colh1, colh2, colh3 = st.columns([1, 1, 2])
+                    with colh1:
+                        if st.button("📌 Charger ce sujet", use_container_width=True):
+                            it = harvest_items[int(pick)]
+                            st.session_state["import_subject_bytes"] = it.get("subject_bytes")
+                            st.session_state["import_correction_bytes"] = it.get("correction_bytes")
+                            st.session_state["import_label"] = it.get("label")
+                            st.success("Chargé en session (Import PDF).")
+                    with colh2:
+                        if st.button("🧹 Vider Import session", use_container_width=True):
+                            st.session_state.pop("import_subject_bytes", None)
+                            st.session_state.pop("import_correction_bytes", None)
+                            st.session_state.pop("import_label", None)
+                            st.info("Session import vidée.")
+                    with colh3:
+                        st.caption("Note: Streamlit ne permet pas de remplir automatiquement un file_uploader; ceci est l’équivalent ISO-PROD.")
+
+                    if st.session_state.get("harvest_meta"):
+                        with st.expander("Meta auto-scrape", expanded=False):
+                            st.json(st.session_state["harvest_meta"])
+                else:
+                    st.info("Pas d’items harvest. Lancez AUTO-SCRAPE dans la Sidebar.")
+
+                st.markdown("---")
+                st.markdown("#### Import manuel (upload) — toujours disponible")
+                subj = st.file_uploader("PDF Sujet (upload)", type=["pdf"], key="subj_up")
+                corr = st.file_uploader("PDF Correction (opt) (upload)", type=["pdf"], key="corr_up")
+
+                st.markdown("---")
                 auto = st.checkbox("Charger automatiquement dans GTE après génération", value=True)
-                if st.button("🧩 Générer qi_pack.json", type="primary", disabled=(subj is None)):
-                    try:
-                        import_meta, qi_pack = build_qi_pack_from_pdfs(subj.read(), corr.read() if corr else None)
-                        st.success(f"✓ Généré: {len(qi_pack)} Qi")
-                        st.expander("Meta extraction / alignement", expanded=False).json(import_meta)
-                        st.download_button(
-                            "📥 Télécharger qi_pack.json",
-                            canonical_json({"meta": import_meta, "qi_pack": qi_pack}),
-                            "qi_pack.json",
-                        )
-                        if auto:
-                            st.session_state["qi_pack"] = qi_pack
-                            st.session_state["import_meta"] = import_meta
-                            st.info("✓ Pack chargé (tab Pipeline).")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+                if st.button("🧩 Générer qi_pack.json", type="primary"):
+                    # Priorité: bytes en session (harvest) sinon upload
+                    sb = st.session_state.get("import_subject_bytes")
+                    cb = st.session_state.get("import_correction_bytes")
+
+                    if sb is None:
+                        if subj is None:
+                            st.error("Aucun PDF (ni harvest, ni upload).")
+                        else:
+                            sb = subj.read()
+                            cb = corr.read() if corr else None
+
+                    if sb is not None:
+                        try:
+                            import_meta, qi_pack = build_qi_pack_from_pdfs(sb, cb)
+                            st.success(f"✓ Généré: {len(qi_pack)} Qi")
+                            st.expander("Meta extraction / alignement", expanded=False).json(import_meta)
+                            st.download_button(
+                                "📥 Télécharger qi_pack.json",
+                                canonical_json({"meta": import_meta, "qi_pack": qi_pack}),
+                                "qi_pack.json",
+                            )
+                            if auto:
+                                st.session_state["qi_pack"] = qi_pack
+                                st.session_state["import_meta"] = import_meta
+                                st.info("✓ Pack chargé (tab Pipeline).")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
 
         if qi_pack:
             st.session_state["qi_pack"] = qi_pack
@@ -1343,7 +1501,9 @@ def main():
             with st.expander("Dernier qi_pack.json généré (aperçu)", expanded=False):
                 st.json({"meta": st.session_state["import_meta"], "qi_pack_preview": st.session_state["qi_pack"][:5]})
             with st.expander("Debug segmentation (preview)", expanded=False):
-                st.json(st.session_state["import_meta"].get("subject_blocks_preview", []))
+                meta = st.session_state["import_meta"]
+                if isinstance(meta, dict):
+                    st.json(meta.get("subject_blocks_preview", []))
 
     # TAB 2
     with tab2:
@@ -1351,7 +1511,7 @@ def main():
 
         lvl2 = st.checkbox("Level 2 (N=10)")
 
-        st.markdown("### A) RUN GTE (sur qi_pack courant)")
+        st.markdown("### RUN GTE (sur qi_pack courant)")
         if st.button("▶️ RUN GTE", type="primary", use_container_width=True):
             qi = st.session_state.get("qi_pack", [])
             if not qi:
@@ -1377,54 +1537,10 @@ def main():
                 else:
                     st.error("# ❌ FAIL")
 
-        st.markdown("---")
-        st.markdown("### B) Activation + Harvest volumes + Saturation (ISO-PROD)")
-        sources = st.session_state.get("sources")
-        items = (sources or {}).get("items", []) if sources else []
-
-        if not items:
-            st.info("Uploader sources.json (sidebar) pour activer la saturation.")
-        else:
-            colA, colB, colC, colD = st.columns(4)
-            with colA:
-                v1 = st.number_input("Volume 1", min_value=1, value=100, step=10)
-            with colB:
-                v2 = st.number_input("Volume 2", min_value=1, value=250, step=10)
-            with colC:
-                v3 = st.number_input("Volume 3", min_value=1, value=500, step=10)
-            with colD:
-                v4 = st.number_input("Volume 4", min_value=1, value=1000, step=10)
-
-            volumes = sorted(list(dict.fromkeys([int(v) for v in [v1, v2, v3, v4] if int(v) > 0])))
-
-            st.caption("Condition d’arrêt: ΔQC == 0 ET orphans == 0 (sur le corpus).")
-
-            if st.button("⛽ ACTIVER + RUN SATURATION", type="primary", use_container_width=True):
-                if not pack:
-                    st.error("Pack requis (academic_pack.json).")
-                else:
-                    okp, perrs = validate_pack_schema(pack)
-                    if not okp:
-                        st.error("Pack invalide (B-01).")
-                        st.json(perrs)
-                    else:
-                        with st.spinner("Harvest + saturation..."):
-                            sat = run_saturation_loop(items, pack, TEST_ONLY_generate_qc_ari_frt_trg, volumes)
-                            st.session_state["saturation"] = sat
-                        st.success(f"Saturation terminée. Stop: {st.session_state['saturation'].get('stop_reason')}")
-
-            st.markdown("#### (Option) Harvest un volume et charger qi_pack")
-            vol_one = st.number_input("Volume (single run)", min_value=1, value=100, step=10, key="vol_one")
-            if st.button("📦 HARVEST volume → charger qi_pack", use_container_width=True):
-                with st.spinner("Harvest..."):
-                    meta_h, qi_pack = harvest_build_qi_pack(items, int(vol_one))
-                    st.session_state["qi_pack"] = qi_pack
-                    st.session_state["import_meta"] = meta_h
-                st.success(f"Chargé: {len(qi_pack)} Qi (volume {vol_one})")
-
     # TAB 3
     with tab3:
         st.header("📊 Résultats")
+
         if "result" not in st.session_state:
             st.info("Run pipeline first")
         else:
@@ -1442,11 +1558,11 @@ def main():
             st.markdown(f"**Hash:** `{m['output_hash'][:32]}...`")
 
             if st.session_state.get("import_meta"):
-                st.subheader("📄 PDF Meta")
+                st.subheader("📄 Meta (PDF ou Harvest)")
                 st.json(st.session_state["import_meta"])
 
             if r.get("chapter_report"):
-                st.subheader("📚 Chapter Report (Pack-driven)")
+                st.subheader("📚 Chapter Report (preuve pack-driven)")
                 st.json(r["chapter_report"])
 
             st.subheader("Validateurs")
@@ -1457,12 +1573,65 @@ def main():
                     st.json(v)
 
             st.markdown("---")
+            st.subheader("🧭 Explorer Chapitre (QC + ARI/FRT/TRG + Qi associés)")
+            if pack is None:
+                st.warning("Uploader academic_pack.json (requis).")
+            else:
+                canon = r.get("artifacts_canon") or {}
+                by_ch = artifacts_by_chapter(canon, pack).get("chapters") or {}
+                chapter_ids = sorted(list(by_ch.keys()))
+                if not chapter_ids:
+                    st.warning("Aucun chapitre exploitable (aucun QC mappé via pack.intent_allowlist).")
+                else:
+                    # Afficher titres
+                    def ch_label(cid: str) -> str:
+                        title = ""
+                        for ch in (pack.get("chapters") or []):
+                            if str(ch.get("chapter_id", "")).strip() == cid:
+                                title = str(ch.get("title", "")).strip()
+                                break
+                        return f"{cid} — {title}" if title else cid
+
+                    sel = st.selectbox("Chapitre", chapter_ids, format_func=ch_label, key="chapter_sel")
+                    obj = by_ch.get(sel) or {}
+                    qc_list = obj.get("qcs") or []
+                    st.info(f"QC dans chapitre: {len(qc_list)}")
+
+                    with st.expander("Liste QC (détails)", expanded=True):
+                        for qc in qc_list[:200]:
+                            qc_id = qc.get("qc_id")
+                            st.markdown(f"**{qc_id}** — {qc.get('qc_formulation')}")
+                            links = qc.get("links") or {}
+                            st.caption(f"ARI={links.get('ari_id')} | FRT={links.get('frt_id')} | TRG={len(links.get('trigger_ids') or [])} | Qi={len((qc.get('mapping') or {}).get('covered_qi_ids') or [])}")
+                            st.json({
+                                "qc": qc,
+                                "ari": obj.get("aris", {}).get(links.get("ari_id")),
+                                "frt": obj.get("frts", {}).get(links.get("frt_id")),
+                                "triggers": [obj.get("triggers", {}).get(t) for t in (links.get("trigger_ids") or []) if obj.get("triggers", {}).get(t)],
+                                "qi_examples": [obj.get("qi", {}).get(q) for q in ((qc.get("mapping") or {}).get("covered_qi_ids") or [])[:5] if obj.get("qi", {}).get(q)],
+                            })
+
+                    chapter_export = {
+                        "chapter_id": sel,
+                        "chapter_title": ch_label(sel),
+                        "qc_count": len(qc_list),
+                        "qcs": qc_list,
+                        "aris": obj.get("aris"),
+                        "frts": obj.get("frts"),
+                        "triggers": obj.get("triggers"),
+                        "qi": obj.get("qi"),
+                        "created_at": datetime.now().isoformat(),
+                        "proof": (r.get("chapter_report") or {}).get("chapters", {}).get(sel, {}),
+                    }
+                    st.download_button("📥 Export chapter_bundle.json", canonical_json(chapter_export), "chapter_bundle.json")
+
+            st.markdown("---")
             st.subheader("📤 Exports")
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 st.download_button(
                     "📥 report.json",
-                    canonical_json({"version": "V31.9.4", "verdict": r["verdict"], "validators": r["validators"], "metrics": m}),
+                    canonical_json({"version": "V31.9.5", "verdict": r["verdict"], "validators": r["validators"], "metrics": m}),
                     "report.json",
                 )
             with c2:
@@ -1474,36 +1643,6 @@ def main():
                     st.download_button("📥 chapter_report.json", canonical_json(r["chapter_report"]), "chapter_report.json")
                 else:
                     st.download_button("📥 chapter_report.json", canonical_json({"note": "No pack or no chapter report"}), "chapter_report.json")
-
-        st.markdown("---")
-        st.subheader("🧪 Rapport Saturation (ISO-PROD)")
-        sat = st.session_state.get("saturation")
-        if not sat:
-            st.info("Aucun rapport saturation. Lancer ACTIVER + RUN SATURATION dans Pipeline.")
-        else:
-            st.caption(f"Stop reason: {sat.get('stop_reason')}")
-            vols = sat.get("volumes", []) or []
-            if vols:
-                for v in vols:
-                    with st.expander(f"Volume {v.get('volume')} — ΔQC={v.get('delta_qc')} — orphans={len(v.get('orphans') or [])}", expanded=False):
-                        st.json({
-                            "volume": v.get("volume"),
-                            "delta_qc": v.get("delta_qc"),
-                            "qc": (v.get("counts") or {}).get("qc"),
-                            "qi": (v.get("counts") or {}).get("qi"),
-                            "orphans_count": (v.get("counts") or {}).get("orphans"),
-                            "validators_b": v.get("validators_b"),
-                            "hash_out": (v.get("hash_out") or "")[:32],
-                        })
-                        st.markdown("**Nouveaux QC (extrait)**")
-                        st.json((v.get("new_qc_ids") or [])[:50])
-                        st.markdown("**Orphans (extrait)**")
-                        st.json((v.get("orphans") or [])[:50])
-                        if v.get("chapter_report"):
-                            st.markdown("**Chapter Report (preuve)**")
-                            st.json(v.get("chapter_report"))
-
-            st.download_button("📥 saturation_report.json", canonical_json(sat), "saturation_report.json")
 
 
 if __name__ == "__main__":
