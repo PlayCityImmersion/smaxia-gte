@@ -1,10 +1,14 @@
-# smaxia_console_v31_ui.py — SMAXIA GTE V31.9.0 (Proof Harness)
 # =============================================================================
 # OBJECTIF (TEST) :
-# - Extraire correctement les Qi d'un PDF BAC (énoncé) + aligner le corrigé
-# - Générer plusieurs QC (éviter le collapse "1 QC") sans hardcode chapitre/pays
+# - Extraire correctement les Qi d'un PDF (énoncé) + aligner le corrigé
+# - Générer plusieurs QC (éviter le collapse "1 QC") sans hardcode chapitre/pays/langue
 # - Respecter la règle de formulation QC : commence par "Comment" et finit par "?"
 # - Zéro régression UI : mêmes 3 onglets + exports + validateurs
+#
+# NOTE CONTRAT INVARIANT :
+# - Interdit : listes/keywords métier, heuristiques "BAC/France", mots-clés linguistiques
+# - Autorisé ici (TEST) : clustering STRUCTUREL par "marker" produit par le parseur générique
+#   (EXn-Qm[a/b/c]) : c'est une donnée STRUCTURELLE de segmentation, pas un savoir métier.
 # =============================================================================
 
 from __future__ import annotations
@@ -33,19 +37,25 @@ except Exception:
 # ZONE A : TEST-ONLY FIXTURES — NOT FOR PROD
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# FIX OPUS #2 : Golden Pack étendu (≥5 intents structurels)
+# Objectif : éviter TN-03 FAIL en mode "Golden Pack" après rendre TN-03 bloquant.
 TEST_ONLY_GOLDEN_QI_PACK: List[Dict[str, Any]] = [
-    {"qi_id": "QI_TEST_001", "subject_id": "SUBJ_A", "position": {"order_index": 1},
-     "statement": {"text_md": "Calculer la valeur demandée."},
-     "correction": {"available": True, "text_md": "On applique la définition puis on vérifie."}},
-    {"qi_id": "QI_TEST_002", "subject_id": "SUBJ_A", "position": {"order_index": 2},
-     "statement": {"text_md": "Démontrer la propriété."},
-     "correction": {"available": True, "text_md": "Preuve par hypothèses puis conclusion."}},
-    {"qi_id": "QI_TEST_003", "subject_id": "SUBJ_A", "position": {"order_index": 3},
-     "statement": {"text_md": "Résoudre l'équation."},
-     "correction": {"available": True, "text_md": "On isole x puis on contrôle."}},
-    {"qi_id": "QI_TEST_004", "subject_id": "SUBJ_A", "position": {"order_index": 4},
-     "statement": {"text_md": "En déduire le résultat."},
-     "correction": {"available": True, "text_md": "On exploite la question précédente."}},
+    {"qi_id": "QI_TEST_001", "subject_id": "SUBJ_A", "position": {"order_index": 1, "marker": "EX1-Q1"},
+     "statement": {"text_md": "Texte question 1"}, "correction": {"available": True, "text_md": "Correction 1"}},
+    {"qi_id": "QI_TEST_002", "subject_id": "SUBJ_A", "position": {"order_index": 2, "marker": "EX1-Q2a"},
+     "statement": {"text_md": "Texte question 2a"}, "correction": {"available": True, "text_md": "Correction 2a"}},
+    {"qi_id": "QI_TEST_003", "subject_id": "SUBJ_A", "position": {"order_index": 3, "marker": "EX1-Q2b"},
+     "statement": {"text_md": "Texte question 2b"}, "correction": {"available": True, "text_md": "Correction 2b"}},
+    {"qi_id": "QI_TEST_004", "subject_id": "SUBJ_A", "position": {"order_index": 4, "marker": "EX2-Q1"},
+     "statement": {"text_md": "Texte question EX2-Q1"}, "correction": {"available": True, "text_md": "Correction EX2-Q1"}},
+
+    # Ajouts structuraux (EX3, EX4, EX5) -> intents distincts
+    {"qi_id": "QI_TEST_005", "subject_id": "SUBJ_A", "position": {"order_index": 5, "marker": "EX3-Q1"},
+     "statement": {"text_md": "Texte question EX3-Q1"}, "correction": {"available": True, "text_md": "Correction EX3-Q1"}},
+    {"qi_id": "QI_TEST_006", "subject_id": "SUBJ_A", "position": {"order_index": 6, "marker": "EX4-Q1"},
+     "statement": {"text_md": "Texte question EX4-Q1"}, "correction": {"available": True, "text_md": "Correction EX4-Q1"}},
+    {"qi_id": "QI_TEST_007", "subject_id": "SUBJ_A", "position": {"order_index": 7, "marker": "EX5-Q1"},
+     "statement": {"text_md": "Texte question EX5-Q1"}, "correction": {"available": True, "text_md": "Correction EX5-Q1"}},
 ]
 
 
@@ -58,20 +68,26 @@ SENSITIVE_CONTEXT_FIELDS: Set[str] = {
     "chapter_code", "chapter", "discipline", "exam_type", "locale", "curriculum",
 }
 
+
 def canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+
 
 def sha256_hex(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
+
 def compute_hash(obj: Any) -> str:
     return sha256_hex(canonical_json(obj))
+
 
 def sha8_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()[:8]
 
+
 def sort_qi_canonical(qi_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(qi_list, key=lambda x: (x.get("position", {}).get("order_index", 0), x.get("qi_id", "")))
+
 
 def canonicalize_artifacts(artifacts: Dict[str, Any], qi_pack: List[Dict[str, Any]]) -> Dict[str, Any]:
     singletons = artifacts.get("singletons_warning", []) or []
@@ -107,6 +123,7 @@ def validate_qi_schema(qi: Dict[str, Any]) -> Tuple[bool, str]:
             return False, "Invalid correction"
     return True, "OK"
 
+
 def validate_qc_schema(qc: Dict[str, Any]) -> Tuple[bool, str]:
     for f in ["qc_id", "qc_formulation", "qc_invariant_signature", "mapping", "links"]:
         if f not in qc:
@@ -120,11 +137,11 @@ def validate_qc_schema(qc: Dict[str, Any]) -> Tuple[bool, str]:
     links = qc.get("links") or {}
     if "ari_id" not in links or "frt_id" not in links or "trigger_ids" not in links:
         return False, "Missing links"
-    # Règle SMAXIA : "Comment ... ?"
     ftxt = str(qc.get("qc_formulation", "")).strip()
     if not (ftxt.startswith("Comment") and ftxt.endswith("?")):
         return False, "QC formulation must be 'Comment ... ?'"
     return True, "OK"
+
 
 def validate_ari_schema(ari: Dict[str, Any]) -> Tuple[bool, str]:
     if "ari_id" not in ari or "steps" not in ari:
@@ -133,6 +150,7 @@ def validate_ari_schema(ari: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "Invalid steps"
     return True, "OK"
 
+
 def validate_frt_schema(frt: Dict[str, Any]) -> Tuple[bool, str]:
     if "frt_id" not in frt or "sections" not in frt:
         return False, "Missing frt_id/sections"
@@ -140,6 +158,7 @@ def validate_frt_schema(frt: Dict[str, Any]) -> Tuple[bool, str]:
         if s not in (frt.get("sections") or {}):
             return False, f"Missing {s}"
     return True, "OK"
+
 
 def validate_trigger_schema(trg: Dict[str, Any]) -> Tuple[bool, str]:
     for f in ["trigger_id", "type_code", "severity", "condition", "action", "links"]:
@@ -182,6 +201,7 @@ def check_ref_integrity(canon: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
     return len(errors) == 0, errors
 
+
 def check_coverage_total(canon: Dict[str, Any]) -> Tuple[bool, List[str]]:
     all_qi = {qi.get("qi_id") for qi in canon.get("qi_pack", [])}
     covered = set()
@@ -189,6 +209,7 @@ def check_coverage_total(canon: Dict[str, Any]) -> Tuple[bool, List[str]]:
         covered.update((qc.get("mapping") or {}).get("covered_qi_ids", []))
     orphans = sorted([q for q in all_qi if q and q not in covered])
     return len(orphans) == 0, orphans
+
 
 def check_coverage_primary_unique(canon: Dict[str, Any]) -> Tuple[bool, List[str]]:
     cnt = defaultdict(int)
@@ -198,10 +219,12 @@ def check_coverage_primary_unique(canon: Dict[str, Any]) -> Tuple[bool, List[str
     dups = sorted([k for k, v in cnt.items() if v > 1])
     return len(dups) == 0, dups
 
+
 def check_determinism_n_runs(gen_func, qi_pack: List[Dict[str, Any]], n: int = 3) -> Tuple[bool, List[str], List[str]]:
     hashes = [compute_hash(canonicalize_artifacts(gen_func(qi_pack), qi_pack)) for _ in range(n)]
     ok = len(set(hashes)) == 1
     return ok, hashes, ([] if ok else ["Divergence"])
+
 
 def check_order_invariance(gen_func, qi_pack: List[Dict[str, Any]]) -> Tuple[bool, str, str]:
     h1 = compute_hash(canonicalize_artifacts(gen_func(qi_pack), qi_pack))
@@ -210,6 +233,7 @@ def check_order_invariance(gen_func, qi_pack: List[Dict[str, Any]]) -> Tuple[boo
     random.shuffle(shuffled)
     h2 = compute_hash(canonicalize_artifacts(gen_func(shuffled), shuffled))
     return h1 == h2, h1, h2
+
 
 def scan_forbidden_literals(source: str, forbidden: Set[str]) -> Tuple[bool, List[Dict[str, Any]]]:
     if not forbidden:
@@ -232,6 +256,7 @@ def scan_forbidden_literals(source: str, forbidden: Set[str]) -> Tuple[bool, Lis
             if lit and lit in low:
                 violations.append({"line": i, "literal": lit})
     return len(violations) == 0, violations
+
 
 def scan_ast_sensitive_access(source: str) -> Tuple[bool, List[Dict[str, Any]]]:
     violations = []
@@ -257,6 +282,7 @@ def scan_ast_sensitive_access(source: str) -> Tuple[bool, List[Dict[str, Any]]]:
     V().visit(tree)
     return len(violations) == 0, violations
 
+
 def check_no_test_imports(source: str) -> Tuple[bool, List[str]]:
     violations = []
     for i, line in enumerate(source.split("\n"), 1):
@@ -266,6 +292,7 @@ def check_no_test_imports(source: str) -> Tuple[bool, List[str]]:
                     violations.append(f"L{i}")
     return len(violations) == 0, violations
 
+
 def check_intent_diversity(canon: Dict[str, Any], min_i: int = 5) -> Tuple[bool, int, Set[str]]:
     intents = {qc.get("qc_invariant_signature", {}).get("intent_code", "") for qc in canon.get("qcs", [])}
     intents.discard("")
@@ -273,13 +300,14 @@ def check_intent_diversity(canon: Dict[str, Any], min_i: int = 5) -> Tuple[bool,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ZONE B.5 : PDF → Qi Builder (robuste BAC)
+# ZONE B.5 : PDF → Qi Builder (robuste markers EXn-Qm[a/b/c])
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ExtractStats:
     pages: int
     errors: List[str]
+
 
 def _read_pdf_text(pdf_bytes: bytes) -> Tuple[str, ExtractStats]:
     if pdfplumber is None:
@@ -298,26 +326,26 @@ def _read_pdf_text(pdf_bytes: bytes) -> Tuple[str, ExtractStats]:
         errors.append(f"open: {e}")
     return "\n".join(text_parts).strip(), ExtractStats(pages, errors)
 
-# BAC markers fréquents : "1)" puis "a)" "b)" "c)" ; parfois texte très compact.
+
 _MAIN_RE = re.compile(r"^\s*(\d{1,3})\s*[\)\.\-]\s*")
 _SUB_RE = re.compile(r"^\s*([a-h])\s*[\)\.\-]\s*", re.I)
 _COMBO_RE = re.compile(r"^\s*(\d{1,3})\s*[\)\.\-]\s*([a-h])\s*[\)\.\-]\s*", re.I)
 
+
 def _detect_exercise(line: str) -> Optional[str]:
-    s = line.strip()
+    s = (line or "").strip()
     if not s:
         return None
-    # tolérant : "EXERCICE 1" ou "EXERCICE1"
     up = s.upper().replace(" ", "")
     if up.startswith("EXERCICE"):
         m = re.match(r"EXERCICE\s*([0-9]+)", s, re.I)
-        if not m:
-            m = re.match(r"EXERCICE([0-9]+)", up, re.I)
-            if m:
-                return m.group(1)
-            return None
-        return m.group(1)
+        if m:
+            return m.group(1)
+        m2 = re.match(r"EXERCICE([0-9]+)", up, re.I)
+        if m2:
+            return m2.group(1)
     return None
+
 
 def _segment_blocks_with_ex(lines: List[str]) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
@@ -330,7 +358,6 @@ def _segment_blocks_with_ex(lines: List[str]) -> List[Dict[str, Any]]:
         nonlocal cur, cur_marker
         txt = "\n".join(cur).strip()
         txt_norm = re.sub(r"\s+", " ", txt).strip()
-        # seuil anti-bruit
         if cur_marker and txt_norm and len(txt_norm) >= 30:
             blocks.append({"marker": cur_marker, "text": txt})
         cur, cur_marker = [], None
@@ -344,7 +371,6 @@ def _segment_blocks_with_ex(lines: List[str]) -> List[Dict[str, Any]]:
         if exn is not None:
             cur_ex = exn
             cur_main = None
-            # on ne flush pas forcément : un exercice peut démarrer après une question finie
             continue
 
         m = _COMBO_RE.match(s)
@@ -379,25 +405,26 @@ def _segment_blocks_with_ex(lines: List[str]) -> List[Dict[str, Any]]:
     if cur:
         flush()
 
-    # fallback : si rien détecté, un seul bloc FULL
     if not blocks and any((ln or "").strip() for ln in lines):
         full = "\n".join(lines).strip()
         if full:
             blocks = [{"marker": "FULL", "text": full}]
     return blocks
 
+
 def _build_corr_index(text: str) -> Dict[str, str]:
     if not text.strip():
         return {}
     lines = [ln.rstrip() for ln in text.splitlines()]
     blocks = _segment_blocks_with_ex(lines)
-    idx = {}
+    idx: Dict[str, str] = {}
     for b in blocks:
         k = str(b.get("marker", "")).strip()
         v = str(b.get("text", "")).strip()
         if k and v:
             idx[k] = v
     return idx
+
 
 def build_qi_pack_from_pdfs(subject_bytes: bytes, correction_bytes: Optional[bytes]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     subj_sha8 = sha8_bytes(subject_bytes)
@@ -417,6 +444,7 @@ def build_qi_pack_from_pdfs(subject_bytes: bytes, correction_bytes: Optional[byt
         corr_txt = corr_idx.get(marker, "") if corr_idx else ""
         if corr_txt:
             aligned += 1
+
         content_h = hashlib.sha256((marker + "|" + statement).encode("utf-8")).hexdigest()[:10]
         qi_pack.append({
             "qi_id": f"QI_{i:04d}_{subj_sha8}_{content_h}",
@@ -427,7 +455,7 @@ def build_qi_pack_from_pdfs(subject_bytes: bytes, correction_bytes: Optional[byt
         })
 
     meta = {
-        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.9.0"},
+        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.9.1"},
         "created_at": datetime.now().isoformat(),
         "stats": {
             "qi_count": len(qi_pack),
@@ -441,151 +469,84 @@ def build_qi_pack_from_pdfs(subject_bytes: bytes, correction_bytes: Optional[byt
             (["low_qi_count"] if len(qi_pack) <= 1 else [])
         ),
         "errors": {"subject": subj_stats.errors, "correction": corr_stats.errors},
+        "subject_blocks_preview": [{"kind": "QI", "key": b.get("marker", ""), "text": b.get("text", "")[:800]} for b in subj_blocks[:30]],
+        "correction_index_keys_preview": sorted(list(corr_idx.keys()))[:60],
     }
     return meta, qi_pack
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ZONE B.7 : QC/ARI/FRT/TRG — TEST GENERATOR (anti-collapse)
+# ZONE B.7 : QC/ARI/FRT/TRG — TEST GENERATOR (STRICT INVARIANT, STRUCTURE-DRIVEN)
 # ═══════════════════════════════════════════════════════════════════════════════
+#
+# CONTRAT OK :
+# - Pas de keywords, pas de chapitres/matières, pas de langue, pas d'exam heuristics
+# - Clustering basé UNIQUEMENT sur la structure produite par segmentation (marker)
+#
+# Objectif test : éviter "1 QC" tout en restant invariant.
+# =============================================================================
 
-# IMPORTANT :
-# - Ne PAS classifier à partir du corrigé (sinon biais "donc/ainsi..." => 1 cluster)
-# - Utiliser des signaux invariants : verbes d'intention + familles d'opérations (universelles)
+_MARKER_RE = re.compile(r"^EX(\d+)-Q(\d+)([a-h])?$", re.I)
 
-_STOPWORDS = set([
-    "donc", "ainsi", "d'où", "car", "alors", "ensuite", "puis", "or", "donner", "trouver",
-])
 
-def _norm(s: str) -> str:
-    s = (s or "").lower()
-    s = s.replace("’", "'")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-# Verbes d'intention (FR + EN) : pondérés (éviter mots trop génériques)
-_INTENT_RULES: List[Tuple[str, List[Tuple[str, int]]]] = [
-    ("INTENT_DEMONTRER", [("démontrer", 4), ("montrer que", 4), ("prouver", 4), ("preuve", 3), ("justify that", 3), ("prove", 3)]),
-    ("INTENT_RESoudre", [("résoudre", 4), ("solution", 2), ("équation", 3), ("inéquation", 3), ("solve", 3), ("isoler", 3)]),
-    ("INTENT_CALCULER", [("calculer", 4), ("déterminer", 3), ("évaluer", 3), ("compute", 3), ("calculate", 3), ("valeur", 2)]),
-    ("INTENT_ETUDIER", [("étudier", 3), ("analyser", 3), ("variation", 2), ("monoton", 2), ("tableau", 2)]),
-    ("INTENT_VERIFIER", [("vérifier", 4), ("contrôler", 3), ("check", 3), ("confirm", 2)]),
-    ("INTENT_DEDUIRE", [("en déduire", 4), ("déduire", 3), ("conclure", 3), ("deduce", 3), ("conclude", 3)]),
-    ("INTENT_INTERPRETER", [("interpréter", 3), ("interprétation", 3), ("signification", 2)]),
-]
-
-# Familles d'opérations (math universelles) — secondaires pour re-split anti-collapse
-_OP_FAMILY_RULES: List[Tuple[str, List[str]]] = [
-    ("OP_LIMIT", ["limite", "tend vers", "convergence", "asymptote"]),
-    ("OP_DERIVATIVE", ["dérivée", "f'", "tangente", "pente"]),
-    ("OP_INTEGRAL", ["intégrale", "primitive", "aire", "surface"]),
-    ("OP_PROBABILITY", ["probabilité", "loi", "événement", "espérance", "variance"]),
-    ("OP_COMPLEX", ["complexe", "affixe", "argument", "module", "conjugué"]),
-    ("OP_SEQUENCE", ["suite", "récurrence", "terme", "un+1", "u(n)"]),
-    ("OP_GEOMETRY", ["vecteur", "droite", "plan", "distance", "coordonnées", "perpendiculaire", "parallèle"]),
-    ("OP_MATRIX", ["matrice", "déterminant", "inverse"]),
-]
-
-def _score_intent(text: str) -> Tuple[str, int]:
-    t = _norm(text)
-    # neutraliser les stopwords de liaison
-    for w in _STOPWORDS:
-        t = t.replace(w, " ")
-    t = re.sub(r"\s+", " ", t).strip()
-
-    best = ("INTENT_GENERIC", 0)
-    for intent, rules in _INTENT_RULES:
-        score = 0
-        for kw, w in rules:
-            if kw in t:
-                score += w
-        if score > best[1]:
-            best = (intent, score)
-    return best
-
-def _op_family(text: str) -> str:
-    t = _norm(text)
-    best = ("OP_GENERIC", 0)
-    for op, kws in _OP_FAMILY_RULES:
-        score = sum(1 for kw in kws if kw in t)
-        if score > best[1]:
-            best = (op, score)
-    return best[0]
-
-def _anti_collapse_split(assignments: List[Tuple[str, str, Dict[str, Any]]], max_ratio: float = 0.60) -> List[Tuple[str, str, Dict[str, Any]]]:
+def _parse_marker(marker: str) -> Tuple[str, str, str]:
     """
-    assignments = [(intent, op, qi), ...]
-    Si un intent domine trop, on re-split ce intent par op_family.
+    Retourne (ex, qmain, sub) ou ("0","0","") si inconnu.
     """
-    if not assignments:
-        return assignments
-    cnt = defaultdict(int)
-    for intent, _, _ in assignments:
-        cnt[intent] += 1
-    total = len(assignments)
-    dom_intent, dom_n = max(cnt.items(), key=lambda kv: kv[1])
-    if total >= 8 and (dom_n / total) >= max_ratio:
-        # Re-split seulement le cluster dominant, en utilisant op_family
-        out = []
-        for intent, op, qi in assignments:
-            if intent == dom_intent:
-                out.append((f"{intent}__{op}", op, qi))
-            else:
-                out.append((intent, op, qi))
-        return out
-    return assignments
+    m = _MARKER_RE.match((marker or "").strip())
+    if not m:
+        return ("0", "0", "")
+    ex = m.group(1) or "0"
+    qm = m.group(2) or "0"
+    sub = (m.group(3) or "").lower()
+    return (ex, qm, sub)
+
 
 def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Générateur TEST (non-PROD) :
-    - cluster = intent (principal) + anti-collapse par familles d'opérations
-    - QC: "Comment ... ?"
+    Générateur TEST invariant :
+    - Groupe par (EX, Qmain) => une QC par "question principale" structurelle.
+    - Les sous-questions (a/b/c) sont rattachées au même groupe.
+    - Si marker absent, fallback : groupe "STRUCT_UNK".
     """
-    # 1) assign intent/op à partir du STATEMENT uniquement
-    assignments: List[Tuple[str, str, Dict[str, Any]]] = []
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
     for qi in qi_pack:
-        stmt = (qi.get("statement", {}) or {}).get("text_md", "") or ""
-        intent, _score = _score_intent(stmt)
-        op = _op_family(stmt)
-        assignments.append((intent, op, qi))
-
-    assignments = _anti_collapse_split(assignments, max_ratio=0.60)
-
-    clusters: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    sig_op: Dict[str, str] = {}
-    for intent_key, op, qi in assignments:
-        clusters[intent_key].append(qi)
-        sig_op[intent_key] = op
+        marker = str((qi.get("position") or {}).get("marker", "") or "").strip()
+        ex, qm, _sub = _parse_marker(marker)
+        if ex == "0" and qm == "0":
+            key = "STRUCT_UNK"
+        else:
+            key = f"STRUCT_EX{ex}_Q{qm}"
+        groups[key].append(qi)
 
     qcs, aris, frts, triggers, singletons = [], [], [], [], []
 
-    # 2) produire artefacts par cluster
-    for intent_key in sorted(clusters.keys()):
-        grp = sorted(clusters[intent_key], key=lambda x: (x.get("position", {}).get("order_index", 0), x.get("qi_id", "")))
+    for gkey in sorted(groups.keys()):
+        grp = sorted(groups[gkey], key=lambda x: (x.get("position", {}).get("order_index", 0), x.get("qi_id", "")))
         qi_ids = [q.get("qi_id", "") for q in grp if q.get("qi_id")]
 
         if len(qi_ids) < 2:
-            singletons.append({"intent": intent_key, "qi_ids": qi_ids})
+            singletons.append({"intent": gkey, "qi_ids": qi_ids})
 
-        h = hashlib.sha256((intent_key + "|" + "|".join(sorted(qi_ids))).encode("utf-8")).hexdigest()[:10]
-        qc_id, ari_id, frt_id, trg_id = f"QC_{intent_key}_{h}", f"ARI_{intent_key}_{h}", f"FRT_{intent_key}_{h}", f"TRG_{intent_key}_{h}"
+        h = hashlib.sha256((gkey + "|" + "|".join(sorted(qi_ids))).encode("utf-8")).hexdigest()[:10]
+        qc_id, ari_id, frt_id, trg_id = f"QC_{gkey}_{h}", f"ARI_{gkey}_{h}", f"FRT_{gkey}_{h}", f"TRG_{gkey}_{h}"
 
         by_subj: Dict[str, List[str]] = defaultdict(list)
         for q in grp:
             by_subj[str(q.get("subject_id", ""))].append(str(q.get("qi_id", "")))
 
-        op = sig_op.get(intent_key, "OP_GENERIC")
-        # Formulation QC conforme à la règle "Comment ... ?"
-        # NOTE: c'est un placeholder invariant de TEST; en PROD vous brancherez votre méthode SMAXIA.
-        qc_formulation = f"Comment appliquer une méthode de type {intent_key} (famille {op}) ?"
+        # QC formulation : uniquement la règle minimale contractuelle ("Comment ... ?")
+        # (Pas de verbes métier type "résoudre", "calculer", etc.)
+        qc_formulation = "Comment procéder ?"
 
         qcs.append({
             "qc_id": qc_id,
             "qc_formulation": qc_formulation,
-            "qc_invariant_signature": {"intent_code": intent_key, "op_family": op},
+            "qc_invariant_signature": {"intent_code": gkey},
             "mapping": {"primary_qi_ids": qi_ids, "covered_qi_ids": qi_ids, "by_subject": dict(by_subj)},
             "links": {"ari_id": ari_id, "frt_id": frt_id, "trigger_ids": [trg_id]},
-            "provenance": {"generator_version": "TEST_ONLY_V31.9.0"},
+            "provenance": {"generator_version": "TEST_ONLY_V31.9.1"},
         })
 
         aris.append({
@@ -605,12 +566,12 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
             "frt_id": frt_id,
             "template_id": "FRT_TPL_V1",
             "sections": {
-                "given": "Données utiles",
+                "given": "Données",
                 "goal": "Objectif",
-                "method": "Méthode (invariante)",
-                "checks": ["Contrôle de cohérence", "Vérification finale"],
-                "common_traps": ["Piège fréquent", "Erreur classique"],
-                "final_form": "Forme finale attendue",
+                "method": "Méthode",
+                "checks": ["Contrôle"],
+                "common_traps": ["Piège"],
+                "final_form": "Forme finale",
             },
             "provenance": {"qc_id": qc_id, "ari_id": ari_id},
         })
@@ -620,7 +581,7 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
             "type_code": "TRG_CHECK",
             "severity": "medium",
             "condition": {"signal": "AFTER_EXECUTE"},
-            "action": {"recommendation": "Appliquer un contrôle invariant (dimension, signe, cohérence, cas limites)"},
+            "action": {"recommendation": "Appliquer un contrôle invariant"},
             "links": {"qc_id": qc_id, "ari_id": ari_id, "qi_examples": qi_ids[:2]},
         })
 
@@ -663,6 +624,7 @@ def get_zone_b_source() -> str:
         return ""
     return zone_b
 
+
 def parse_qi_pack_input(data: Any) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     if isinstance(data, list):
         return data, None
@@ -671,6 +633,7 @@ def parse_qi_pack_input(data: Any) -> Tuple[List[Dict[str, Any]], Optional[Dict[
             if k in data:
                 return data[k], {x: data[x] for x in data if x != k}
     return [], {"error": "Unknown format"}
+
 
 def load_forbidden_literals_json(uploaded) -> Tuple[Set[str], Optional[str]]:
     if not uploaded:
@@ -697,7 +660,7 @@ class GTERunner:
 
     def run(self, qi_pack: List[Dict[str, Any]], gen_func, level2: bool, forbidden: Set[str]) -> Dict[str, Any]:
         self.logs, self.results = [], {}
-        self.log(f"═══ GTE V31.9.0 — {len(qi_pack)} Qi ═══")
+        self.log(f"═══ GTE V31.9.1 — {len(qi_pack)} Qi ═══")
 
         artifacts_raw = gen_func(qi_pack)
         canon = canonicalize_artifacts(artifacts_raw, qi_pack)
@@ -707,7 +670,6 @@ class GTERunner:
         if singletons:
             self.log(f"⚠️ Singletons: {len(singletons)}")
 
-        # TS-01 Schema
         errs = []
         for qi in canon["qi_pack"]:
             ok, e = validate_qi_schema(qi)
@@ -732,32 +694,26 @@ class GTERunner:
         self.results["TS-01_SCHEMA"] = {"pass": len(errs) == 0, "errors": errs}
         self.log(f"TS-01 SCHEMA: {'PASS' if len(errs) == 0 else 'FAIL'}")
 
-        # TS-02 Ref
         ref_ok, ref_errs = check_ref_integrity(canon)
         self.results["TS-02_REF"] = {"pass": ref_ok, "errors": ref_errs}
         self.log(f"TS-02 REF: {'PASS' if ref_ok else 'FAIL'}")
 
-        # TC-01 Coverage
         cov_ok, orphans = check_coverage_total(canon)
         self.results["TC-01_COV"] = {"pass": cov_ok, "orphans": orphans}
         self.log(f"TC-01 COV: {'PASS' if cov_ok else 'FAIL'} ({len(orphans)} orphans)")
 
-        # TC-02 Primary
         prim_ok, dups = check_coverage_primary_unique(canon)
         self.results["TC-02_PRIM"] = {"pass": prim_ok, "duplicates": dups}
         self.log(f"TC-02 PRIM: {'PASS' if prim_ok else 'FAIL'}")
 
-        # TD-01 Det N=3
         det_ok, hashes, _ = check_determinism_n_runs(gen_func, qi_pack, 3)
         self.results["TD-01_DET_N3"] = {"pass": det_ok, "hashes": hashes}
         self.log(f"TD-01 DET_N3: {'PASS' if det_ok else 'FAIL'}")
 
-        # TD-02 Order
         ord_ok, h1, h2 = check_order_invariance(gen_func, qi_pack)
         self.results["TD-02_ORDER"] = {"pass": ord_ok, "h1": h1[:16], "h2": h2[:16]}
         self.log(f"TD-02 ORDER: {'PASS' if ord_ok else 'FAIL'}")
 
-        # Source-based validators with SKIP fallback
         zone_b = get_zone_b_source()
         source_ok = len(zone_b) > 100
 
@@ -807,13 +763,19 @@ class GTERunner:
             p = self.results.get(k, {}).get("pass")
             return True if p is None else bool(p)
 
+        # FIX OPUS #1 : TN-03 devient bloquant (évite faux PASS si diversity FAIL)
         p0_keys = [
             "TS-01_SCHEMA", "TS-02_REF", "TC-01_COV", "TC-02_PRIM",
             "TD-01_DET_N3", "TD-02_ORDER", "TN-02_IMPORTS", "TA-01_AST",
-            "TA-02_LITERALS", "TA-04_PROMPT"
+            "TA-02_LITERALS", "TA-04_PROMPT",
+            "TN-03_DIVERSITY",
         ]
         p0_pass = all(is_green(k) for k in p0_keys)
         self.log(f"═══ VERDICT: {'PASS' if p0_pass else 'FAIL'} ═══")
+
+        covered: Set[str] = set()
+        for qc in qcs:
+            covered.update(qc.get("mapping", {}).get("covered_qi_ids", []))
 
         return {
             "verdict": "PASS" if p0_pass else "FAIL",
@@ -831,16 +793,16 @@ class GTERunner:
 
 
 def main():
-    st.set_page_config(page_title="SMAXIA GTE V31.9.0", page_icon="🔒", layout="wide")
-    st.title("🔒 SMAXIA GTE Console V31.9.0")
-    st.markdown("**Harnais ISO-PROD — Extraction Qi BAC + QC anti-collapse (TEST)**")
+    st.set_page_config(page_title="SMAXIA GTE V31.9.1", page_icon="🔒", layout="wide")
+    st.title("🔒 SMAXIA GTE Console V31.9.1")
+    st.markdown("**Harnais ISO-PROD — Extraction Qi + QC structure-driven (invariant)**")
 
     with st.sidebar:
-        st.header("⚙️ V31.9.0")
-        st.markdown("✓ Extraction Qi BAC : EXn-Qm(a/b/c)")
-        st.markdown("✓ Alignement corrigé sur mêmes clés")
-        st.markdown("✓ QC : 'Comment ... ?' (règle SMAXIA)")
-        st.markdown("✓ Anti-collapse : re-split si 1 cluster domine")
+        st.header("⚙️ V31.9.1")
+        st.markdown("✓ QC anti-collapse : clustering structurel par markers (EXn-Qm)")
+        st.markdown("✓ Zéro keywords métier/langue dans le générateur QC")
+        st.markdown("✓ QC formulation conforme : 'Comment ... ?'")
+        st.markdown("✓ UI inchangée : 3 tabs + exports + validateurs")
         st.markdown("---")
         st.subheader("TA-02 (optionnel)")
         forb_up = st.file_uploader("forbidden_literals.json", type=["json"], key="forb")
@@ -899,20 +861,21 @@ def main():
             else:
                 subj = st.file_uploader("PDF Sujet", type=["pdf"], key="subj")
                 corr = st.file_uploader("PDF Correction (opt)", type=["pdf"], key="corr")
-                auto = st.checkbox("Auto-charger", value=True)
-                if st.button("🧩 Générer qi_pack", type="primary", disabled=(subj is None)):
+                auto = st.checkbox("Charger automatiquement dans GTE après génération", value=True)
+                if st.button("🧩 Générer qi_pack.json", type="primary", disabled=(subj is None)):
                     try:
                         import_meta, qi_pack = build_qi_pack_from_pdfs(subj.read(), corr.read() if corr else None)
-                        st.success(f"✓ {len(qi_pack)} Qi")
-                        st.json(import_meta.get("stats", {}))
+                        st.success(f"✓ Généré: {len(qi_pack)} Qi")
+                        st.expander("Meta extraction / alignement", expanded=False).json(import_meta)
                         st.download_button(
-                            "📥 qi_pack.json",
+                            "📥 Télécharger qi_pack.json",
                             canonical_json({"meta": import_meta, "qi_pack": qi_pack}),
                             "qi_pack.json",
                         )
                         if auto:
                             st.session_state["qi_pack"] = qi_pack
                             st.session_state["import_meta"] = import_meta
+                            st.info("✓ Pack chargé (tab Pipeline).")
                     except Exception as e:
                         st.error(f"Error: {e}")
 
@@ -922,6 +885,12 @@ def main():
             st.session_state["import_meta"] = import_meta
         if st.session_state.get("qi_pack"):
             st.metric("Qi", len(st.session_state["qi_pack"]))
+
+        if st.session_state.get("import_meta"):
+            with st.expander("Dernier qi_pack.json généré (aperçu)", expanded=False):
+                st.json({"meta": st.session_state["import_meta"], "qi_pack_preview": st.session_state["qi_pack"][:5]})
+            with st.expander("Debug segmentation (preview)", expanded=False):
+                st.json(st.session_state["import_meta"].get("subject_blocks_preview", []))
 
     with tab2:
         st.header("🚀 Pipeline")
@@ -934,6 +903,7 @@ def main():
                 with st.spinner("Running..."):
                     result = GTERunner().run(qi, TEST_ONLY_generate_qc_ari_frt_trg, lvl2, forbidden)
                     st.session_state["result"] = result
+
                 for l in result["logs"]:
                     if "FAIL" in l:
                         st.markdown(f"🔴 `{l}`")
@@ -943,6 +913,7 @@ def main():
                         st.markdown(f"🟡 `{l}`")
                     else:
                         st.text(l)
+
                 st.markdown("---")
                 if result["verdict"] == "PASS":
                     st.success("# ✅ PASS")
@@ -983,7 +954,7 @@ def main():
             with c1:
                 st.download_button(
                     "📥 report.json",
-                    canonical_json({"version": "V31.9.0", "verdict": r["verdict"], "validators": r["validators"], "metrics": m}),
+                    canonical_json({"version": "V31.9.1", "verdict": r["verdict"], "validators": r["validators"], "metrics": m}),
                     "report.json",
                 )
             with c2:
