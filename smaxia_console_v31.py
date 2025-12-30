@@ -1,22 +1,23 @@
 # =============================================================================
-# SMAXIA GTE Console V31.9.3 (ISO-PROD TEST HARNESS)
+# SMAXIA — GTE Console V31.9.4 (ISO-PROD TEST)
 # =============================================================================
-# OBJECTIF (TEST) :
+# OBJECTIF (TEST ISO-PROD) :
 # - Extraire correctement les Qi d'un PDF (énoncé) + aligner le corrigé
-# - Générer plusieurs QC (éviter le collapse "1 QC") sans hardcode chapitre/pays/langue
-# - Respecter la règle de formulation QC : commence par "Comment" et finit par "?"
+# - Générer plusieurs QC (éviter collapse "1 QC") sans hardcode chapitre/pays/langue
+# - Respecter la règle QC : commence par "Comment" et finit par "?"
 # - Zéro régression UI : mêmes 3 onglets + exports + validateurs
 #
-# PATCH V31.9.3 (DEMANDÉ) :
-# - Upload academic_pack.json
-# - Module “QC par chapitre (pack-driven)” (aucun hardcode : tout vient du Pack)
-# - Validateurs B BLOQUANTS (mapping/borne QC/coverage/cross-leak)
-# - Export chapter_report.json (preuves par chapitre : counts + coverage + anomalies)
+# EXTENSION V31.9.4 :
+# - Zone Activation Pays (UI) + auto-load du Pack (via upload academic_pack.json)
+# - Harvester par volumes via sources.json (DATA)
+# - Boucle Saturation : itérations, ΔQC par volume, stop si ΔQC==0 ET orphans==0
+# - Module "QC par chapitre (pack-driven)" + Validateurs B BLOQUANTS
+# - Export saturation_report.json + chapter_report preuves
 #
 # NOTE CONTRAT INVARIANT :
 # - Interdit : listes/keywords métier, heuristiques "BAC/France", mots-clés linguistiques
-# - Autorisé ici (TEST) : clustering STRUCTUREL par "marker" produit par le parseur générique
-#   (EXn-Qm[a/b/c]) : c'est une donnée STRUCTURELLE de segmentation, pas un savoir métier.
+# - Autorisé (TEST) : clustering STRUCTUREL par marker parseur générique (EXn-Qm[a/b/c])
+# - Chapitre : JAMAIS déduit par texte. Seulement pack-driven (academic_pack.json).
 # =============================================================================
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import io
 import json
 import random
 import re
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -457,7 +459,7 @@ def build_qi_pack_from_pdfs(subject_bytes: bytes, correction_bytes: Optional[byt
         })
 
     meta = {
-        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.9.3"},
+        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.9.4"},
         "created_at": datetime.now().isoformat(),
         "stats": {
             "qi_count": len(qi_pack),
@@ -485,9 +487,6 @@ _MARKER_RE = re.compile(r"^EX(\d+)-Q(\d+)([a-h])?$", re.I)
 
 
 def _parse_marker(marker: str) -> Tuple[str, str, str]:
-    """
-    Retourne (ex, qmain, sub) ou ("0","0","") si inconnu.
-    """
     m = _MARKER_RE.match((marker or "").strip())
     if not m:
         return ("0", "0", "")
@@ -501,8 +500,8 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
     """
     Générateur TEST invariant :
     - Groupe par (EX, Qmain) => une QC par "question principale" structurelle.
-    - Les sous-questions (a/b/c) sont rattachées au même groupe.
-    - Si marker absent, fallback : groupe "STRUCT_UNK".
+    - Sous-questions (a/b/c) rattachées au même groupe.
+    - Fallback STRUCT_UNK.
     """
     groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
@@ -531,7 +530,7 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
         for q in grp:
             by_subj[str(q.get("subject_id", ""))].append(str(q.get("qi_id", "")))
 
-        # QC formulation : uniquement la règle minimale contractuelle ("Comment ... ?")
+        # QC formulation minimale contractuelle (sans verbes métier)
         qc_formulation = "Comment procéder ?"
 
         qcs.append({
@@ -540,7 +539,7 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
             "qc_invariant_signature": {"intent_code": gkey},
             "mapping": {"primary_qi_ids": qi_ids, "covered_qi_ids": qi_ids, "by_subject": dict(by_subj)},
             "links": {"ari_id": ari_id, "frt_id": frt_id, "trigger_ids": [trg_id]},
-            "provenance": {"generator_version": "TEST_ONLY_V31.9.3"},
+            "provenance": {"generator_version": "TEST_ONLY_V31.9.4"},
         })
 
         aris.append({
@@ -594,10 +593,12 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ZONE B.8 : Academic Pack (TEST) — QC by Chapter (pack-driven) + Validators B
+# ZONE B.8 : ACADEMIC PACK (TEST) + VALIDATEURS B (BLOQUANTS)
+# - Chapitre jamais déduit du texte : uniquement pack-driven via intent_allowlist
+# - Le pack est DATA; le code ne contient aucun savoir métier.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_academic_pack(uploaded) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def load_academic_pack_json(uploaded) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not uploaded:
         return None, None
     try:
@@ -611,299 +612,387 @@ def load_academic_pack(uploaded) -> Tuple[Optional[Dict[str, Any]], Optional[str
 
 def validate_pack_schema(pack: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """
-    Schéma minimal strict (TEST) :
+    Minimal required structure (TEST):
     {
       "pack_id": "...",
-      "signature": "...",
-      "subjects": [
-        {
-          "subject_code": "...",
-          "chapters": [
-            {
-              "chapter_code": "...",
-              "qc_min": 6,
-              "qc_max": 15,
-              "intent_allowlist": ["STRUCT_EX1_Q1", ...]
-            }
-          ]
-        }
+      "country_code": "...",
+      "signature": {"pack_hash":"...", "signed_at":"..."},
+      "chapters": [
+        {"chapter_id":"CH_...", "title":"...", "intent_allowlist":["STRUCT_EX1_Q1", ...]},
+        ...
       ]
     }
     """
-    errs: List[str] = []
+    errs = []
     if not isinstance(pack, dict):
-        return False, ["Pack not dict"]
-    for k in ["pack_id", "signature", "subjects"]:
-        if k not in pack:
-            errs.append(f"Missing pack.{k}")
-    if errs:
-        return False, errs
-    if not isinstance(pack.get("subjects"), list) or len(pack["subjects"]) < 1:
-        return False, ["pack.subjects must be non-empty list"]
-    for si, subj in enumerate(pack["subjects"], 1):
-        if not isinstance(subj, dict):
-            errs.append(f"subjects[{si}] not dict")
-            continue
-        if "subject_code" not in subj:
-            errs.append(f"subjects[{si}].subject_code missing")
-        chs = subj.get("chapters")
-        if not isinstance(chs, list) or len(chs) < 1:
-            errs.append(f"subjects[{si}].chapters must be non-empty list")
-            continue
-        for ci, ch in enumerate(chs, 1):
+        return False, ["pack must be dict"]
+    for f in ["pack_id", "country_code", "signature", "chapters"]:
+        if f not in pack:
+            errs.append(f"Missing {f}")
+    if not isinstance(pack.get("chapters"), list) or len(pack.get("chapters") or []) < 1:
+        errs.append("chapters must be non-empty list")
+    else:
+        for i, ch in enumerate(pack["chapters"], 1):
             if not isinstance(ch, dict):
-                errs.append(f"subjects[{si}].chapters[{ci}] not dict")
+                errs.append(f"chapters[{i}] must be object")
                 continue
-            for k in ["chapter_code", "qc_min", "qc_max", "intent_allowlist"]:
-                if k not in ch:
-                    errs.append(f"subjects[{si}].chapters[{ci}].{k} missing")
-            if "intent_allowlist" in ch and not isinstance(ch["intent_allowlist"], list):
-                errs.append(f"subjects[{si}].chapters[{ci}].intent_allowlist must be list")
-            if "qc_min" in ch and "qc_max" in ch:
-                try:
-                    mn, mx = int(ch["qc_min"]), int(ch["qc_max"])
-                    if mn < 0 or mx < 0 or mx < mn:
-                        errs.append(f"subjects[{si}].chapters[{ci}] invalid qc_min/qc_max")
-                except Exception:
-                    errs.append(f"subjects[{si}].chapters[{ci}] qc_min/qc_max must be int")
+            for f in ["chapter_id", "intent_allowlist"]:
+                if f not in ch:
+                    errs.append(f"chapters[{i}] missing {f}")
+            ial = ch.get("intent_allowlist")
+            if not isinstance(ial, list) or len(ial) < 1:
+                errs.append(f"chapters[{i}].intent_allowlist must be non-empty list")
+            else:
+                for it in ial:
+                    if not str(it).strip():
+                        errs.append(f"chapters[{i}].intent_allowlist has empty")
+    sig = pack.get("signature")
+    if not isinstance(sig, dict) or "pack_hash" not in sig:
+        errs.append("signature.pack_hash missing")
     return len(errs) == 0, errs
 
 
-def build_pack_index(pack: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Index :
-    - intent -> (subject_code, chapter_code)
-    - chapter_meta[(subject_code, chapter_code)] -> {qc_min,qc_max,intents}
-    """
-    intent_to_chapter: Dict[str, Dict[str, str]] = {}
-    chapter_meta: Dict[str, Dict[str, Any]] = {}
-
-    for subj in pack.get("subjects", []):
-        sc = str(subj.get("subject_code", "")).strip()
-        for ch in (subj.get("chapters") or []):
-            cc = str(ch.get("chapter_code", "")).strip()
-            key = f"{sc}::{cc}"
-            intents = [str(x).strip() for x in (ch.get("intent_allowlist") or []) if str(x).strip()]
-            qc_min = int(ch.get("qc_min", 0))
-            qc_max = int(ch.get("qc_max", 0))
-            chapter_meta[key] = {
-                "subject_code": sc,
-                "chapter_code": cc,
-                "qc_min": qc_min,
-                "qc_max": qc_max,
-                "intent_allowlist": intents,
-            }
-            for it in intents:
-                intent_to_chapter[it] = {"subject_code": sc, "chapter_code": cc}
-
-    return {"intent_to_chapter": intent_to_chapter, "chapter_meta": chapter_meta}
-
-
-def qc_intent(qc: Dict[str, Any]) -> str:
-    return str((qc.get("qc_invariant_signature") or {}).get("intent_code", "")).strip()
-
-
-def compute_chapter_report(canon: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Report pack-driven :
-    - Map QC -> chapter via intent_allowlist
-    - Per chapter: QC list + ARI/FRT/TRG + Qi (primary/covered)
-    - Validators B evidence
-    """
-    idx = build_pack_index(pack)
-    intent_to = idx["intent_to_chapter"]
-    chapter_meta = idx["chapter_meta"]
-
-    # Map QC -> chapter
-    qc_to_chapter: Dict[str, Optional[str]] = {}
-    unmapped_qc: List[str] = []
-    multi_mapped_intents: Dict[str, List[str]] = defaultdict(list)
-
-    # detect intent appearing in multiple chapters (should not happen in pack)
-    intent_chapters: Dict[str, Set[str]] = defaultdict(set)
-    for ch_key, meta in chapter_meta.items():
-        for it in meta.get("intent_allowlist", []):
-            intent_chapters[it].add(ch_key)
-    for it, chs in intent_chapters.items():
-        if len(chs) > 1:
-            multi_mapped_intents[it] = sorted(list(chs))
-
-    for qc in canon.get("qcs", []):
-        qid = str(qc.get("qc_id", ""))
-        it = qc_intent(qc)
-        if not it or it not in intent_to:
-            qc_to_chapter[qid] = None
-            unmapped_qc.append(qid)
-        else:
-            sc = intent_to[it]["subject_code"]
-            cc = intent_to[it]["chapter_code"]
-            qc_to_chapter[qid] = f"{sc}::{cc}"
-
-    # Prepare reverse maps
-    qcs_by_chapter: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for qc in canon.get("qcs", []):
-        ch = qc_to_chapter.get(str(qc.get("qc_id", "")))
-        if ch:
-            qcs_by_chapter[ch].append(qc)
-
-    # Lookups for linked artifacts
-    aris = {a.get("ari_id"): a for a in canon.get("aris", [])}
-    frts = {f.get("frt_id"): f for f in canon.get("frts", [])}
-    trgs = {t.get("trigger_id"): t for t in canon.get("triggers", [])}
-
-    # Build chapter details
-    chapters_out: Dict[str, Any] = {}
-    for ch_key, meta in chapter_meta.items():
-        ch_qcs = sorted(qcs_by_chapter.get(ch_key, []), key=lambda x: x.get("qc_id", ""))
-        qc_ids = [qc.get("qc_id") for qc in ch_qcs]
-
-        # Qi assignment (pack-driven via mapped QC):
-        primary_qi: Set[str] = set()
-        covered_qi: Set[str] = set()
-        for qc in ch_qcs:
-            mp = qc.get("mapping") or {}
-            primary_qi.update([str(x) for x in (mp.get("primary_qi_ids") or []) if str(x)])
-            covered_qi.update([str(x) for x in (mp.get("covered_qi_ids") or []) if str(x)])
-
-        # Compose QC entries with links
-        qc_entries: List[Dict[str, Any]] = []
-        for qc in ch_qcs:
-            links = qc.get("links") or {}
-            ari_id = links.get("ari_id")
-            frt_id = links.get("frt_id")
-            trg_ids = links.get("trigger_ids") or []
-            qc_entries.append({
-                "qc": qc,
-                "ari": aris.get(ari_id),
-                "frt": frts.get(frt_id),
-                "triggers": [trgs.get(tid) for tid in trg_ids if tid in trgs],
-                "qi_primary_ids": (qc.get("mapping") or {}).get("primary_qi_ids", []),
-                "qi_covered_ids": (qc.get("mapping") or {}).get("covered_qi_ids", []),
-            })
-
-        chapters_out[ch_key] = {
-            "subject_code": meta["subject_code"],
-            "chapter_code": meta["chapter_code"],
-            "qc_min": meta["qc_min"],
-            "qc_max": meta["qc_max"],
-            "qc_count": len(ch_qcs),
-            "qc_ids": qc_ids,
-            "qi_primary_count": len(primary_qi),
-            "qi_covered_count": len(covered_qi),
-            "qi_primary_ids": sorted(list(primary_qi)),
-            "qi_covered_ids": sorted(list(covered_qi)),
-            "entries": qc_entries,
-        }
-
-    # Cross-leak evidence:
-    # A Qi should not be covered ONLY by chapters different from its primary-chapter.
-    # We define primary-chapter(Qi) = chapter of the QC that lists it in primary_qi_ids.
-    qi_primary_ch: Dict[str, str] = {}
-    for qc in canon.get("qcs", []):
-        ch = qc_to_chapter.get(str(qc.get("qc_id", ""))) or ""
-        for qi in ((qc.get("mapping") or {}).get("primary_qi_ids") or []):
-            if qi and ch:
-                qi_primary_ch[str(qi)] = ch
-
-    qi_covered_chs: Dict[str, Set[str]] = defaultdict(set)
-    for qc in canon.get("qcs", []):
-        ch = qc_to_chapter.get(str(qc.get("qc_id", ""))) or ""
-        for qi in ((qc.get("mapping") or {}).get("covered_qi_ids") or []):
-            if qi and ch:
-                qi_covered_chs[str(qi)].add(ch)
-
-    cross_leak: List[Dict[str, Any]] = []
-    for qi, pch in qi_primary_ch.items():
-        chs = qi_covered_chs.get(qi, set())
-        if not chs:
-            cross_leak.append({"qi_id": qi, "primary_chapter": pch, "covered_chapters": [], "type": "NO_COVERED_CHAPTER"})
-        else:
-            if pch not in chs:
-                cross_leak.append({"qi_id": qi, "primary_chapter": pch, "covered_chapters": sorted(list(chs)), "type": "COVERED_OUTSIDE_PRIMARY"})
-
-    report = {
-        "version": "V31.9.3",
-        "created_at": datetime.now().isoformat(),
-        "pack_ref": {"pack_id": pack.get("pack_id"), "signature": pack.get("signature")},
-        "mapping": {
-            "qc_to_chapter": qc_to_chapter,
-            "unmapped_qc_ids": unmapped_qc,
-            "multi_mapped_intents_in_pack": dict(multi_mapped_intents),
-        },
-        "chapters": chapters_out,
-        "evidence": {
-            "cross_leak_qi": cross_leak,
-        }
-    }
-    return report
+def _pack_intent_to_chapter(pack: Dict[str, Any]) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    for ch in pack.get("chapters", []) or []:
+        cid = str(ch.get("chapter_id", "")).strip()
+        for intent in (ch.get("intent_allowlist") or []):
+            it = str(intent).strip()
+            if not it:
+                continue
+            # if duplicated across chapters -> violation handled in validators_B
+            if it not in m:
+                m[it] = cid
+    return m
 
 
 def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Validateurs B BLOQUANTS :
-    B-01_PACK_SCHEMA
-    B-02_QC_MAP_TOTAL (toute QC mappée par pack)
-    B-03_QC_COUNT_BOUNDS (qc_min/qc_max)
-    B-04_COVER_100_CHAPTER (tous les Qi primaires du chapitre couverts par des QC du chapitre)
-    B-05_NO_CROSS_LEAK (pas de Qi couvert uniquement hors de son chapitre primaire)
+    B Validators = BLOQUANTS dès qu’un pack est présent.
+    - B-01_PACK_SCHEMA
+    - B-02_INTENT_UNIQUE (no intent in multiple chapters)
+    - B-03_QC_CHAPTER_MAPPING (every QC intent maps to a chapter)
+    - B-04_QI_COVERAGE_PER_CHAPTER (orphans=0 per chapter on corpus)
+    Evidence: chapter_report
     """
     out: Dict[str, Any] = {}
+    chapter_report = {
+        "pack_ref": None,
+        "created_at": datetime.now().isoformat(),
+        "chapters": {},
+        "violations": [],
+    }
+
     if not pack:
-        out["B-01_PACK_SCHEMA"] = {"pass": False, "errors": ["Pack not provided"]}
-        out["B-02_QC_MAP_TOTAL"] = {"pass": False, "errors": ["Pack not provided"]}
-        out["B-03_QC_COUNT_BOUNDS"] = {"pass": False, "errors": ["Pack not provided"]}
-        out["B-04_COVER_100_CHAPTER"] = {"pass": False, "errors": ["Pack not provided"]}
-        out["B-05_NO_CROSS_LEAK"] = {"pass": False, "errors": ["Pack not provided"]}
-        out["_chapter_report"] = None
+        out["B-00_PACK_PRESENT"] = {"pass": None, "note": "No pack provided"}
+        out["_chapter_report"] = chapter_report
         return out
 
-    ok_schema, errs = validate_pack_schema(pack)
-    out["B-01_PACK_SCHEMA"] = {"pass": ok_schema, "errors": errs}
-    if not ok_schema:
-        out["B-02_QC_MAP_TOTAL"] = {"pass": False, "errors": ["Pack schema invalid"]}
-        out["B-03_QC_COUNT_BOUNDS"] = {"pass": False, "errors": ["Pack schema invalid"]}
-        out["B-04_COVER_100_CHAPTER"] = {"pass": False, "errors": ["Pack schema invalid"]}
-        out["B-05_NO_CROSS_LEAK"] = {"pass": False, "errors": ["Pack schema invalid"]}
-        out["_chapter_report"] = None
+    okp, perrs = validate_pack_schema(pack)
+    out["B-01_PACK_SCHEMA"] = {"pass": okp, "errors": perrs}
+    if not okp:
+        chapter_report["pack_ref"] = {"pack_id": pack.get("pack_id"), "country_code": pack.get("country_code")}
+        out["_chapter_report"] = chapter_report
         return out
 
-    chapter_report = compute_chapter_report(canon, pack)
+    # B-02: intent uniqueness across chapters
+    seen: Dict[str, str] = {}
+    dups: List[Dict[str, str]] = []
+    for ch in pack.get("chapters", []) or []:
+        cid = str(ch.get("chapter_id", "")).strip()
+        for intent in (ch.get("intent_allowlist") or []):
+            it = str(intent).strip()
+            if not it:
+                continue
+            if it in seen and seen[it] != cid:
+                dups.append({"intent": it, "chapters": f"{seen[it]}|{cid}"})
+            else:
+                seen[it] = cid
+    out["B-02_INTENT_UNIQUE"] = {"pass": len(dups) == 0, "duplicates": dups}
+
+    intent_to_chapter = _pack_intent_to_chapter(pack)
+
+    # B-03: all QC mapped
+    unmapped_qc = []
+    qc_to_chapter: Dict[str, str] = {}
+    for qc in canon.get("qcs", []) or []:
+        intent = str((qc.get("qc_invariant_signature") or {}).get("intent_code", "")).strip()
+        qc_id = str(qc.get("qc_id", "")).strip()
+        cid = intent_to_chapter.get(intent)
+        if not cid:
+            unmapped_qc.append({"qc_id": qc_id, "intent": intent})
+        else:
+            qc_to_chapter[qc_id] = cid
+    out["B-03_QC_CHAPTER_MAPPING"] = {"pass": len(unmapped_qc) == 0, "unmapped_qc": unmapped_qc}
+
+    # Build chapter-wise coverage evidence on corpus
+    all_qi = [q for q in (canon.get("qi_pack") or [])]
+    qi_ids_all = [str(q.get("qi_id", "")).strip() for q in all_qi if str(q.get("qi_id", "")).strip()]
+
+    # Map QC -> its covered qi_ids
+    qc_cov: Dict[str, Set[str]] = {}
+    for qc in canon.get("qcs", []) or []:
+        qc_id = str(qc.get("qc_id", "")).strip()
+        cov_ids = set([str(x).strip() for x in (qc.get("mapping") or {}).get("covered_qi_ids", []) if str(x).strip()])
+        qc_cov[qc_id] = cov_ids
+
+    # Assign each Qi to a chapter = union of chapters of QCs that cover it
+    qi_to_chapters: Dict[str, Set[str]] = {qid: set() for qid in qi_ids_all}
+    for qc_id, cov_ids in qc_cov.items():
+        ch_id = qc_to_chapter.get(qc_id)
+        if not ch_id:
+            continue
+        for qi_id in cov_ids:
+            if qi_id in qi_to_chapters:
+                qi_to_chapters[qi_id].add(ch_id)
+
+    # Violations: Qi covered by QCs from multiple chapters (cross-leak) or no chapter
+    cross = [qi_id for qi_id, s in qi_to_chapters.items() if len(s) > 1]
+    no_ch = [qi_id for qi_id, s in qi_to_chapters.items() if len(s) == 0]
+
+    out["B-04_QI_CHAPTER_ASSIGNMENT"] = {
+        "pass": (len(cross) == 0 and len(no_ch) == 0),
+        "cross_leak_qi": cross[:500],
+        "unassigned_qi": no_ch[:500],
+        "counts": {"cross_leak": len(cross), "unassigned": len(no_ch)},
+    }
+
+    # Evidence per chapter (on corpus): Qi that belong to that chapter = those whose assigned set == {chapter}
+    chapters_ids = [str(ch.get("chapter_id", "")).strip() for ch in (pack.get("chapters") or []) if str(ch.get("chapter_id", "")).strip()]
+    chapter_report["pack_ref"] = {
+        "pack_id": pack.get("pack_id"),
+        "country_code": pack.get("country_code"),
+        "pack_hash": (pack.get("signature") or {}).get("pack_hash"),
+    }
+
+    # Determine QC list per chapter
+    chapter_qc: Dict[str, List[str]] = defaultdict(list)
+    for qc_id, ch_id in qc_to_chapter.items():
+        chapter_qc[ch_id].append(qc_id)
+    for ch in chapters_ids:
+        chapter_qc[ch] = sorted(list(set(chapter_qc.get(ch, []))))
+
+    # Qi per chapter: those uniquely assigned to that chapter
+    chapter_qi: Dict[str, List[str]] = defaultdict(list)
+    for qi_id, s in qi_to_chapters.items():
+        if len(s) == 1:
+            chapter_qi[list(s)[0]].append(qi_id)
+    for ch in chapters_ids:
+        chapter_qi[ch] = sorted(chapter_qi.get(ch, []))
+
+    # Coverage per chapter: Qi covered by QCs of that chapter
+    chapter_cov: Dict[str, Set[str]] = defaultdict(set)
+    for ch in chapters_ids:
+        for qc_id in chapter_qc.get(ch, []):
+            chapter_cov[ch].update(qc_cov.get(qc_id, set()))
+
+    # Orphans per chapter = Qi assigned to chapter but not covered by its QCs (should be zero)
+    chapter_orphans: Dict[str, List[str]] = {}
+    for ch in chapters_ids:
+        assigned = set(chapter_qi.get(ch, []))
+        covered = chapter_cov.get(ch, set())
+        orph = sorted([q for q in assigned if q not in covered])
+        chapter_orphans[ch] = orph
+
+    all_orphans = [q for ch in chapters_ids for q in chapter_orphans.get(ch, [])]
+    out["B-05_COVERAGE_PER_CHAPTER"] = {
+        "pass": len(all_orphans) == 0,
+        "orphans_total": len(all_orphans),
+        "orphans_preview": all_orphans[:200],
+    }
+
+    # Fill report chapters
+    for ch in chapters_ids:
+        qi_total = len(chapter_qi.get(ch, []))
+        orph = chapter_orphans.get(ch, [])
+        qc_count = len(chapter_qc.get(ch, []))
+        chapter_report["chapters"][ch] = {
+            "qc_count": qc_count,
+            "qi_total": qi_total,
+            "qi_covered": max(0, qi_total - len(orph)),
+            "coverage_ratio": (1.0 if qi_total == 0 else (qi_total - len(orph)) / float(qi_total)),
+            "orphans": orph[:500],
+            "qc_ids": chapter_qc.get(ch, [])[:500],
+        }
+
+    # Global violations
+    if dups:
+        chapter_report["violations"].append({"type": "intent_duplicate_across_chapters", "items": dups[:200]})
+    if unmapped_qc:
+        chapter_report["violations"].append({"type": "unmapped_qc_intents", "items": unmapped_qc[:200]})
+    if cross:
+        chapter_report["violations"].append({"type": "qi_cross_leak", "items": cross[:200]})
+    if no_ch:
+        chapter_report["violations"].append({"type": "qi_unassigned_to_chapter", "items": no_ch[:200]})
+    if all_orphans:
+        chapter_report["violations"].append({"type": "chapter_orphans", "count": len(all_orphans)})
+
     out["_chapter_report"] = chapter_report
-
-    unmapped = chapter_report.get("mapping", {}).get("unmapped_qc_ids", []) or []
-    multi_int = chapter_report.get("mapping", {}).get("multi_mapped_intents_in_pack", {}) or {}
-    b02_errs = []
-    if multi_int:
-        b02_errs.append(f"Pack intent appears in multiple chapters: {len(multi_int)} intents")
-    if unmapped:
-        b02_errs.append(f"Unmapped QC: {len(unmapped)}")
-    out["B-02_QC_MAP_TOTAL"] = {"pass": (len(b02_errs) == 0), "errors": b02_errs, "unmapped_qc_ids": unmapped, "multi_mapped_intents": multi_int}
-
-    # Bounds per chapter
-    b03_errs: List[str] = []
-    for ch_key, ch in (chapter_report.get("chapters") or {}).items():
-        mn = int(ch.get("qc_min", 0))
-        mx = int(ch.get("qc_max", 0))
-        cnt = int(ch.get("qc_count", 0))
-        if cnt < mn or cnt > mx:
-            b03_errs.append(f"{ch_key}: qc_count={cnt} not in [{mn},{mx}]")
-    out["B-03_QC_COUNT_BOUNDS"] = {"pass": (len(b03_errs) == 0), "errors": b03_errs}
-
-    # Coverage 100% per chapter: all primary_qi_ids assigned to chapter must be within covered_qi_ids of same chapter
-    b04_errs: List[str] = []
-    for ch_key, ch in (chapter_report.get("chapters") or {}).items():
-        prim = set(ch.get("qi_primary_ids", []) or [])
-        cov = set(ch.get("qi_covered_ids", []) or [])
-        missing = sorted([q for q in prim if q not in cov])
-        if missing:
-            b04_errs.append(f"{ch_key}: {len(missing)} primary Qi not covered in-chapter")
-    out["B-04_COVER_100_CHAPTER"] = {"pass": (len(b04_errs) == 0), "errors": b04_errs}
-
-    # Cross leak
-    cross = chapter_report.get("evidence", {}).get("cross_leak_qi", []) or []
-    out["B-05_NO_CROSS_LEAK"] = {"pass": (len(cross) == 0), "errors": (["Cross-leak detected"] if cross else []), "items": cross[:200]}
-
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ZONE B.9 : HARVEST + SATURATION (TEST ISO-PROD)
+# - sources.json = DATA (URLs or local paths)
+# - Volume iteration: process batches, track ΔQC and orphans
+# - Stop when ΔQC == 0 AND orphans == 0
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_sources_json(uploaded) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Expected formats:
+    A) {"country_code":"FR","items":[{"subject_url":"...pdf","correction_url":"...pdf"}, ...]}
+    B) {"items":[{"subject_path":"local.pdf","correction_path":"local.pdf"}, ...]}  # optional local mode
+    """
+    if not uploaded:
+        return None, None
+    try:
+        raw = json.load(uploaded)
+        if not isinstance(raw, dict):
+            return None, "sources.json doit être un objet JSON"
+        items = raw.get("items")
+        if not isinstance(items, list) or len(items) < 1:
+            return None, "sources.items doit être une liste non vide"
+        for i, it in enumerate(items, 1):
+            if not isinstance(it, dict):
+                return None, f"items[{i}] must be object"
+            if not (it.get("subject_url") or it.get("subject_path")):
+                return None, f"items[{i}] missing subject_url/subject_path"
+        return raw, None
+    except Exception as e:
+        return None, f"Parse error: {e}"
+
+
+def fetch_pdf_bytes(item: Dict[str, Any], key: str) -> Optional[bytes]:
+    """
+    key in {"subject","correction"}.
+    Uses either *_url or *_path. For URL, downloads bytes.
+    """
+    url = item.get(f"{key}_url")
+    path = item.get(f"{key}_path")
+    if url:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return resp.read()
+    if path:
+        p = Path(str(path))
+        if p.exists() and p.is_file():
+            return p.read_bytes()
+    return None
+
+
+def harvest_build_qi_pack(items: List[Dict[str, Any]], limit: int) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    merged: List[Dict[str, Any]] = []
+    meta_all = {
+        "generator": {"name": "SMAXIA_HARVESTER", "version": "V31.9.4"},
+        "created_at": datetime.now().isoformat(),
+        "limit": limit,
+        "items_total": len(items),
+        "items_used": 0,
+        "per_item": [],
+        "errors": [],
+    }
+
+    used = 0
+    for idx, it in enumerate(items[:limit], 1):
+        try:
+            sb = fetch_pdf_bytes(it, "subject")
+            cb = fetch_pdf_bytes(it, "correction") if (it.get("correction_url") or it.get("correction_path")) else None
+            if not sb:
+                meta_all["errors"].append({"item": idx, "error": "subject bytes missing"})
+                continue
+            meta_i, qi_i = build_qi_pack_from_pdfs(sb, cb)
+            merged.extend(qi_i)
+            meta_all["per_item"].append({
+                "item": idx,
+                "subject_ref": it.get("subject_url") or it.get("subject_path"),
+                "correction_ref": it.get("correction_url") or it.get("correction_path"),
+                "qi_count": meta_i.get("stats", {}).get("qi_count", len(qi_i)),
+                "aligned": meta_i.get("stats", {}).get("aligned", 0),
+                "warnings": meta_i.get("warnings", []),
+            })
+            used += 1
+        except Exception as e:
+            meta_all["errors"].append({"item": idx, "error": str(e)})
+
+    meta_all["items_used"] = used
+    meta_all["qi_total"] = len(merged)
+    return meta_all, merged
+
+
+def saturation_step(gen_func, qi_pack: List[Dict[str, Any]], pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    artifacts_raw = gen_func(qi_pack)
+    canon = canonicalize_artifacts(artifacts_raw, qi_pack)
+    qc_ids = [q.get("qc_id") for q in (canon.get("qcs") or []) if q.get("qc_id")]
+    ok_cov, orphans = check_coverage_total(canon)
+    orphans = [] if ok_cov else (orphans or [])
+
+    vb = validators_B(canon, pack)
+    chapter_report = vb.pop("_chapter_report", None)
+
+    return {
+        "canon": canon,
+        "qc_ids": sorted(qc_ids),
+        "orphans": sorted(list(set(orphans))),
+        "validators_b": vb,
+        "chapter_report": chapter_report,
+        "hash_out": compute_hash(canon),
+        "hash_in": compute_hash(sort_qi_canonical(qi_pack)),
+        "counts": {"qi": len(qi_pack), "qc": len(qc_ids), "orphans": len(orphans)},
+    }
+
+
+def run_saturation_loop(items: List[Dict[str, Any]], pack: Dict[str, Any], gen_func, volumes: List[int]) -> Dict[str, Any]:
+    report = {
+        "version": "V31.9.4",
+        "created_at": datetime.now().isoformat(),
+        "pack_ref": {"pack_id": pack.get("pack_id"), "country_code": pack.get("country_code"), "pack_hash": (pack.get("signature") or {}).get("pack_hash")},
+        "sources_items_total": len(items),
+        "volumes": [],
+        "stop_reason": None,
+        "final": None,
+    }
+
+    prev_qc_set: Set[str] = set()
+    for v in volumes:
+        meta_h, qi_pack = harvest_build_qi_pack(items, v)
+        step = saturation_step(gen_func, qi_pack, pack)
+
+        qc_set = set(step["qc_ids"])
+        new_qc = sorted(list(qc_set - prev_qc_set))
+        delta_qc = len(new_qc)
+        orphans = step["orphans"]
+        orphans_n = len(orphans)
+
+        report["volumes"].append({
+            "volume": v,
+            "harvest_meta": meta_h,
+            "counts": step["counts"],
+            "delta_qc": delta_qc,
+            "new_qc_ids": new_qc[:500],
+            "orphans": orphans[:500],
+            "hash_in": step["hash_in"],
+            "hash_out": step["hash_out"],
+            "validators_b": step["validators_b"],
+            "chapter_report": step["chapter_report"],
+        })
+
+        prev_qc_set = qc_set
+
+        if delta_qc == 0 and orphans_n == 0:
+            report["stop_reason"] = f"SATURATED at volume={v} (ΔQC=0 & orphans=0)"
+            report["final"] = {"volume": v, "qc_total": len(prev_qc_set), "orphans": 0, "hash_out": step["hash_out"]}
+            return report
+
+    report["stop_reason"] = "MAX_VOLUMES_REACHED"
+    last = report["volumes"][-1] if report["volumes"] else None
+    if last:
+        report["final"] = {
+            "volume": last["volume"],
+            "qc_total": last["counts"]["qc"],
+            "orphans": last["counts"]["orphans"],
+            "hash_out": last["hash_out"],
+        }
+    return report
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -967,7 +1056,7 @@ class GTERunner:
 
     def run(self, qi_pack: List[Dict[str, Any]], gen_func, level2: bool, forbidden: Set[str], pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         self.logs, self.results = [], {}
-        self.log(f"═══ GTE V31.9.3 — {len(qi_pack)} Qi ═══")
+        self.log(f"═══ GTE V31.9.4 — {len(qi_pack)} Qi ═══")
 
         artifacts_raw = gen_func(qi_pack)
         canon = canonicalize_artifacts(artifacts_raw, qi_pack)
@@ -977,6 +1066,7 @@ class GTERunner:
         if singletons:
             self.log(f"⚠️ Singletons: {len(singletons)}")
 
+        # A / core validators
         errs = []
         for qi in canon["qi_pack"]:
             ok, e = validate_qi_schema(qi)
@@ -1066,35 +1156,37 @@ class GTERunner:
         self.results["TN-03_DIVERSITY"] = {"pass": div_ok, "count": div_c, "intents": sorted(intents)}
         self.log(f"TN-03 DIVERSITY: {'PASS' if div_ok else 'FAIL'} ({div_c} intents)")
 
-        # --- NEW: Validators B (pack-driven chapters) ---
+        # B validators (pack-driven) - BLOQUANTS si pack présent
         vb = validators_B(canon, pack)
-        # expose report in results for UI
         chapter_report = vb.pop("_chapter_report", None)
-        self.results["TB-01_PACK_SCHEMA"] = vb["B-01_PACK_SCHEMA"]
-        self.results["TB-02_QC_MAP_TOTAL"] = vb["B-02_QC_MAP_TOTAL"]
-        self.results["TB-03_QC_COUNT_BOUNDS"] = vb["B-03_QC_COUNT_BOUNDS"]
-        self.results["TB-04_COVER_100_CHAPTER"] = vb["B-04_COVER_100_CHAPTER"]
-        self.results["TB-05_NO_CROSS_LEAK"] = vb["B-05_NO_CROSS_LEAK"]
+        for k, v in vb.items():
+            self.results[k] = v
+            p = v.get("pass")
+            if p is True:
+                self.log(f"{k}: PASS")
+            elif p is False:
+                self.log(f"{k}: FAIL")
+            else:
+                self.log(f"{k}: SKIP")
 
-        self.log(f"TB-01 PACK_SCHEMA: {'PASS' if self.results['TB-01_PACK_SCHEMA']['pass'] else 'FAIL'}")
-        self.log(f"TB-02 QC_MAP_TOTAL: {'PASS' if self.results['TB-02_QC_MAP_TOTAL']['pass'] else 'FAIL'}")
-        self.log(f"TB-03 QC_COUNT_BOUNDS: {'PASS' if self.results['TB-03_QC_COUNT_BOUNDS']['pass'] else 'FAIL'}")
-        self.log(f"TB-04 COVER_100_CHAPTER: {'PASS' if self.results['TB-04_COVER_100_CHAPTER']['pass'] else 'FAIL'}")
-        self.log(f"TB-05 NO_CROSS_LEAK: {'PASS' if self.results['TB-05_NO_CROSS_LEAK']['pass'] else 'FAIL'}")
-
+        # Verdict gating
         def is_green(k):
             p = self.results.get(k, {}).get("pass")
             return True if p is None else bool(p)
 
-        # --- VERDICT keys (B validators are BLOQUANTS) ---
         p0_keys = [
             "TS-01_SCHEMA", "TS-02_REF", "TC-01_COV", "TC-02_PRIM",
             "TD-01_DET_N3", "TD-02_ORDER", "TN-02_IMPORTS", "TA-01_AST",
             "TA-02_LITERALS", "TA-04_PROMPT",
-            "TN-03_DIVERSITY",
-            "TB-01_PACK_SCHEMA", "TB-02_QC_MAP_TOTAL", "TB-03_QC_COUNT_BOUNDS",
-            "TB-04_COVER_100_CHAPTER", "TB-05_NO_CROSS_LEAK",
+            "TN-03_DIVERSITY",  # BLOQUANT (fix OPUS)
         ]
+
+        # If pack present and schema ok => all B must pass
+        pack_present = (pack is not None)
+        if pack_present and self.results.get("B-01_PACK_SCHEMA", {}).get("pass") is True:
+            b_keys = [k for k in self.results.keys() if k.startswith("B-")]
+            p0_keys.extend(sorted(b_keys))
+
         p0_pass = all(is_green(k) for k in p0_keys)
         self.log(f"═══ VERDICT: {'PASS' if p0_pass else 'FAIL'} ═══")
 
@@ -1115,35 +1207,21 @@ class GTERunner:
 
 
 def main():
-    st.set_page_config(page_title="SMAXIA GTE V31.9.3", page_icon="🔒", layout="wide")
-    st.title("🔒 SMAXIA GTE Console V31.9.3")
-    st.markdown("**Harnais ISO-PROD — Extraction Qi + QC structure-driven (invariant) + QC→Chapitre (pack-driven)**")
+    st.set_page_config(page_title="SMAXIA GTE V31.9.4", page_icon="🔒", layout="wide")
+    st.title("🔒 SMAXIA GTE Console V31.9.4")
+    st.markdown("**Harnais ISO-PROD — Extraction Qi + QC structure-driven (invariant) + Pack-driven Chapters + Saturation**")
 
+    # Sidebar
     with st.sidebar:
-        st.header("⚙️ V31.9.3")
+        st.header("⚙️ V31.9.4")
         st.markdown("✓ QC anti-collapse : clustering structurel par markers (EXn-Qm)")
         st.markdown("✓ Zéro keywords métier/langue dans le générateur QC")
         st.markdown("✓ QC formulation conforme : 'Comment ... ?'")
         st.markdown("✓ UI inchangée : 3 tabs + exports + validateurs")
-        st.markdown("✓ NEW : academic_pack.json + QC par chapitre + validateurs B bloquants")
+        st.markdown("✓ Chapitres pack-driven (academic_pack.json)")
+        st.markdown("✓ Saturation par volumes (sources.json)")
         st.markdown("---")
 
-        st.subheader("Academic Pack (TEST)")
-        pack_up = st.file_uploader("academic_pack.json", type=["json"], key="pack")
-        pack, pack_err = load_academic_pack(pack_up)
-        if pack_err:
-            st.error(pack_err)
-        elif pack:
-            okp, errs = validate_pack_schema(pack)
-            if okp:
-                st.success(f"Pack chargé: {pack.get('pack_id','?')}")
-            else:
-                st.error("Pack invalide")
-                st.json(errs)
-        else:
-            st.warning("Pack requis pour VALIDATEURS B (bloquants)")
-
-        st.markdown("---")
         st.subheader("TA-02 (optionnel)")
         forb_up = st.file_uploader("forbidden_literals.json", type=["json"], key="forb")
         forbidden, forb_err = load_forbidden_literals_json(forb_up)
@@ -1154,11 +1232,45 @@ def main():
         else:
             st.info("TA-02 désactivé")
 
+        st.markdown("---")
+        st.subheader("Activation Pays (TEST)")
+        st.caption("UI démonstrateur. Aucun hardcode : le pays est une sélection UI, la vérité vient du Pack.")
+        country = st.selectbox("Pays", ["FR"], index=0)
+        st.session_state["country_code"] = country
+
+        st.subheader("Academic Pack (Pack-driven)")
+        pack_up = st.file_uploader("academic_pack.json", type=["json"], key="pack")
+        pack, pack_err = load_academic_pack_json(pack_up)
+        if pack_err:
+            st.error(pack_err)
+        elif pack:
+            okp, perrs = validate_pack_schema(pack)
+            if okp:
+                st.success(f"Pack OK: {pack.get('pack_id')} ({pack.get('country_code')})")
+            else:
+                st.error("Pack invalide (B-01)")
+                st.json(perrs)
+        else:
+            st.warning("Uploader academic_pack.json pour activer 'QC par chapitre' + Validateurs B.")
+
+        st.subheader("Sources Harvester (DATA)")
+        src_up = st.file_uploader("sources.json (URLs PDF sujet + correction)", type=["json"], key="sources")
+        sources, src_err = load_sources_json(src_up)
+        if src_err:
+            st.error(src_err)
+        elif sources:
+            st.success(f"Sources chargées: {len(sources.get('items', []))} items")
+            st.session_state["sources"] = sources
+        else:
+            st.info("Uploader sources.json pour activer Harvester + Saturation.")
+
     tab1, tab2, tab3 = st.tabs(["📥 Entrée", "🚀 Pipeline", "📊 Résultats"])
 
+    # TAB 1
     with tab1:
         st.header("📥 Entrée")
         mode = st.radio("Mode", ["Golden Pack", "JSON Upload", "Manuel", "Import Sujet (PDF)"], horizontal=True)
+
         qi_pack, import_meta = [], None
 
         if mode == "Golden Pack":
@@ -1223,6 +1335,7 @@ def main():
             st.session_state["qi_pack"] = qi_pack
         if import_meta:
             st.session_state["import_meta"] = import_meta
+
         if st.session_state.get("qi_pack"):
             st.metric("Qi", len(st.session_state["qi_pack"]))
 
@@ -1232,26 +1345,20 @@ def main():
             with st.expander("Debug segmentation (preview)", expanded=False):
                 st.json(st.session_state["import_meta"].get("subject_blocks_preview", []))
 
+    # TAB 2
     with tab2:
         st.header("🚀 Pipeline")
+
         lvl2 = st.checkbox("Level 2 (N=10)")
+
+        st.markdown("### A) RUN GTE (sur qi_pack courant)")
         if st.button("▶️ RUN GTE", type="primary", use_container_width=True):
             qi = st.session_state.get("qi_pack", [])
             if not qi:
                 st.error("No Qi")
             else:
                 with st.spinner("Running..."):
-                    # Pack from sidebar uploader is not in session_state by default, pass directly:
-                    # Re-load from uploader state if present:
-                    pack_state = None
-                    try:
-                        # Streamlit keeps uploaded file object in widget, not directly accessible here;
-                        # we reuse the already parsed `pack` from outer scope via closure (safe).
-                        pack_state = pack
-                    except Exception:
-                        pack_state = None
-
-                    result = GTERunner().run(qi, TEST_ONLY_generate_qc_ari_frt_trg, lvl2, forbidden, pack_state)
+                    result = GTERunner().run(qi, TEST_ONLY_generate_qc_ari_frt_trg, lvl2, forbidden, pack)
                     st.session_state["result"] = result
 
                 for l in result["logs"]:
@@ -1270,6 +1377,52 @@ def main():
                 else:
                     st.error("# ❌ FAIL")
 
+        st.markdown("---")
+        st.markdown("### B) Activation + Harvest volumes + Saturation (ISO-PROD)")
+        sources = st.session_state.get("sources")
+        items = (sources or {}).get("items", []) if sources else []
+
+        if not items:
+            st.info("Uploader sources.json (sidebar) pour activer la saturation.")
+        else:
+            colA, colB, colC, colD = st.columns(4)
+            with colA:
+                v1 = st.number_input("Volume 1", min_value=1, value=100, step=10)
+            with colB:
+                v2 = st.number_input("Volume 2", min_value=1, value=250, step=10)
+            with colC:
+                v3 = st.number_input("Volume 3", min_value=1, value=500, step=10)
+            with colD:
+                v4 = st.number_input("Volume 4", min_value=1, value=1000, step=10)
+
+            volumes = sorted(list(dict.fromkeys([int(v) for v in [v1, v2, v3, v4] if int(v) > 0])))
+
+            st.caption("Condition d’arrêt: ΔQC == 0 ET orphans == 0 (sur le corpus).")
+
+            if st.button("⛽ ACTIVER + RUN SATURATION", type="primary", use_container_width=True):
+                if not pack:
+                    st.error("Pack requis (academic_pack.json).")
+                else:
+                    okp, perrs = validate_pack_schema(pack)
+                    if not okp:
+                        st.error("Pack invalide (B-01).")
+                        st.json(perrs)
+                    else:
+                        with st.spinner("Harvest + saturation..."):
+                            sat = run_saturation_loop(items, pack, TEST_ONLY_generate_qc_ari_frt_trg, volumes)
+                            st.session_state["saturation"] = sat
+                        st.success(f"Saturation terminée. Stop: {st.session_state['saturation'].get('stop_reason')}")
+
+            st.markdown("#### (Option) Harvest un volume et charger qi_pack")
+            vol_one = st.number_input("Volume (single run)", min_value=1, value=100, step=10, key="vol_one")
+            if st.button("📦 HARVEST volume → charger qi_pack", use_container_width=True):
+                with st.spinner("Harvest..."):
+                    meta_h, qi_pack = harvest_build_qi_pack(items, int(vol_one))
+                    st.session_state["qi_pack"] = qi_pack
+                    st.session_state["import_meta"] = meta_h
+                st.success(f"Chargé: {len(qi_pack)} Qi (volume {vol_one})")
+
+    # TAB 3
     with tab3:
         st.header("📊 Résultats")
         if "result" not in st.session_state:
@@ -1292,6 +1445,10 @@ def main():
                 st.subheader("📄 PDF Meta")
                 st.json(st.session_state["import_meta"])
 
+            if r.get("chapter_report"):
+                st.subheader("📚 Chapter Report (Pack-driven)")
+                st.json(r["chapter_report"])
+
             st.subheader("Validateurs")
             for k, v in r["validators"].items():
                 p = v.get("pass")
@@ -1299,73 +1456,13 @@ def main():
                 with st.expander(f"{icon} {k}"):
                     st.json(v)
 
-            # --- NEW: QC by Chapter ---
-            st.markdown("---")
-            st.subheader("📚 QC par Chapitre (Pack-driven)")
-            if not r.get("chapter_report"):
-                st.warning("Aucun chapter_report (Pack manquant ou invalide, ou RUN non effectué avec pack).")
-            else:
-                cr = r["chapter_report"]
-                st.caption(f"Pack: {cr.get('pack_ref', {}).get('pack_id','?')} — signature: {cr.get('pack_ref', {}).get('signature','?')}")
-                unm = cr.get("mapping", {}).get("unmapped_qc_ids", []) or []
-                if unm:
-                    st.error(f"Unmapped QC (FAIL attendu): {len(unm)}")
-                    with st.expander("Voir unmapped QC"):
-                        st.json(unm)
-
-                chapters = cr.get("chapters") or {}
-                if not chapters:
-                    st.info("Aucun chapitre dans le pack ou index vide.")
-                else:
-                    chap_keys = sorted(list(chapters.keys()))
-                    sel = st.selectbox("Chapitre", chap_keys)
-                    ch = chapters.get(sel) or {}
-                    ccols = st.columns(6)
-                    ccols[0].metric("QC", ch.get("qc_count", 0))
-                    ccols[1].metric("QC min", ch.get("qc_min", 0))
-                    ccols[2].metric("QC max", ch.get("qc_max", 0))
-                    ccols[3].metric("Qi primary", ch.get("qi_primary_count", 0))
-                    ccols[4].metric("Qi covered", ch.get("qi_covered_count", 0))
-                    ccols[5].metric("Entries", len(ch.get("entries") or []))
-
-                    with st.expander("Liste QC (IDs)", expanded=False):
-                        st.json(ch.get("qc_ids", []))
-
-                    with st.expander("Qi associés (primary / covered)", expanded=False):
-                        st.json({
-                            "qi_primary_ids": ch.get("qi_primary_ids", [])[:200],
-                            "qi_covered_ids": ch.get("qi_covered_ids", [])[:200],
-                        })
-
-                    st.markdown("### Détails QC → ARI / FRT / TRG + Qi")
-                    for entry in (ch.get("entries") or []):
-                        qc_obj = entry.get("qc") or {}
-                        qc_id = qc_obj.get("qc_id", "")
-                        with st.expander(f"QC: {qc_id}", expanded=False):
-                            st.json({
-                                "qc": qc_obj,
-                                "ari": entry.get("ari"),
-                                "frt": entry.get("frt"),
-                                "triggers": entry.get("triggers"),
-                                "qi_primary_ids": entry.get("qi_primary_ids"),
-                                "qi_covered_ids": entry.get("qi_covered_ids"),
-                            })
-
-                cross = cr.get("evidence", {}).get("cross_leak_qi", []) or []
-                if cross:
-                    st.error(f"Cross-leak détecté: {len(cross)} (FAIL attendu)")
-                    with st.expander("Voir cross-leak items", expanded=False):
-                        st.json(cross[:200])
-                else:
-                    st.success("Aucun cross-leak détecté (OK)")
-
             st.markdown("---")
             st.subheader("📤 Exports")
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 st.download_button(
                     "📥 report.json",
-                    canonical_json({"version": "V31.9.3", "verdict": r["verdict"], "validators": r["validators"], "metrics": m}),
+                    canonical_json({"version": "V31.9.4", "verdict": r["verdict"], "validators": r["validators"], "metrics": m}),
                     "report.json",
                 )
             with c2:
@@ -1373,11 +1470,40 @@ def main():
             with c3:
                 st.download_button("📥 canon.json", canonical_json(r["artifacts_canon"]), "canon.json")
             with c4:
-                st.download_button(
-                    "📥 chapter_report.json",
-                    canonical_json(r.get("chapter_report") or {"error": "no chapter_report"}),
-                    "chapter_report.json",
-                )
+                if r.get("chapter_report"):
+                    st.download_button("📥 chapter_report.json", canonical_json(r["chapter_report"]), "chapter_report.json")
+                else:
+                    st.download_button("📥 chapter_report.json", canonical_json({"note": "No pack or no chapter report"}), "chapter_report.json")
+
+        st.markdown("---")
+        st.subheader("🧪 Rapport Saturation (ISO-PROD)")
+        sat = st.session_state.get("saturation")
+        if not sat:
+            st.info("Aucun rapport saturation. Lancer ACTIVER + RUN SATURATION dans Pipeline.")
+        else:
+            st.caption(f"Stop reason: {sat.get('stop_reason')}")
+            vols = sat.get("volumes", []) or []
+            if vols:
+                for v in vols:
+                    with st.expander(f"Volume {v.get('volume')} — ΔQC={v.get('delta_qc')} — orphans={len(v.get('orphans') or [])}", expanded=False):
+                        st.json({
+                            "volume": v.get("volume"),
+                            "delta_qc": v.get("delta_qc"),
+                            "qc": (v.get("counts") or {}).get("qc"),
+                            "qi": (v.get("counts") or {}).get("qi"),
+                            "orphans_count": (v.get("counts") or {}).get("orphans"),
+                            "validators_b": v.get("validators_b"),
+                            "hash_out": (v.get("hash_out") or "")[:32],
+                        })
+                        st.markdown("**Nouveaux QC (extrait)**")
+                        st.json((v.get("new_qc_ids") or [])[:50])
+                        st.markdown("**Orphans (extrait)**")
+                        st.json((v.get("orphans") or [])[:50])
+                        if v.get("chapter_report"):
+                            st.markdown("**Chapter Report (preuve)**")
+                            st.json(v.get("chapter_report"))
+
+            st.download_button("📥 saturation_report.json", canonical_json(sat), "saturation_report.json")
 
 
 if __name__ == "__main__":
