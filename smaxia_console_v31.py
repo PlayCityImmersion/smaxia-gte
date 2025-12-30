@@ -1,30 +1,37 @@
 # =============================================================================
-# smaxia_console_v31_9_6.py — SMAXIA GTE Console V31.9.6 (ISO-PROD TEST)
+# smaxia_console_v31_9_7.py — SMAXIA GTE Console V31.9.7 (ISO-PROD TEST)
 # =============================================================================
-# OBJECTIF CEO (V31.9.6)
-# Chaîne de test intégrale SUR UI (pas de “mode script”) :
+# PATCH CTO — OBJECTIF:
+# 1) Implémenter harvest.catalog SANS hardcode métier
+#    => via "Pack Builder" en UI : upload harvest_sources.json + génération skeleton + injection catalog
+# 2) Chaîne test scellable & transposable PROD:
+#    - le CORE ne contient AUCUN site/URL/regex métier
+#    - les SEEDS viennent UNIQUEMENT des DATA (academic_pack.json enrichi)
+#    - export "academic_pack_enriched.json" pour scellement + copie en PROD
 #
-# Input:
-#   Choix Pays (ex: FR)
-#   => Loading automatique Academic Pack (VISIBLE: niveaux + matières + chapitres)
-#   => Sélection TEST : 1 niveau + jusqu’à 2 matières
-#   => Harvest pack-driven (scope niveau+matière) => sujets+corrections visibles dans “Import PDF”
-#   => Extraction JSON (Qi/RQi)
-#   => Pipeline RUN GTE
-#   => Résultats + Explorateur “QC par chapitre” + exports preuves
+# Rappel Streamlit:
+# - On ne peut pas auto-remplir file_uploader. Donc "Import PDF" affiche la bibliothèque harvest (bytes en session).
 #
-# LOIS SMAXIA:
-# - Zéro hardcode métier (niveaux/matières/chapitres/sources) dans le code CORE.
-# - Tout vient du academic_pack.json (DATA). La sélection UI n’utilise QUE les IDs présents dans le pack.
-# - Validateurs B BLOQUANTS (chapitres pack-driven + preuves coverage).
+# IMPORTANT:
+# - Pour HARVEST ON: pack.harvest.catalog doit être NON-VIDE ET chaque entrée (level_id, subject_id) doit avoir seeds[] non-vide.
+# - V31.9.7 ajoute:
+#     Sidebar -> Pack Builder -> (A) Générer skeleton (level_subject_map) (B) Uploader harvest_sources.json (C) Injecter dans pack
+#     Sidebar -> Export pack enrichi
 #
-# NOTE STREAMLIT:
-# - On ne peut pas auto-remplir un file_uploader. Donc: “Bibliothèque Harvest” => sélection + bytes en session.
-#
-# INTÉGRATION MOTEUR RÉEL (si présent dans votre repo):
-# - Si disponible: from smaxia_granulo_engine_test import run_granulo_test
-#   attendu: run_granulo_test(urls, volume) -> {sujets,qc,saturation,audit}
-# - Sinon: fallback TEST_ONLY (générateur structure-driven) pour valider l’infrastructure.
+# harvest_sources.json (schéma minimal):
+# {
+#   "version":"1",
+#   "entries":[
+#     {
+#       "country_code":"FR",
+#       "level_id":"TERMINALE",
+#       "subject_id":"MATH",
+#       "seeds":[
+#         {"index_url":"https://...", "pdf_regex":"\\.pdf($|\\?)", "corr_hint_regex":"corrig(e|é)|correction"}
+#       ]
+#     }
+#   ]
+# }
 # =============================================================================
 
 from __future__ import annotations
@@ -63,10 +70,8 @@ except Exception:
 # =============================================================================
 # ZONE A — TEST-ONLY FALLBACK PACK (UNIQUEMENT si aucun pack FR présent)
 # =============================================================================
-# IMPORTANT: ce fallback n’est là QUE pour éviter écran vide.
-# Pour un test ISO-PROD sérieux, uploadez votre academic_pack_FR.json (Gemini/Opus).
 TEST_ONLY_DEFAULT_PACK_FR: Dict[str, Any] = {
-    "pack_id": "FR_TEST_DEFAULT_PACK_V31_9_6",
+    "pack_id": "FR_TEST_DEFAULT_PACK_V31_9_7",
     "country_code": "FR",
     "signature": {"pack_hash": "TEST_ONLY_PLACEHOLDER_HASH", "signed_at": "TEST_ONLY"},
     "academic_structure": {
@@ -99,20 +104,10 @@ TEST_ONLY_DEFAULT_PACK_FR: Dict[str, Any] = {
     ],
     "harvest": {
         "http": {"user_agent": "Mozilla/5.0", "timeout_sec": 25, "max_bytes_pdf": 25_000_000, "max_index_pages": 30},
-        # CATALOGUE pack-driven (niveau+matière) — VIDE en fallback (bouton auto-scrape OFF)
-        "catalog": [
-            # Exemple attendu (dans votre pack FR réel):
-            # {
-            #   "level_id": "TERMINALE",
-            #   "subject_id": "MATH",
-            #   "volume_mode": "pairs",
-            #   "seeds": [
-            #     {"index_url":"https://....", "pdf_regex": r"\.pdf($|\?)", "corr_hint_regex": r"corrig(e|é)|correction"}
-            #   ]
-            # }
-        ],
+        "catalog": [],  # injecté via Pack Builder (DATA)
     },
 }
+
 
 # =============================================================================
 # B — CANONICAL / HASH
@@ -154,6 +149,7 @@ def canonicalize_artifacts(artifacts: Dict[str, Any], qi_pack: List[Dict[str, An
         "qi_coverage": artifacts.get("qi_coverage", {}) or {},
         "qi_pack": sort_qi_canonical(qi_pack),
     }
+
 
 # =============================================================================
 # C — SCHEMAS
@@ -213,6 +209,7 @@ def validate_trigger_schema(trg: Dict[str, Any]) -> Tuple[bool, str]:
     if "qc_id" not in (trg.get("links") or {}) or "ari_id" not in (trg.get("links") or {}):
         return False, "Missing links"
     return True, "OK"
+
 
 # =============================================================================
 # D — INTEGRITY / COVERAGE
@@ -306,6 +303,7 @@ def get_full_source() -> str:
         return Path(__file__).read_text(encoding="utf-8")
     except Exception:
         return ""
+
 
 # =============================================================================
 # E — PDF → Qi Builder (markers EXn-Qm[a/b/c])
@@ -457,7 +455,7 @@ def build_qi_pack_from_pdf_pair(subject_bytes: bytes, correction_bytes: Optional
         })
 
     meta = {
-        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.9.6"},
+        "generator": {"name": "SMAXIA_PDF_QI_BUILDER", "version": "V31.9.7"},
         "created_at": datetime.now().isoformat(),
         "label": label,
         "stats": {
@@ -478,7 +476,7 @@ def build_qi_pack_from_pdf_pair(subject_bytes: bytes, correction_bytes: Optional
 
 
 # =============================================================================
-# F — TEST GENERATOR QC/ARI/FRT/TRG (fallback infrastructure)
+# F — TEST GENERATOR QC/ARI/FRT/TRG (fallback infra)
 # =============================================================================
 
 _MARKER_RE = re.compile(r"^EX(\d+)-Q(\d+)([a-h])?$", re.I)
@@ -525,7 +523,7 @@ def TEST_ONLY_generate_qc_ari_frt_trg(qi_pack: List[Dict[str, Any]]) -> Dict[str
             "qc_invariant_signature": {"intent_code": gkey},
             "mapping": {"primary_qi_ids": qi_ids, "covered_qi_ids": qi_ids, "by_subject": dict(by_subj)},
             "links": {"ari_id": ari_id, "frt_id": frt_id, "trigger_ids": [trg_id]},
-            "provenance": {"generator_version": "TEST_ONLY_V31.9.6"},
+            "provenance": {"generator_version": "TEST_ONLY_V31.9.7"},
         })
 
         aris.append({
@@ -613,10 +611,10 @@ def validate_pack_schema(pack: Dict[str, Any]) -> Tuple[bool, List[str]]:
     sig = pack.get("signature")
     if not isinstance(sig, dict) or "pack_hash" not in sig:
         errs.append("signature.pack_hash missing")
-    # academic_structure is required for your V31.9.6 workflow
+
     acs = pack.get("academic_structure")
     if not isinstance(acs, dict):
-        errs.append("academic_structure missing (required in V31.9.6)")
+        errs.append("academic_structure missing (required in V31.9.7)")
     else:
         if not isinstance(acs.get("levels"), list) or len(acs.get("levels") or []) < 1:
             errs.append("academic_structure.levels must be non-empty list")
@@ -645,7 +643,7 @@ def validate_pack_harvest_catalog(pack: Dict[str, Any]) -> Tuple[bool, List[str]
                 errs.append(f"catalog[{i}] missing subject_id")
             seeds = row.get("seeds")
             if not isinstance(seeds, list) or len(seeds) < 1:
-                errs.append(f"catalog[{i}].seeds must be non-empty list")
+                errs.append(f"catalog[{i}].seeds must be non-empty list (for HARVEST ON)")
             else:
                 for j, s in enumerate(seeds, 1):
                     if not isinstance(s, dict):
@@ -693,7 +691,6 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Tuple
 
     intent_to_chapter = _pack_intent_to_chapter(pack)
 
-    # QC must map to chapter via intent_code
     unmapped_qc = []
     qc_to_chapter: Dict[str, str] = {}
     for qc in canon.get("qcs", []) or []:
@@ -706,7 +703,6 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Tuple
             qc_to_chapter[qc_id] = cid
     out["B-02_QC_CHAPTER_MAPPING"] = {"pass": len(unmapped_qc) == 0, "unmapped_qc": unmapped_qc}
 
-    # Qi assigned to exactly one chapter via mapped QCs
     all_qi = [q for q in (canon.get("qi_pack") or [])]
     qi_ids_all = [str(q.get("qi_id", "")).strip() for q in all_qi if str(q.get("qi_id", "")).strip()]
 
@@ -735,7 +731,6 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Tuple
         "unassigned_qi_preview": no_ch[:200],
     }
 
-    # Coverage per chapter (within assigned Qi of that chapter)
     chapters = pack.get("chapters") or []
     chapter_ids = [str(ch.get("chapter_id", "")).strip() for ch in chapters if str(ch.get("chapter_id", "")).strip()]
 
@@ -800,7 +795,156 @@ def validators_B(canon: Dict[str, Any], pack: Optional[Dict[str, Any]]) -> Tuple
 
 
 # =============================================================================
-# H — HARVEST (pack-driven catalog, scope level+subject)
+# H — PACK BUILDER (harvest.catalog) — DATA ONLY (no hardcode URLs)
+# =============================================================================
+
+def build_catalog_skeleton_from_pack(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Crée un skeleton catalog (level_id, subject_id) depuis academic_structure.level_subject_map.
+    seeds = [] (HARVEST OFF tant que l’utilisateur n’a pas injecté des seeds via sources.json)."""
+    acs = pack.get("academic_structure") or {}
+    level_subject_map = acs.get("level_subject_map") or []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for row in level_subject_map:
+        lv = str((row or {}).get("level_id", "")).strip()
+        subs = (row or {}).get("subject_ids") or []
+        for sb in subs:
+            sb = str(sb).strip()
+            if not lv or not sb:
+                continue
+            key = (lv, sb)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "level_id": lv,
+                "subject_id": sb,
+                "volume_mode": "pairs",
+                "seeds": [],
+            })
+    return out
+
+def validate_sources_schema(src: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    errs = []
+    if not isinstance(src, dict):
+        return False, ["sources must be dict"]
+    ent = src.get("entries")
+    if not isinstance(ent, list) or len(ent) < 1:
+        errs.append("sources.entries must be non-empty list")
+    else:
+        for i, e in enumerate(ent, 1):
+            if not isinstance(e, dict):
+                errs.append(f"entries[{i}] must be object")
+                continue
+            for f in ["country_code", "level_id", "subject_id", "seeds"]:
+                if f not in e:
+                    errs.append(f"entries[{i}] missing {f}")
+            seeds = e.get("seeds")
+            if not isinstance(seeds, list) or len(seeds) < 1:
+                errs.append(f"entries[{i}].seeds must be non-empty list")
+            else:
+                for j, s in enumerate(seeds, 1):
+                    if not isinstance(s, dict):
+                        errs.append(f"entries[{i}].seeds[{j}] must be object")
+                        continue
+                    if not str(s.get("index_url", "")).strip():
+                        errs.append(f"entries[{i}].seeds[{j}] missing index_url")
+                    if not str(s.get("pdf_regex", "")).strip():
+                        errs.append(f"entries[{i}].seeds[{j}] missing pdf_regex")
+    return len(errs) == 0, errs
+
+def merge_sources_into_catalog(pack: Dict[str, Any], sources: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Injecte/merge harvest.catalog depuis sources.json.
+    - Filtre par country_code == pack.country_code
+    - Remplace seeds pour (level_id, subject_id) (mode: override)"""
+    country = str(pack.get("country_code", "")).strip()
+    entries = sources.get("entries") or []
+    # Ensure harvest object
+    if "harvest" not in pack or not isinstance(pack.get("harvest"), dict):
+        pack["harvest"] = {"http": {"user_agent": "Mozilla/5.0", "timeout_sec": 25, "max_bytes_pdf": 25_000_000, "max_index_pages": 30}, "catalog": []}
+    if "catalog" not in pack["harvest"] or not isinstance(pack["harvest"].get("catalog"), list):
+        pack["harvest"]["catalog"] = []
+
+    catalog = pack["harvest"]["catalog"]
+    index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in catalog:
+        lv = str(row.get("level_id", "")).strip()
+        sb = str(row.get("subject_id", "")).strip()
+        if lv and sb:
+            index[(lv, sb)] = row
+
+    applied, skipped = [], []
+    for e in entries:
+        if str(e.get("country_code", "")).strip() != country:
+            skipped.append({"reason": "country_mismatch", "entry": {"country_code": e.get("country_code"), "level_id": e.get("level_id"), "subject_id": e.get("subject_id")}})
+            continue
+        lv = str(e.get("level_id", "")).strip()
+        sb = str(e.get("subject_id", "")).strip()
+        seeds = e.get("seeds") or []
+        if not lv or not sb or not isinstance(seeds, list) or len(seeds) < 1:
+            skipped.append({"reason": "invalid_entry", "entry": {"level_id": lv, "subject_id": sb}})
+            continue
+
+        row = index.get((lv, sb))
+        if row is None:
+            row = {"level_id": lv, "subject_id": sb, "volume_mode": "pairs", "seeds": []}
+            catalog.append(row)
+            index[(lv, sb)] = row
+
+        # override seeds (DATA)
+        row["seeds"] = []
+        for s in seeds:
+            row["seeds"].append({
+                "index_url": str(s.get("index_url", "")).strip(),
+                "pdf_regex": str(s.get("pdf_regex", "")).strip(),
+                "corr_hint_regex": str(s.get("corr_hint_regex", "")).strip(),
+            })
+        applied.append({"level_id": lv, "subject_id": sb, "seeds": len(row["seeds"])})
+
+    pack["harvest"]["catalog"] = sorted(pack["harvest"]["catalog"], key=lambda r: (str(r.get("level_id", "")), str(r.get("subject_id", ""))))
+    report = {"applied": applied, "skipped": skipped, "catalog_count": len(pack["harvest"]["catalog"])}
+    return pack, report
+
+
+# =============================================================================
+# I — UI HELPERS (academic_structure)
+# =============================================================================
+
+def level_title(pack: Dict[str, Any], level_id: str) -> str:
+    acs = pack.get("academic_structure") or {}
+    for lv in (acs.get("levels") or []):
+        if str(lv.get("level_id", "")).strip() == level_id:
+            return str(lv.get("title", "")).strip() or level_id
+    return level_id
+
+def subject_title(pack: Dict[str, Any], subject_id: str) -> str:
+    acs = pack.get("academic_structure") or {}
+    for sb in (acs.get("subjects") or []):
+        if str(sb.get("subject_id", "")).strip() == subject_id:
+            return str(sb.get("title", "")).strip() or subject_id
+    return subject_id
+
+def allowed_subjects_for_level(pack: Dict[str, Any], level_id: str) -> List[str]:
+    acs = pack.get("academic_structure") or {}
+    for row in (acs.get("level_subject_map") or []):
+        if str(row.get("level_id", "")).strip() == level_id:
+            subs = row.get("subject_ids") or []
+            return [str(x).strip() for x in subs if str(x).strip()]
+    return []
+
+def load_pack_auto_for_country(country_code: str) -> Dict[str, Any]:
+    fname = f"academic_pack_{country_code}.json"
+    p = Path(fname)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return TEST_ONLY_DEFAULT_PACK_FR
+    return TEST_ONLY_DEFAULT_PACK_FR
+
+
+# =============================================================================
+# J — HARVEST (pack-driven catalog, scope level+subject)
 # =============================================================================
 
 def _http_get(url: str, ua: str, timeout: int) -> bytes:
@@ -878,7 +1022,6 @@ def harvest_for_level_subject(pack: Dict[str, Any], level_id: str, subject_id: s
     max_pdf = int(http.get("max_bytes_pdf") or 25_000_000)
     max_index_pages = int(http.get("max_index_pages") or 30)
 
-    # pack-driven: trouver la ligne catalog correspondant
     catalog = h.get("catalog") or []
     row = None
     for r in catalog:
@@ -909,7 +1052,6 @@ def harvest_for_level_subject(pack: Dict[str, Any], level_id: str, subject_id: s
         except Exception as e:
             crawl_log.append({"seed": index_url, "error": str(e)})
 
-    # de-dup by subject_url
     seen_subj = set()
     pairs_unique = []
     for subj_url, corr_url in collected_pairs:
@@ -966,45 +1108,7 @@ def harvest_for_level_subject(pack: Dict[str, Any], level_id: str, subject_id: s
 
 
 # =============================================================================
-# I — UI HELPERS (academic_structure)
-# =============================================================================
-
-def level_title(pack: Dict[str, Any], level_id: str) -> str:
-    acs = pack.get("academic_structure") or {}
-    for lv in (acs.get("levels") or []):
-        if str(lv.get("level_id", "")).strip() == level_id:
-            return str(lv.get("title", "")).strip() or level_id
-    return level_id
-
-def subject_title(pack: Dict[str, Any], subject_id: str) -> str:
-    acs = pack.get("academic_structure") or {}
-    for sb in (acs.get("subjects") or []):
-        if str(sb.get("subject_id", "")).strip() == subject_id:
-            return str(sb.get("title", "")).strip() or subject_id
-    return subject_id
-
-def allowed_subjects_for_level(pack: Dict[str, Any], level_id: str) -> List[str]:
-    acs = pack.get("academic_structure") or {}
-    for row in (acs.get("level_subject_map") or []):
-        if str(row.get("level_id", "")).strip() == level_id:
-            subs = row.get("subject_ids") or []
-            return [str(x).strip() for x in subs if str(x).strip()]
-    return []
-
-def load_pack_auto_for_country(country_code: str) -> Dict[str, Any]:
-    # Auto-load from local file if present, else fallback
-    fname = f"academic_pack_{country_code}.json"
-    p = Path(fname)
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return TEST_ONLY_DEFAULT_PACK_FR
-    return TEST_ONLY_DEFAULT_PACK_FR
-
-
-# =============================================================================
-# J — GTE RUNNER (UI)
+# K — GTE RUNNER (UI)
 # =============================================================================
 
 class GTERunner:
@@ -1019,14 +1123,10 @@ class GTERunner:
         self.logs = []
         self.validators = {}
 
-        self.log(f"═══ GTE V31.9.6 — {len(qi_pack)} Qi ═══")
+        self.log(f"═══ GTE V31.9.7 — {len(qi_pack)} Qi ═══")
 
-        # Choose generator: real engine (if present) or test-only
         if REAL_ENGINE_AVAILABLE:
-            self.log("ENGINE: REAL (smaxia_granulo_engine_test.run_granulo_test) — (UI test harness)")
-            # In ISO-PROD UI, the real engine typically takes URLs.
-            # Here we still run QC generation from Qi_pack via fallback generator unless your real engine exposes a Qi->QC function.
-            # Therefore, we keep QC generation = TEST_ONLY, but we expose REAL engine check for later integration.
+            self.log("ENGINE: REAL (import OK) — (UI harness still uses TEST_ONLY QC gen unless Qi->QC function exists)")
             gen_func = TEST_ONLY_generate_qc_ari_frt_trg
         else:
             self.log("ENGINE: TEST_ONLY (structure-driven) — infrastructure validation")
@@ -1041,7 +1141,6 @@ class GTERunner:
         if singletons:
             self.log(f"⚠️ Singletons: {len(singletons)}")
 
-        # Schema checks
         errs = []
         for qi in canon["qi_pack"]:
             ok, e = validate_qi_schema(qi)
@@ -1100,13 +1199,11 @@ class GTERunner:
             self.validators["TA-01_AST"] = {"pass": ast_ok, "violations": ast_v}
             self.log(f"TA-01 AST: {'PASS' if ast_ok else 'FAIL'}")
 
-        # Validateurs B BLOQUANTS (chapitres pack-driven + preuves)
         bvals, chapter_report = validators_B(canon, pack)
         for k, v in bvals.items():
             self.validators[k] = v
             self.log(f"{k}: {'PASS' if v.get('pass') else 'FAIL'}")
 
-        # Verdict: must all core + all B-* pass
         def is_green(k: str) -> bool:
             p = self.validators.get(k, {}).get("pass")
             return True if p is None else bool(p)
@@ -1134,37 +1231,35 @@ class GTERunner:
 
 
 # =============================================================================
-# K — APP (UI)
+# L — APP (UI)
 # =============================================================================
 
 def main():
-    st.set_page_config(page_title="SMAXIA GTE V31.9.6", page_icon="🔒", layout="wide")
-    st.title("🔒 SMAXIA GTE Console V31.9.6")
-    st.markdown("**ISO-PROD TEST — Activation Pays → Pack visible → Sélection Niveau+Matières → Harvest → Extraction Qi/RQi → RUN GTE → Résultats**")
+    st.set_page_config(page_title="SMAXIA GTE V31.9.7", page_icon="🔒", layout="wide")
+    st.title("🔒 SMAXIA GTE Console V31.9.7")
+    st.markdown("**ISO-PROD TEST — Activation Pays → Pack visible → (Pack Builder: harvest.catalog) → Sélection Niveau+Matières → Harvest → Extraction → RUN GTE → Résultats**")
 
-    # Session state
     st.session_state.setdefault("country_code", "FR")
     st.session_state.setdefault("active_pack", None)
     st.session_state.setdefault("active_pack_source", "AUTO")
     st.session_state.setdefault("selected_level", None)
     st.session_state.setdefault("selected_subjects", [])
-    st.session_state.setdefault("harvest_items", [])          # list of items (bytes)
-    st.session_state.setdefault("harvest_meta", [])           # list of meta per scope
-    st.session_state.setdefault("selected_items_idx", set())  # for extraction
+    st.session_state.setdefault("harvest_items", [])
+    st.session_state.setdefault("harvest_meta", [])
+    st.session_state.setdefault("selected_items_idx", set())
     st.session_state.setdefault("qi_pack", [])
     st.session_state.setdefault("qi_meta_list", [])
     st.session_state.setdefault("result", None)
+    st.session_state.setdefault("sources_report", None)
 
-    # ---------------- Sidebar (Activation + Pack) ----------------
+    # ---------------- Sidebar ----------------
     with st.sidebar:
-        st.header("V31.9.6 — Chaîne ISO-PROD TEST")
-        st.caption("Le pack doit contenir: academic_structure + chapters + harvest.catalog (niveau+matière).")
-
+        st.header("V31.9.7 — ISO-PROD TEST")
         country = st.selectbox("Pays (TEST)", ["FR"], index=0)
         st.session_state["country_code"] = country
 
         st.markdown("### Academic Pack (auto + override upload)")
-        pack_up = st.file_uploader("academic_pack.json (override)", type=["json"])
+        pack_up = st.file_uploader("academic_pack.json (override)", type=["json"], key="pack_upload")
         pack_override = None
         if pack_up:
             raw, err = load_json_from_uploaded(pack_up)
@@ -1182,17 +1277,80 @@ def main():
             pack = load_pack_auto_for_country(country)
             st.session_state["active_pack_source"] = "AUTO"
 
+        # Ensure harvest exists (structure)
+        if "harvest" not in pack or not isinstance(pack.get("harvest"), dict):
+            pack["harvest"] = {"http": {"user_agent": "Mozilla/5.0", "timeout_sec": 25, "max_bytes_pdf": 25_000_000, "max_index_pages": 30}, "catalog": []}
+        if "catalog" not in pack["harvest"] or not isinstance(pack["harvest"].get("catalog"), list):
+            pack["harvest"]["catalog"] = []
+
         st.session_state["active_pack"] = pack
 
-        okp, perrs = validate_pack_schema(pack) if isinstance(pack, dict) else (False, ["Pack is not dict"])
+        okp, perrs = validate_pack_schema(pack) if isinstance(pack, dict) else (False, ["Pack invalid"])
         if okp:
             st.success(f"Pack chargé: {pack.get('pack_id')} ({pack.get('country_code')}) — source={st.session_state['active_pack_source']}")
         else:
             st.error("Pack invalide — chaîne BLOQUÉE")
             st.json(perrs)
 
+        # --------- Pack Builder (harvest.catalog) ----------
+        st.markdown("---")
+        st.markdown("### Pack Builder (harvest.catalog) — DATA ONLY")
+        st.caption("But: rendre HARVEST ON via injection de seeds depuis un fichier sources.json (aucun URL/regex en code).")
+
+        if okp:
+            colA, colB = st.columns(2)
+            with colA:
+                if st.button("🧱 Générer skeleton catalog", use_container_width=True):
+                    skeleton = build_catalog_skeleton_from_pack(pack)
+                    # merge skeleton without overwriting existing seeds
+                    existing = {(str(r.get("level_id","")).strip(), str(r.get("subject_id","")).strip()): r for r in (pack["harvest"].get("catalog") or []) if isinstance(r, dict)}
+                    merged = []
+                    for row in skeleton:
+                        key = (row["level_id"], row["subject_id"])
+                        if key in existing:
+                            merged.append(existing[key])
+                        else:
+                            merged.append(row)
+                    pack["harvest"]["catalog"] = sorted(merged, key=lambda r: (str(r.get("level_id","")), str(r.get("subject_id",""))))
+                    st.session_state["active_pack"] = pack
+                    st.success(f"Skeleton OK: {len(pack['harvest']['catalog'])} entrées (seeds vides tant que non injectées).")
+            with colB:
+                st.download_button(
+                    "📥 Export academic_pack_enriched.json",
+                    canonical_json(pack),
+                    "academic_pack_enriched.json",
+                    use_container_width=True
+                )
+
+            src_up = st.file_uploader("harvest_sources.json", type=["json"], key="sources_upload")
+            sources_obj = None
+            if src_up:
+                src_raw, src_err = load_json_from_uploaded(src_up)
+                if src_err:
+                    st.error(src_err)
+                elif isinstance(src_raw, dict):
+                    sources_obj = src_raw
+                else:
+                    st.error("harvest_sources.json doit être un objet JSON")
+
+            if sources_obj is not None:
+                oks, serrs = validate_sources_schema(sources_obj)
+                if not oks:
+                    st.error("sources.json invalide")
+                    st.json(serrs)
+                else:
+                    if st.button("🧬 Injecter sources → harvest.catalog", type="primary", use_container_width=True):
+                        pack2, report = merge_sources_into_catalog(pack, sources_obj)
+                        st.session_state["active_pack"] = pack2
+                        st.session_state["sources_report"] = report
+                        st.success(f"Injection OK — catalog_count={report.get('catalog_count')}")
+                        with st.expander("Rapport injection (applied/skipped)", expanded=True):
+                            st.json(report)
+
         with st.expander("Voir Academic Pack (résumé)", expanded=True):
             acs = (pack.get("academic_structure") or {}) if isinstance(pack, dict) else {}
+            cat = ((pack.get("harvest") or {}).get("catalog") or []) if isinstance(pack, dict) else []
+            seeds_nonempty = sum(1 for r in cat if isinstance(r, dict) and isinstance(r.get("seeds"), list) and len(r.get("seeds")) > 0)
             st.json({
                 "source": st.session_state["active_pack_source"],
                 "pack_id": pack.get("pack_id") if isinstance(pack, dict) else None,
@@ -1202,8 +1360,10 @@ def main():
                 "subjects_count": len(acs.get("subjects") or []),
                 "level_subject_map_count": len(acs.get("level_subject_map") or []),
                 "chapters_count": len(pack.get("chapters") or []) if isinstance(pack, dict) else 0,
-                "chapters_preview": (pack.get("chapters") or [])[:12] if isinstance(pack, dict) else [],
-                "harvest_catalog_count": len(((pack.get("harvest") or {}).get("catalog") or [])) if isinstance(pack, dict) else 0,
+                "harvest_catalog_count": len(cat),
+                "harvest_catalog_with_seeds": seeds_nonempty,
+                "chapters_preview": (pack.get("chapters") or [])[:8] if isinstance(pack, dict) else [],
+                "harvest_catalog_preview": cat[:6],
             })
 
         st.markdown("---")
@@ -1229,8 +1389,7 @@ def main():
                     def _sb_label(sb: str) -> str:
                         return f"{sb} — {subject_title(pack, sb)}"
                     subs = st.multiselect("Matières (max 2)", allowed, default=allowed[:2], format_func=_sb_label)
-                    subs = subs[:2]
-                    st.session_state["selected_subjects"] = subs
+                    st.session_state["selected_subjects"] = subs[:2]
 
         st.markdown("---")
         st.markdown("### Harvest (pack-driven)")
@@ -1239,14 +1398,11 @@ def main():
         okh, herrs = (False, ["pack invalid"])
         if okp:
             okh, herrs = validate_pack_harvest_catalog(pack)
-
         harvest_ready = okp and okh and bool(st.session_state.get("selected_level")) and len(st.session_state.get("selected_subjects") or []) >= 1
-        if not okh and okp:
-            st.warning("Harvest OFF: pack.harvest.catalog manquant/invalide (uploadez le pack FR réel).")
+        if okp and not okh:
+            st.warning("HARVEST OFF: harvest.catalog incomplet (seeds vides ou absent). Utilisez Pack Builder → sources.json → Injecter.")
 
-        btn_disabled = not harvest_ready
-
-        if st.button("⛽ LANCER HARVEST", type="primary", use_container_width=True, disabled=btn_disabled):
+        if st.button("⛽ LANCER HARVEST", type="primary", use_container_width=True, disabled=(not harvest_ready)):
             st.session_state["harvest_items"] = []
             st.session_state["harvest_meta"] = []
             st.session_state["selected_items_idx"] = set()
@@ -1261,25 +1417,16 @@ def main():
                 for sb in subjects:
                     out = harvest_for_level_subject(pack, level_id, sb, int(vol))
                     st.session_state["harvest_meta"].append(out.get("meta"))
-                    items = out.get("items") or []
-                    st.session_state["harvest_items"].extend(items)
+                    st.session_state["harvest_items"].extend(out.get("items") or [])
 
-            # auto-select all harvested items for extraction
             st.session_state["selected_items_idx"] = set(range(len(st.session_state["harvest_items"])))
             st.success(f"Harvest terminé: {len(st.session_state['harvest_items'])} sujets (toutes matières confondues).")
-
-        if harvest_ready:
-            st.info("Prêt: sélection OK + catalog OK → vous pouvez lancer Harvest.")
-        else:
-            st.caption("Conditions: pack valide + niveau + ≥1 matière + harvest.catalog valide.")
 
     # ---------------- Main tabs ----------------
     t1, t2, t3 = st.tabs(["📥 Import PDF", "🧪 Extraction & Pipeline", "📊 Résultats"])
 
-    # TAB 1 — Import PDF (Harvest library + manual upload)
     with t1:
         st.header("📥 Import PDF (sujets + corrigés)")
-        pack = st.session_state.get("active_pack")
         items = st.session_state.get("harvest_items") or []
 
         left, right = st.columns([2, 1])
@@ -1287,10 +1434,8 @@ def main():
         with left:
             st.subheader("Bibliothèque Harvest (visible)")
             if not items:
-                st.info("Aucun item harvest. Lancez Harvest dans la sidebar (niveau+matières).")
+                st.info("Aucun item harvest. Lancez Harvest dans la sidebar.")
             else:
-                st.caption("Sélectionnez les documents à dépesser (extraction Qi/RQi).")
-                # selection table-like
                 selected_idx = set(st.session_state.get("selected_items_idx") or set())
                 for i, it in enumerate(items):
                     scope = it.get("scope") or {}
@@ -1298,17 +1443,15 @@ def main():
                     label = it.get("label", f"doc_{i}.pdf")
                     has_corr = bool(it.get("correction_bytes"))
                     key = f"sel_{i}"
-                    default = i in selected_idx
                     checked = st.checkbox(
                         f"{i+1:03d} — {label} | {lv}/{sb} | {'corr✓' if has_corr else 'corr✗'}",
-                        value=default,
+                        value=(i in selected_idx),
                         key=key
                     )
                     if checked:
                         selected_idx.add(i)
                     else:
                         selected_idx.discard(i)
-
                 st.session_state["selected_items_idx"] = selected_idx
 
                 with st.expander("Meta Harvest (preview)", expanded=False):
@@ -1316,7 +1459,6 @@ def main():
 
         with right:
             st.subheader("Upload manuel (optionnel)")
-            st.caption("Permet d’ajouter 1 paire PDF au panier de test si besoin.")
             if pdfplumber is None:
                 st.error("pdfplumber non installé")
             else:
@@ -1341,14 +1483,13 @@ def main():
                         st.session_state["selected_items_idx"].add(idx)
                         st.success("Ajouté + sélectionné pour extraction.")
 
-    # TAB 2 — Extraction & Pipeline
     with t2:
         st.header("🧪 Extraction Qi/RQi → RUN GTE")
         pack = st.session_state.get("active_pack")
         okp, perrs = validate_pack_schema(pack) if isinstance(pack, dict) else (False, ["Pack invalid"])
 
         if not okp:
-            st.error("Pack invalide. Corrigez/chargez un pack conforme (academic_structure + chapters + harvest.catalog).")
+            st.error("Pack invalide. Corrigez/chargez un pack conforme.")
             st.json(perrs)
         else:
             if pdfplumber is None:
@@ -1376,7 +1517,6 @@ def main():
                                 meta_list.append(meta)
                                 qi_all.extend(qi_pack)
 
-                        # Re-index order_index globally for determinism stable
                         qi_all = sort_qi_canonical(qi_all)
                         for i, q in enumerate(qi_all, 1):
                             q["position"]["order_index"] = i
@@ -1396,7 +1536,6 @@ def main():
                             res = runner.run(st.session_state["qi_pack"], pack, lvl2=lvl2)
                         st.session_state["result"] = res
 
-                        # logs (compact)
                         for l in res["logs"]:
                             if "FAIL" in l:
                                 st.markdown(f"🔴 `{l}`")
@@ -1410,7 +1549,7 @@ def main():
                         if res["verdict"] == "PASS":
                             st.success("✅ VERDICT: PASS")
                         else:
-                            st.error("❌ VERDICT: FAIL (B bloquants inclus)")
+                            st.error("❌ VERDICT: FAIL")
 
                 st.markdown("---")
                 st.subheader("Aperçu Qi (post extraction)")
@@ -1426,7 +1565,6 @@ def main():
                     with st.expander("Meta extraction (tous PDFs)", expanded=False):
                         st.json(st.session_state["qi_meta_list"])
 
-    # TAB 3 — Résultats + explorer chapitres + exports
     with t3:
         st.header("📊 Résultats")
         res = st.session_state.get("result")
@@ -1465,9 +1603,7 @@ def main():
         chapters = pack.get("chapters") or []
         chapter_ids = [str(ch.get("chapter_id", "")).strip() for ch in chapters if str(ch.get("chapter_id", "")).strip()]
 
-        if not chapter_ids:
-            st.warning("Aucun chapitre dans le pack.")
-        else:
+        if chapter_ids:
             intent_to_ch = _pack_intent_to_chapter(pack)
 
             def ch_label(cid: str) -> str:
@@ -1495,7 +1631,7 @@ def main():
 
             st.info(f"QC sur ce chapitre: {len(qcs_ch)}")
 
-            with st.expander("Détails QC (avec ARI/FRT/TRG + Qi associées)", expanded=True):
+            with st.expander("Détails QC (ARI/FRT/TRG + Qi associées)", expanded=True):
                 for qc in qcs_ch[:200]:
                     links = qc.get("links") or {}
                     ari = aris.get(links.get("ari_id"))
@@ -1524,12 +1660,14 @@ def main():
                 }),
                 "chapter_bundle.json",
             )
+        else:
+            st.warning("Aucun chapitre dans le pack.")
 
         st.markdown("---")
         st.subheader("Exports")
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.download_button("📥 report.json", canonical_json({"version": "V31.9.6", "verdict": res["verdict"], "validators": res["validators"], "metrics": m}), "report.json")
+            st.download_button("📥 report.json", canonical_json({"version": "V31.9.7", "verdict": res["verdict"], "validators": res["validators"], "metrics": m}), "report.json")
         with c2:
             st.download_button("📥 canon.json", canonical_json(res.get("artifacts_canon") or {}), "canon.json")
         with c3:
