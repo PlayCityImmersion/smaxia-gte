@@ -18,6 +18,7 @@
 # - FIX C: un seul moteur RUN (http(s) + local:// via fetcher), suppression duplication.
 # - FIX D: alignement Qi ↔ RQi par similarité déterministe (greedy) => Qi POSABLE plus fiable.
 # - FIX E: chapter_report optimisé (qc_id->chapter_code pré-calculé) + métriques unmapped.
+# - FIX F: pack embarqué TEST réintégré (zéro régression)
 # =============================================================================
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ DEFAULT_COUNTRY = "FR"
 DEFAULT_LEVEL = "TERMINALE"
 DEFAULT_SUBJECTS = ["MATH"]
 
-# Source web de test (harvest). C’est une brique de test, pas le core invariant.
+# Source web de test (harvest). C'est une brique de test, pas le core invariant.
 APMEP_ROOT_BY_LEVEL = {
     "TERMINALE": "https://www.apmep.fr/Annales-du-Bac-Terminale",
     "PREMIERE": "https://www.apmep.fr/Annales-du-Bac-Premiere",
@@ -106,7 +107,93 @@ def logs_text() -> str:
 
 
 # -----------------------------------------------------------------------------
-# PACK LOADING (ISO-PROD: no stub)
+# PACK EMBARQUÉ TEST (FIX F - zéro régression)
+# -----------------------------------------------------------------------------
+def _get_embedded_pack(country: str) -> Optional[Dict[str, Any]]:
+    """
+    Pack embarqué pour TEST ISO-PROD.
+    En PROD réel: ce pack viendrait d'un fichier signé ou d'une API.
+    """
+    EMBEDDED_PACKS: Dict[str, Dict[str, Any]] = {
+        "FR": {
+            "pack_id": "CAP_FR_BAC_2024_V1",
+            "country_code": "FR",
+            "country_label": "France",
+            "version": "1.0.0",
+            "signature": {"hash": "sha256:TEST_EMBEDDED", "signed_at": "2024-12-31T00:00:00Z"},
+            "academic_structure": {
+                "levels": [
+                    {"id": "SECONDE", "label": "Seconde", "order": 1},
+                    {"id": "PREMIERE", "label": "Première", "order": 2},
+                    {"id": "TERMINALE", "label": "Terminale", "order": 3},
+                ],
+                "subjects": [
+                    {"id": "MATH", "label": "Mathématiques"},
+                    {"id": "PHYS", "label": "Physique-Chimie"},
+                ],
+                "level_subjects": {
+                    "TERMINALE": ["MATH", "PHYS"],
+                    "PREMIERE": ["MATH", "PHYS"],
+                    "SECONDE": ["MATH", "PHYS"],
+                },
+            },
+            "chapters": [
+                {
+                    "chapter_code": "CH_ANALYSE",
+                    "chapter_label": "Analyse - Fonctions",
+                    "qc_target": 15,
+                    "keywords": ["fonction", "derivee", "limite", "continuite", "integrale", "primitive"],
+                    "matchers": [],
+                },
+                {
+                    "chapter_code": "CH_PROBAS",
+                    "chapter_label": "Probabilités - Variables aléatoires",
+                    "qc_target": 15,
+                    "keywords": ["probabilite", "variable", "aleatoire", "esperance", "variance", "loi", "binomiale", "normale"],
+                    "matchers": [],
+                },
+                {
+                    "chapter_code": "CH_GEOMETRIE",
+                    "chapter_label": "Géométrie - Nombres complexes",
+                    "qc_target": 15,
+                    "keywords": ["complexe", "argument", "module", "affixe", "geometrie", "vecteur", "plan"],
+                    "matchers": [],
+                },
+                {
+                    "chapter_code": "CH_SUITES",
+                    "chapter_label": "Suites et Récurrence",
+                    "qc_target": 15,
+                    "keywords": ["suite", "recurrence", "convergence", "arithmetique", "geometrique"],
+                    "matchers": [],
+                },
+                {
+                    "chapter_code": "CH_LOGARITHME",
+                    "chapter_label": "Logarithme et Exponentielle",
+                    "qc_target": 15,
+                    "keywords": ["logarithme", "exponentielle", "ln", "exp", "croissance"],
+                    "matchers": [],
+                },
+                {
+                    "chapter_code": "CH_TRIGONOMETRIE",
+                    "chapter_label": "Trigonométrie",
+                    "qc_target": 15,
+                    "keywords": ["cosinus", "sinus", "tangente", "trigonometrie", "angle", "radian"],
+                    "matchers": [],
+                },
+            ],
+            "gte": {
+                "split_patterns": [],
+                "chapter_match_threshold": 0.12,
+                "trigger_regex": [],
+            },
+            "_source": "EMBEDDED_TEST",
+        },
+    }
+    return EMBEDDED_PACKS.get(country)
+
+
+# -----------------------------------------------------------------------------
+# PACK LOADING (ISO-PROD: fichier externe prioritaire, embarqué en fallback)
 # -----------------------------------------------------------------------------
 def _safe_read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -133,30 +220,37 @@ def _candidate_pack_paths(country: str) -> List[str]:
     return out
 
 def load_academic_pack(country: str) -> Dict[str, Any]:
+    """
+    Charge le pack académique.
+    Priorité 1: Fichier externe (ISO-PROD réel)
+    Priorité 2: Pack embarqué (TEST ISO-PROD)
+    """
+    # Priorité 1: Essayer fichier externe
     paths = _candidate_pack_paths(country)
     log(f"[PACK] Searching pack for country={country} | candidates={len(paths)}")
-    if not paths:
-        raise FileNotFoundError(
-            "Aucun fichier pack trouvé. Placez le pack JSON (ex: CAP_FR_BAC_2024_V1.json) "
-            "dans ./academic_packs/ ou ./packs/ ou à la racine du projet."
-        )
 
-    last_err: Optional[Exception] = None
     for path in paths[:25]:
         try:
             pack = _safe_read_json(path)
             pack_id = str(pack.get("pack_id") or pack.get("id") or pack.get("name") or "").strip()
             chapters = pack.get("chapters") or pack.get("chapter_list") or pack.get("academic", {}).get("chapters")
             if not pack_id or not isinstance(chapters, list) or len(chapters) == 0:
-                raise ValueError("Schéma pack invalide: pack_id manquant ou chapters vide/invalide.")
+                continue
+
             pack["_pack_file_path"] = path
-            log(f"[PACK] Loaded pack_id={pack_id} from {path}")
+            pack["_source"] = "FILE"
+            log(f"[PACK] Loaded from FILE: pack_id={pack_id} path={path}")
             return pack
         except Exception as e:
-            last_err = e
             log(f"[PACK] Candidate failed: {path} | err={type(e).__name__}: {e}")
 
-    raise RuntimeError(f"Impossible de charger un pack valide. Dernière erreur: {last_err}")
+    # Priorité 2: Pack embarqué (TEST)
+    embedded = _get_embedded_pack(country)
+    if embedded:
+        log(f"[PACK] Loaded EMBEDDED TEST pack for country={country}")
+        return embedded
+
+    raise RuntimeError(f"Aucun pack trouvé pour country={country} (ni fichier ni embarqué).")
 
 def pack_chapters(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
     ch = pack.get("chapters") or pack.get("chapter_list") or pack.get("academic", {}).get("chapters") or []
@@ -170,7 +264,7 @@ def pack_chapters(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "chapter_code": code,
                     "chapter_label": label,
                     "keywords": item.get("keywords", []),
-                    "matchers": item.get("matchers", []),  # option: list[regex]
+                    "matchers": item.get("matchers", []),
                 })
         elif isinstance(item, dict) and "items" in item and isinstance(item["items"], list):
             for sub in item["items"]:
@@ -184,7 +278,6 @@ def pack_chapters(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
                             "keywords": sub.get("keywords", []),
                             "matchers": sub.get("matchers", []),
                         })
-    # dedupe
     seen = set()
     uniq = []
     for c in out:
@@ -194,12 +287,6 @@ def pack_chapters(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
     return uniq
 
 def pack_spec(pack: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Optionnel: un espace data-driven dans le pack pour configurer le test (sans hardcode core).
-    - gte.split_patterns: list[str regex]
-    - gte.chapter_match_threshold: float
-    - gte.trigger_regex: list[str regex] => TRG_CUSTOM
-    """
     g = pack.get("gte") if isinstance(pack.get("gte"), dict) else {}
     return g if isinstance(g, dict) else {}
 
@@ -276,7 +363,6 @@ def split_questions(raw_text: str, patterns: List[str]) -> List[str]:
         if len(c) >= 40:
             chunks.append(c)
 
-    # fallback: découpe sur ponctuation interrogative/exclamative
     if len(chunks) <= 1:
         parts = re.split(r"(?<=[\?\!])\s+", t)
         chunks = [p.strip() for p in parts if len(p.strip()) >= 60]
@@ -288,7 +374,6 @@ def split_questions(raw_text: str, patterns: List[str]) -> List[str]:
             c2 = c2[:2500].rstrip() + "…"
         cleaned.append(c2)
 
-    # dedupe stable
     seen = set()
     out = []
     for c in cleaned:
@@ -318,7 +403,6 @@ def hamming(a: int, b: int) -> int:
 def align_q_to_r(qs: List[str], rs: List[str], max_ham: int = 22) -> Dict[int, int]:
     """
     Alignement déterministe Qi->RQi via simhash minimal (greedy).
-    - retourne mapping {qi_index: rqi_index}
     """
     if not qs or not rs:
         return {}
@@ -326,7 +410,7 @@ def align_q_to_r(qs: List[str], rs: List[str], max_ham: int = 22) -> Dict[int, i
     qh = [simhash64(tokenize(q)) for q in qs]
     rh = [simhash64(tokenize(r)) for r in rs]
 
-    pairs: List[Tuple[int, int, int]] = []  # (dist, qi, ri)
+    pairs: List[Tuple[int, int, int]] = []
     for qi in range(len(qs)):
         for ri in range(len(rs)):
             d = hamming(qh[qi], rh[ri])
@@ -393,7 +477,7 @@ def cluster_by_simhash(items: List[Dict[str, Any]], sim_threshold: float, min_cl
 
 
 # -----------------------------------------------------------------------------
-# ARI / FRT / Triggers / Chapter mapping (invariants)
+# ARI / FRT / Triggers / Chapter mapping (invariants - ZÉRO mot FR/EN)
 # -----------------------------------------------------------------------------
 def build_triggers_structural(qi_text: str) -> List[str]:
     """
@@ -401,23 +485,18 @@ def build_triggers_structural(qi_text: str) -> List[str]:
     """
     out: List[str] = []
 
-    # 1) présence d'interrogation/impératif ponctuel
     if "?" in qi_text:
         out.append("TRG_INTERROGATIVE")
 
-    # 2) présence de symboles math/logic
     if re.search(r"[=<>≤≥∈∀∃∑∏∫√⇒→↦]", qi_text):
         out.append("TRG_SYMBOLIC")
 
-    # 3) présence de quantités/valeurs structurées
     if re.search(r"\b\d+\b", qi_text) or re.search(r"\d+[,\.]\d+", qi_text):
         out.append("TRG_NUMERIC")
 
-    # 4) structure énumération (items)
     if re.search(r"(?m)^\s*([a-h]|\d{1,2}|[ivxIVX]+)\s*[\)\.\-:]\s+", qi_text):
         out.append("TRG_ENUM")
 
-    # 5) présence d’expression “équation” (pattern variable = expression) sans mots
     if re.search(r"(?i)[a-z]\s*=\s*[a-z0-9\(\)\+\-\*/^]", qi_text):
         out.append("TRG_EQUATION")
 
@@ -427,10 +506,6 @@ def build_triggers_structural(qi_text: str) -> List[str]:
     return out[:6]
 
 def build_triggers(qi_text: str, pack: Dict[str, Any]) -> List[str]:
-    """
-    Triggers core = structurels.
-    Option pack-driven: pack.gte.trigger_regex = list[regex] => ajoute TRG_CUSTOM si match.
-    """
     out = build_triggers_structural(qi_text)
     g = pack_spec(pack)
     custom = g.get("trigger_regex", [])
@@ -443,7 +518,6 @@ def build_triggers(qi_text: str, pack: Dict[str, Any]) -> List[str]:
                     break
             except Exception:
                 continue
-    # dedupe stable
     seen = set()
     uniq = []
     for x in out:
@@ -480,7 +554,6 @@ def build_frt(qi_text: str, rqi_text: str, triggers: List[str]) -> Dict[str, Any
     }
 
 def build_qc_label(cluster_items: List[Dict[str, Any]]) -> str:
-    # QC commence par Comment et finit par ?
     all_toks: List[str] = []
     for it in cluster_items:
         all_toks += tokenize(it.get("text", ""))
@@ -502,19 +575,12 @@ def build_qc_label(cluster_items: List[Dict[str, Any]]) -> str:
     return qc
 
 def map_qc_to_chapter(qc_text: str, chapters: List[Dict[str, Any]], pack: Dict[str, Any]) -> str:
-    """
-    Mapping pack-driven:
-    1) matchers regex (si pack fournit chapters[*].matchers)
-    2) keywords matching (chapters[*].keywords)
-    Sinon UNMAPPED
-    """
     if not chapters:
         return "UNMAPPED"
 
     qc_norm = norm_text(qc_text)
     qc_toks = set(tokenize(qc_text))
 
-    # 1) matchers
     for ch in chapters:
         matchers = ch.get("matchers", [])
         if isinstance(matchers, list) and matchers:
@@ -525,7 +591,6 @@ def map_qc_to_chapter(qc_text: str, chapters: List[Dict[str, Any]], pack: Dict[s
                 except Exception:
                     continue
 
-    # 2) keywords score
     threshold = 0.12
     g = pack_spec(pack)
     if isinstance(g.get("chapter_match_threshold"), (int, float)):
@@ -613,12 +678,10 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                 groups = [y_sp]
 
             def is_meta_pdf(h: str, txt: str) -> bool:
-                # test-only (ne touche pas le core SMAXIA)
                 s = norm_text(h + " " + txt)
                 return any(k in s for k in ["explication", "liste", "index", "sommaire"])
 
             def is_corrige_guess(h: str, txt: str) -> bool:
-                # test-only
                 s = norm_text(h + " " + txt)
                 return ("corrig" in s) or ("correction" in s)
 
@@ -683,9 +746,10 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
 
 
 # -----------------------------------------------------------------------------
-# RUN GRANULO TEST (mono-fichier)
+# RUN GRANULO TEST (mono-fichier, fetcher unifié)
 # -----------------------------------------------------------------------------
 def fetch_bytes(url: str) -> bytes:
+    """Fetcher unifié: http(s) + local://"""
     if url.startswith("local://"):
         data = st.session_state.get("_uploads", {}).get(url)
         if not data:
@@ -715,7 +779,6 @@ def run_granulo_test(
     g = pack_spec(pack)
     patterns = DEFAULT_Q_SPLIT_PATTERNS[:]
     if isinstance(g.get("split_patterns"), list) and g["split_patterns"]:
-        # pack-driven override/extend
         for rx in g["split_patterns"][:20]:
             patterns.append(str(rx))
 
@@ -822,7 +885,7 @@ def run_granulo_test(
         frt = build_frt(q["text"], rtxt, triggers)
 
         qc_id = qc_map.get(qi_id, "")
-        is_orphan = not qc_id  # en pratique rare, mais on garde la preuve
+        is_orphan = not qc_id
         if is_orphan:
             orphan_count += 1
             orphan_ids.append(qi_id)
@@ -844,7 +907,7 @@ def run_granulo_test(
             "frt": frt,
         })
 
-    # Chapter report complet (optimisé)
+    # Chapter report complet (optimisé O(n))
     ch_label = {c["chapter_code"]: c.get("chapter_label", c["chapter_code"]) for c in chapters}
 
     qc_by_chapter: Dict[str, List[str]] = {}
@@ -981,7 +1044,11 @@ def main():
         if st.session_state.pack_active:
             st.success("✅ Pack actif")
             st.write(f"**{st.session_state.pack_id}**")
-            st.caption(f"Pack file: {st.session_state.pack_active.get('_pack_file_path','')}")
+            src = st.session_state.pack_active.get("_source", "FILE")
+            if src == "EMBEDDED_TEST":
+                st.caption("Source: EMBEDDED TEST")
+            else:
+                st.caption(f"Pack file: {st.session_state.pack_active.get('_pack_file_path','')}")
         else:
             st.warning("Pack inactif (ISO-PROD: RUN bloqué sans pack).")
 
