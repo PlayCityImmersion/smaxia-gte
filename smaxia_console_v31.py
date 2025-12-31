@@ -1,20 +1,18 @@
 # =============================================================================
-# SMAXIA GTE Console V31.9.11 (ISO-PROD — Kernel-aligned) — UI FLUX STRICT
+# SMAXIA GTE Console V31.10.0 (ISO-PROD — UIFLUX + Library visible + Kernel locks)
 # =============================================================================
 #
-# UI FLUX (OBLIGATOIRE)
-# [1] Activation pays (1 clic) -> load_academic_pack("FR") (invisible)
-# [2] Pack visible -> Niveaux / Matières / Chapitres
+# FLUX VALIDÉ:
+# [1] Activation pays -> load_academic_pack("FR") (invisible)
+# [2] Pack visible -> UI affiche niveaux/matières/chapitres
 # [3] Sélection -> Niveau + 1-2 matières
-# [4] Harvest AUTO (pêche aveugle) -> barre progression visible
-# [5] Pipeline -> Qi/RQi -> (ARI,FRT,Triggers) -> QC (ordre strict)
-# [6] Mapping chapitre -> intent_code -> Pack.chapter_code (pack-driven)
-# [7] Saturation -> arrêt si new_proof_sig=0 ET validateurs B PASS -> SEALED
-# [8] Explorateur -> QC → ARI → FRT → Triggers → Qi
-# [9] Exports -> preuves + logs
-#
-# KERNEL V10.6.1 (CAS 1 ONLY) : couverture 100% POSABLE, orphelins POSABLE bloquants,
-# pas de reconstruction, déterminisme, preuves exportables. (Réf doc scellé)
+# [4] Harvest AUTO (pêche aveugle) -> bibliothèque visible (sujets + corrigés)
+# [5] Extraction -> Qi/RQi
+# [6] Pipeline -> ARI/FRT/TRG puis QC
+# [7] Mapping QC -> chapitres (pack-driven)
+# [8] Validateurs B BLOQUANTS (inclut B-00_MIN_POSABLE & B-00_MIN_QC)
+# [9] Saturation -> SEALED seulement si new_proof_sig=0 ET B PASS ET QC>0 ET POSABLE>0
+# [10] Résultats / Explorateur / Exports
 # =============================================================================
 
 from __future__ import annotations
@@ -28,7 +26,6 @@ import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,18 +36,14 @@ try:
 except Exception:
     pdfplumber = None
 
-# -------------------------
-# BUILD TAG (preuve UI)
-# -------------------------
-BUILD_TAG = "V31.9.11-UIFLUX-2025-12-31"
+BUILD_TAG = "V31.10.0-UIFLUX-LIBRARY-2025-12-31"
 
 
 # =============================================================================
-# ZONE A — PACK LOADER (SIMULATION ISO-PROD)
+# PACK LOADER (SIMULATION ISO-PROD)
 # =============================================================================
+
 def load_academic_pack(country_code: str) -> Optional[Dict[str, Any]]:
-    # NOTE TEST: ce loader est un HARNESS ISO-PROD.
-    # En PROD: API/DB/Prompt5 admin.
     PACKS: Dict[str, Dict[str, Any]] = {
         "FR": {
             "pack_id": "CAP_FR_BAC_2024_V1",
@@ -123,7 +116,7 @@ def load_academic_pack(country_code: str) -> Optional[Dict[str, Any]]:
                     "user_agent": "SMAXIA-Harvester/1.0 (ISO-PROD)",
                     "timeout_sec": 25,
                     "max_pdf_mb": 25,
-                    "max_links_scan": 1200,
+                    "max_links_scan": 700,
                 },
                 "sources": {
                     "TERMINALE|MATH": [
@@ -168,6 +161,7 @@ def load_academic_pack(country_code: str) -> Optional[Dict[str, Any]]:
 # =============================================================================
 # CORE HELPERS
 # =============================================================================
+
 def canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
 
@@ -180,15 +174,74 @@ def sha8_bytes(b: bytes) -> str:
 def sha10_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
 
+def now_iso() -> str:
+    return datetime.now().isoformat()
+
 
 # =============================================================================
-# HARVEST (pack-driven) + pairing
+# LIBRARY (bibliothèque visible) — sujets + corrigés (AUTO + MANUAL)
 # =============================================================================
+
+def library_init():
+    if "library" not in st.session_state:
+        st.session_state.library = []  # list[dict(pair_id, label, scope_key, subject_bytes, correction_bytes, subject_url, corr_url, added_at, source)]
+    if "logs" not in st.session_state:
+        st.session_state.logs = []
+
+def log(line: str):
+    st.session_state.logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {line}")
+
+def library_add_items(items: List[Dict[str, Any]], source: str):
+    library_init()
+    existing = {x.get("pair_id") for x in st.session_state.library if x.get("pair_id")}
+    added = 0
+    for it in items:
+        pid = it.get("pair_id")
+        if not pid or pid in existing:
+            continue
+        row = dict(it)
+        row["added_at"] = now_iso()
+        row["source"] = source
+        st.session_state.library.append(row)
+        existing.add(pid)
+        added += 1
+    return added
+
+def library_rows(limit: int = 400) -> List[Dict[str, Any]]:
+    library_init()
+    rows = []
+    for it in st.session_state.library[:limit]:
+        sb = it.get("subject_bytes") or b""
+        cb = it.get("correction_bytes") or b""
+        rows.append({
+            "pair_id": it.get("pair_id"),
+            "scope": it.get("scope_key"),
+            "source": it.get("source"),
+            "sujet": it.get("label"),
+            "corrigé?": "✅" if cb else "❌",
+            "size_sujet_kb": int(len(sb) / 1024) if sb else 0,
+            "size_corr_kb": int(len(cb) / 1024) if cb else 0,
+            "added_at": (it.get("added_at") or "")[:19],
+        })
+    return rows
+
+def library_counts() -> Tuple[int, int]:
+    library_init()
+    total = len(st.session_state.library)
+    with_corr = sum(1 for it in st.session_state.library if it.get("correction_bytes"))
+    return total, with_corr
+
+
+# =============================================================================
+# HARVEST (pack-driven, pêche aveugle) + MANIFEST
+# =============================================================================
+
 def http_get(url: str, ua: str, timeout: int) -> Tuple[Optional[bytes], Optional[str]]:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": ua})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read(), None
+            data = resp.read()
+            return data, None
     except Exception as e:
         return None, f"http_get failed: {type(e).__name__}: {e}"
 
@@ -227,7 +280,7 @@ def harvest_subjects(
     ua = http_cfg.get("user_agent", "Mozilla/5.0")
     timeout = int(http_cfg.get("timeout_sec", 25))
     max_pdf_mb = float(http_cfg.get("max_pdf_mb", 25))
-    max_links_scan = int(http_cfg.get("max_links_scan", 600))
+    max_links_scan = int(http_cfg.get("max_links_scan", 700))
 
     key = f"{level}|{subject}"
     sources = (cfg.get("sources", {}) or {}).get(key, [])
@@ -239,13 +292,13 @@ def harvest_subjects(
         "download_fail": 0,
         "pairs_with_correction": 0,
         "errors": [],
-        "started_at": datetime.now().isoformat(),
+        "started_at": now_iso(),
         "ended_at": None,
     }
 
     if not sources:
         manifest["errors"].append(f"no_sources_for_scope:{key}")
-        manifest["ended_at"] = datetime.now().isoformat()
+        manifest["ended_at"] = now_iso()
         return [], manifest
 
     all_pairs: List[Tuple[str, Optional[str]]] = []
@@ -273,17 +326,17 @@ def harvest_subjects(
     unique = [(s, c) for (s, c) in all_pairs if s and (s not in seen) and not seen.add(s)]
     if not unique:
         manifest["errors"].append("no_pdf_pairs_discovered")
-        manifest["ended_at"] = datetime.now().isoformat()
+        manifest["ended_at"] = now_iso()
         return [], manifest
 
-    rnd = random.Random(42)  # déterminisme ISO
+    rnd = random.Random(42)
     if len(unique) > volume:
         unique = rnd.sample(unique, volume)
-
     manifest["selected_pairs"] = len(unique)
 
     items: List[Dict[str, Any]] = []
     total = len(unique)
+
     for i, (subj_url, corr_url) in enumerate(unique, start=1):
         if progress_cb:
             progress_cb(i, total, subj_url)
@@ -301,15 +354,16 @@ def harvest_subjects(
 
         cb = None
         if corr_url:
-            cb, errc = http_get(corr_url, ua, timeout)
+            cb2, errc = http_get(corr_url, ua, timeout)
             if errc:
                 manifest["errors"].append(f"corr_download_fail:{corr_url}:{errc}")
-                cb = None
-            elif cb and (len(cb) / (1024 * 1024)) > max_pdf_mb:
-                manifest["errors"].append(f"corr_too_large_mb:{corr_url}:{len(cb)/(1024*1024):.1f}")
-                cb = None
+            else:
+                if (len(cb2) / (1024 * 1024)) > max_pdf_mb:
+                    manifest["errors"].append(f"corr_too_large_mb:{corr_url}:{len(cb2)/(1024*1024):.1f}")
+                else:
+                    cb = cb2
 
-        items.append({
+        item = {
             "pair_id": f"PAIR_{key}_{i:04d}_{sha8_bytes(sb)}",
             "scope_key": key,
             "label": urllib.parse.urlparse(subj_url).path.split("/")[-1] or f"subject_{i}.pdf",
@@ -317,18 +371,20 @@ def harvest_subjects(
             "corr_url": corr_url,
             "subject_bytes": sb,
             "correction_bytes": cb,
-        })
+        }
+        items.append(item)
         manifest["download_ok"] += 1
         if cb:
             manifest["pairs_with_correction"] += 1
 
-    manifest["ended_at"] = datetime.now().isoformat()
+    manifest["ended_at"] = now_iso()
     return items, manifest
 
 
 # =============================================================================
-# PDF -> Qi/RQi EXTRACTION (structure-driven HARNESS)
+# PDF -> Qi/RQi EXTRACTION (structure-driven) — TEST HARNESS
 # =============================================================================
+
 def read_pdf_text(pdf_bytes: bytes) -> str:
     if not pdfplumber:
         return ""
@@ -395,26 +451,25 @@ def segment_questions(text: str) -> List[Dict[str, Any]]:
     return segments
 
 def marker_to_intent(marker: str) -> str:
-    # HARNESS TEST (non PROD): EXn-Qm -> STRUCT_EXn_Qm
     m = re.match(r"EX(\d+)-Q(\d+)", (marker or "").strip(), re.I)
     if not m:
         return "STRUCT_UNK"
     return f"STRUCT_EX{m.group(1)}_Q{m.group(2)}"
 
-def extract_qi_rqi(pairs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def extract_qi_rqi_from_library(library_items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     qi_list: List[Dict[str, Any]] = []
     stats = {
-        "pairs": len(pairs),
+        "library_items": len(library_items),
         "qi_total": 0,
-        "qi_posable": 0,  # CAS 1 ONLY (test): posable = corrigé exploitable présent
+        "qi_posable": 0,
         "aligned_rqi": 0,
         "pdfplumber": bool(pdfplumber),
         "errors": [],
     }
 
-    for pair in pairs:
+    for pair in library_items:
         try:
-            subj_text = read_pdf_text(pair["subject_bytes"])
+            subj_text = read_pdf_text(pair.get("subject_bytes") or b"")
             corr_text = read_pdf_text(pair.get("correction_bytes") or b"")
 
             subj_segs = segment_questions(subj_text)
@@ -450,12 +505,13 @@ def extract_qi_rqi(pairs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], D
 
 
 # =============================================================================
-# PIPELINE GTE — INVARIANT (ARI/FRT/TRG templates) -> QC (conteneur final)
+# PIPELINE GTE — INVARIANT (ARI/FRT/TRG templates) -> QC
 # =============================================================================
+
 def cluster_by_intent(qi_list: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     clusters: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for qi in qi_list:
-        if qi.get("has_rqi"):  # CAS 1 ONLY: POSABLE
+        if qi.get("has_rqi"):
             clusters[qi.get("intent_code", "STRUCT_UNK")].append(qi)
     return dict(clusters)
 
@@ -483,13 +539,12 @@ def make_frt_template(intent_code: str, proof_sig: str) -> Dict[str, Any]:
         "intent_code": intent_code,
         "template": "FRT_INVARIANT_V1",
         "sections": {
-            "usage": "USAGE",
-            "preconditions": "PRECONDITIONS",
-            "ari": "ARI_TYPED",
-            "checkpoints": ["CHECKPOINTS"],
+            "given": "GIVEN",
+            "goal": "GOAL",
+            "method": "METHOD",
+            "checks": ["CHECKS"],
             "traps": ["TRAPS"],
             "final": "FINAL",
-            "proofs": ["EVIDENCE_REFS"],
         },
     }
 
@@ -502,19 +557,19 @@ def make_triggers_template(intent_code: str, proof_sig: str) -> List[Dict[str, A
     }]
 
 def build_qc(intent_code: str, cluster: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    # Anti-singleton (normatif): n_q_cluster >= 2
     if len(cluster) < 2:
         return None
 
     qi_ids = [q["qi_id"] for q in cluster if q.get("qi_id")]
     sig = proof_signature(intent_code, qi_ids)
 
+    qc_id_stable = f"QC_{intent_code}_{sha10_str(intent_code)}"
     ari = make_ari_template(intent_code, sig)
     frt = make_frt_template(intent_code, sig)
     trgs = make_triggers_template(intent_code, sig)
 
     return {
-        "qc_id": f"QC_{intent_code}_{sha10_str(intent_code)}",
+        "qc_id": qc_id_stable,
         "intent_code": intent_code,
         "qc_proof_sig": sig,
         "formulation": "Comment procéder ?",
@@ -523,11 +578,10 @@ def build_qc(intent_code: str, cluster: List[Dict[str, Any]]) -> Optional[Dict[s
         "ari": ari,
         "frt": frt,
         "triggers": trgs,
-        "created_at": datetime.now().isoformat(),
+        "created_at": now_iso(),
     }
 
 def map_qc_to_chapter(intent_code: str, chapters: List[Dict[str, Any]]) -> Optional[str]:
-    # Pack-driven allowlist (Option A)
     for ch in chapters:
         if intent_code in (ch.get("intent_allowlist") or []):
             return ch.get("chapter_code")
@@ -538,13 +592,10 @@ def run_pipeline_gte(qi_list: List[Dict[str, Any]], chapters: List[Dict[str, Any
 
     qc_list: List[Dict[str, Any]] = []
     singletons: List[Dict[str, Any]] = []
-
-    # ORDRE VALIDÉ: ARI/FRT/TRG générés AVANT QC (QC = conteneur final)
     for intent_code, cluster in sorted(clusters.items(), key=lambda x: x[0]):
         if len(cluster) < 2:
             singletons.append({"intent_code": intent_code, "count": len(cluster)})
             continue
-
         qc = build_qc(intent_code, cluster)
         if qc:
             qc["chapter_code"] = map_qc_to_chapter(intent_code, chapters)
@@ -561,13 +612,14 @@ def run_pipeline_gte(qi_list: List[Dict[str, Any]], chapters: List[Dict[str, Any
 
 
 # =============================================================================
-# PROOFS + VALIDATORS B (BLOQUANTS)
+# VALIDATORS B (BLOQUANTS) + REPORTS
 # =============================================================================
+
 def compute_orphans_posable(qi_list: List[Dict[str, Any]], qcs: List[Dict[str, Any]]) -> List[str]:
     posable_ids = {q["qi_id"] for q in qi_list if q.get("has_rqi") and q.get("qi_id")}
     covered = set()
     for qc in qcs:
-        for qid in (qc.get("qi_ids") or []):
+        for qid in qc.get("qi_ids", []) or []:
             covered.add(qid)
     return sorted([qid for qid in posable_ids if qid not in covered])
 
@@ -593,7 +645,7 @@ def build_chapter_report(chapters: List[Dict[str, Any]], qi_list: List[Dict[str,
             qi_by_intent[qi.get("intent_code", "STRUCT_UNK")].append(qi.get("qi_id"))
 
     report: Dict[str, Any] = {
-        "generated_at": datetime.now().isoformat(),
+        "generated_at": now_iso(),
         "active_chapters": sorted(list(active_codes)),
         "chapters": {},
     }
@@ -635,13 +687,25 @@ def build_chapter_report(chapters: List[Dict[str, Any]], qi_list: List[Dict[str,
     return report
 
 def validate_B_blocking(chapters: List[Dict[str, Any]], qi_list: List[Dict[str, Any]], qcs: List[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
+    qi_posable = sum(1 for q in qi_list if q.get("has_rqi"))
+    qc_total = len(qcs)
+
     orphans_global = compute_orphans_posable(qi_list, qcs)
     chapter_report = build_chapter_report(chapters, qi_list, qcs)
 
     failures = []
+
+    # B-00: MIN POSABLE + MIN QC (anti-faux SEALED)
+    if qi_posable <= 0:
+        failures.append({"code": "B-00_MIN_POSABLE", "detail": "qi_posable==0 (aucune correction alignée)."})
+    if qc_total <= 0:
+        failures.append({"code": "B-00_MIN_QC", "detail": "qc_total==0 (aucune QC générée)."})
+
+    # B-01: orphans posables interdits
     if orphans_global:
         failures.append({"code": "B-01_ORPHANS_POSABLE", "count": len(orphans_global), "sample": orphans_global[:20]})
 
+    # B-02..B-04: preuve par chapitre actif
     for ch_code, data in (chapter_report.get("chapters") or {}).items():
         if data.get("qi_posable_count", 0) == 0:
             failures.append({"code": "B-02_NO_EVIDENCE_CHAPTER", "chapter": ch_code})
@@ -651,17 +715,21 @@ def validate_B_blocking(chapters: List[Dict[str, Any]], qi_list: List[Dict[str, 
             failures.append({"code": "B-04_NO_QC_CHAPTER", "chapter": ch_code})
 
     ok = (len(failures) == 0)
-    return ok, {
+    details = {
         "ok": ok,
+        "qi_posable": qi_posable,
+        "qc_total": qc_total,
         "orphans_global": orphans_global,
         "chapter_report": chapter_report,
         "failures": failures,
     }
+    return ok, details
 
 
 # =============================================================================
-# SATURATION — proof signatures delta (anti-faux SEALED)
+# SATURATION — proof signatures
 # =============================================================================
+
 def saturation_delta(prev_qcs: List[Dict[str, Any]], new_qcs: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
     prev_sigs = {qc.get("qc_proof_sig") for qc in prev_qcs if qc.get("qc_proof_sig")}
     new_sigs = {qc.get("qc_proof_sig") for qc in new_qcs if qc.get("qc_proof_sig")}
@@ -670,473 +738,422 @@ def saturation_delta(prev_qcs: List[Dict[str, Any]], new_qcs: List[Dict[str, Any
 
 
 # =============================================================================
-# STREAMLIT UI — FLUX STRICT
+# STREAMLIT UI — 3 tabs (Import PDF / Chaîne complète / Résultats)
 # =============================================================================
+
 def init_state():
     defaults = {
-        "country": "FR",
         "pack": None,
+        "country": "FR",
         "level": None,
         "subjects": [],
-        "library_pairs": [],          # bibliothèque (auto+manuel)
-        "harvest_manifest": None,
         "qi_global": [],
         "qi_stats": None,
         "qcs_global": [],
         "gte_stats": None,
-        "last_B": None,
         "sealed": False,
+        "last_B": None,
+        "harvest_manifest": None,
         "iterations": [],
-        "log_lines": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    library_init()
 
-def log(line: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    st.session_state.log_lines.append(f"[{ts}] {line}")
-
-def reset_runtime_state(keep_pack: bool = True):
-    pack = st.session_state.pack if keep_pack else None
-    country = st.session_state.country
-    st.session_state.level = None
-    st.session_state.subjects = []
-    st.session_state.library_pairs = []
-    st.session_state.harvest_manifest = None
-    st.session_state.qi_global = []
-    st.session_state.qi_stats = None
-    st.session_state.qcs_global = []
-    st.session_state.gte_stats = None
-    st.session_state.last_B = None
-    st.session_state.sealed = False
-    st.session_state.iterations = []
-    st.session_state.log_lines = []
-    st.session_state.pack = pack
-    st.session_state.country = country
-
-def sidebar_activation_and_pack():
+def sidebar(pack: Optional[Dict[str, Any]]):
     st.sidebar.markdown("## ÉTAPE 1 — ACTIVATION PAYS")
     st.sidebar.caption("1 clic = load_academic_pack(country) (invisible). Pack visible = preuve.")
 
     st.session_state.country = st.sidebar.selectbox("Pays (TEST)", ["FR", "CI"], index=0 if st.session_state.country == "FR" else 1)
-
-    if st.sidebar.button("🔓 ACTIVER", type="primary", use_container_width=True):
-        pack = load_academic_pack(st.session_state.country)
-        if not pack:
+    if st.sidebar.button("🗝️ ACTIVER", type="primary", use_container_width=True):
+        p = load_academic_pack(st.session_state.country)
+        if not p:
             st.sidebar.error("Pack introuvable.")
         else:
-            st.session_state.pack = pack
-            reset_runtime_state(keep_pack=True)
-            log(f"═══ ACTIVATION ═══ Pays: {pack.get('country_code')} | Pack: {pack.get('pack_id')} | Version: {pack.get('version')}")
-            st.sidebar.success(f"Pack actif: {pack.get('pack_id')}")
-
-    pack = st.session_state.pack
-    if not pack:
-        st.sidebar.info("Activez un pays.")
-        return
-
-    st.sidebar.markdown("---")
-    st.sidebar.write(f"✅ **Pack actif:** {pack.get('pack_id')}")
-    st.sidebar.caption(f"Signature: {pack.get('signature', {}).get('hash')} / {pack.get('signature', {}).get('signed_at')}")
-
-    acs = pack.get("academic_structure", {}) or {}
-    st.sidebar.markdown("### Niveaux")
-    for lv in sorted(acs.get("levels", []), key=lambda x: x.get("order", 999)):
-        st.sidebar.caption(f"• {lv.get('label')} ({lv.get('id')})")
-
-    st.sidebar.markdown("### Matières (selon niveau)")
-    if st.session_state.level:
-        labels = {s["id"]: s["label"] for s in acs.get("subjects", [])}
-        allowed = acs.get("level_subjects", {}).get(st.session_state.level, [])
-        for s in allowed:
-            st.sidebar.caption(f"• {labels.get(s, s)} ({s})")
-    else:
-        for s in acs.get("subjects", []):
-            st.sidebar.caption(f"• {s.get('label')} ({s.get('id')})")
-
-    st.sidebar.markdown("### Chapitres (pack-driven)")
-    for ch in pack.get("chapters", [])[:18]:
-        st.sidebar.caption(f"• {ch.get('chapter_code')} — {ch.get('label')}")
-    if len(pack.get("chapters", [])) > 18:
-        st.sidebar.caption("…")
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("## ÉTAPE 2 — SÉLECTION")
-    if not st.session_state.pack:
-        st.sidebar.info("Activez un pays.")
-        return
-
-    levels = sorted(acs.get("levels", []), key=lambda x: x.get("order", 999))
-    level_ids = [l["id"] for l in levels]
-    level_labels = {l["id"]: l["label"] for l in levels}
-
-    st.session_state.level = st.sidebar.radio(
-        "Niveau",
-        level_ids,
-        horizontal=False,
-        format_func=lambda x: level_labels.get(x, x),
-        index=level_ids.index(st.session_state.level) if st.session_state.level in level_ids else 0,
-    )
-
-    subject_labels = {s["id"]: s["label"] for s in acs.get("subjects", [])}
-    allowed = acs.get("level_subjects", {}).get(st.session_state.level, [])
-
-    st.session_state.subjects = st.sidebar.multiselect(
-        "Matières (1–2 recommandé pour test)",
-        options=allowed,
-        default=st.session_state.subjects if st.session_state.subjects else (allowed[:1] if allowed else []),
-        format_func=lambda x: subject_labels.get(x, x),
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.write("✅ Sélection:")
-    st.sidebar.write(f"- Niveau: **{level_labels.get(st.session_state.level, st.session_state.level)}**")
-    st.sidebar.write(f"- Matières: **{', '.join(st.session_state.subjects) if st.session_state.subjects else '—'}**")
-
-
-def ui_import_pdf():
-    st.subheader("Import PDF (sujets + corrigés)")
-    st.caption("Bibliothèque = Harvest AUTO + Upload manuel. La chaîne GTE consomme la bibliothèque.")
-
-    colL, colR = st.columns([2, 1])
-
-    with colL:
-        st.markdown("### Bibliothèque Harvest (visible)")
-        if not st.session_state.library_pairs:
-            st.info("Aucun item en bibliothèque. Lancez la chaîne complète (Harvest AUTO) ou faites un upload manuel.")
-        else:
-            rows = []
-            for p in st.session_state.library_pairs[:300]:
-                rows.append({
-                    "pair_id": p.get("pair_id"),
-                    "scope": p.get("scope_key"),
-                    "sujet": p.get("label"),
-                    "corrigé?": "✅" if p.get("correction_bytes") else "❌",
-                })
-            st.dataframe(rows, use_container_width=True, height=340)
-            st.caption("Affichage limité à 300 lignes (export complet disponible).")
-
-    with colR:
-        st.markdown("### Upload manuel (optionnel)")
-        subj_files = st.file_uploader("PDF Sujet", type=["pdf"], accept_multiple_files=True, key="manual_subj")
-        corr_files = st.file_uploader("PDF Correction (opt)", type=["pdf"], accept_multiple_files=True, key="manual_corr")
-
-        if st.button("➕ Ajouter à la bibliothèque", use_container_width=True):
-            if not subj_files:
-                st.error("Ajoutez au moins un PDF Sujet.")
-                return
-
-            pairs = []
-            corr_list = corr_files or []
-
-            for i, sf in enumerate(subj_files, start=1):
-                sb = sf.read()
-                sf.seek(0)
-                cb = None
-
-                # pairing best-effort par nom
-                sname = (sf.name or "").lower()
-                for cf in corr_list:
-                    cname = (cf.name or "").lower()
-                    if ("corrig" in cname or "correc" in cname) and (
-                        re.sub(r"(corrig[eé]|correction|corrige)", "", cname)[:25] in re.sub(r"(enonce|énoncé)", "", sname)[:25]
-                        or re.sub(r"(enonce|énoncé)", "", sname)[:25] in re.sub(r"(corrig[eé]|correction|corrige)", "", cname)[:25]
-                    ):
-                        cb = cf.read()
-                        cf.seek(0)
-                        break
-
-                pairs.append({
-                    "pair_id": f"MANUAL_{i:04d}_{sha8_bytes(sb)}",
-                    "scope_key": "MANUAL",
-                    "label": sf.name,
-                    "subject_url": None,
-                    "corr_url": None,
-                    "subject_bytes": sb,
-                    "correction_bytes": cb,
-                })
-
-            before = len(st.session_state.library_pairs)
-            st.session_state.library_pairs.extend(pairs)
-            after = len(st.session_state.library_pairs)
-
-            log(f"[MANUAL] +{after-before} pairs ajoutées à la bibliothèque.")
-            st.success(f"Ajouté : {after-before} pair(s).")
-
-
-def ui_chain_complete():
-    st.subheader("ÉTAPE 3 — LANCER CHAÎNE COMPLÈTE (Harvest → Extraction → RUN GTE → Saturation)")
-    st.caption("Objectif ISO-PROD : preuves exportables, validateurs B bloquants, scellement seulement si new_proof_sig=0 ET B PASS.")
-
-    if not st.session_state.pack:
-        st.warning("Activez d'abord un pays.")
-        return
-    if not st.session_state.level or not st.session_state.subjects:
-        st.warning("Sélectionnez Niveau + au moins une matière.")
-        return
-
-    colA, colB, colC = st.columns([1, 1, 1])
-    with colA:
-        base_volume = st.number_input("Volume initial (par matière)", min_value=5, value=20, step=5)
-    with colB:
-        max_iter = st.number_input("Max itérations", min_value=1, value=5, step=1)
-    with colC:
-        incr = st.number_input("Incrément volume", min_value=5, value=50, step=5)
-
-    run_btn = st.button("⚡ LANCER CHAÎNE COMPLÈTE", type="primary", use_container_width=True)
-
-    log_box = st.empty()
-    prog = st.progress(0.0)
-    iter_table = st.empty()
-
-    def render_log():
-        last = "\n".join(st.session_state.log_lines[-200:])
-        log_box.code(last or "(log vide)", language="text")
-
-    if run_btn:
-        # reset runtime (mais conserve pack + sélection + bibliothèque existante)
-        st.session_state.sealed = False
-        st.session_state.iterations = []
-        st.session_state.qi_global = []
-        st.session_state.qcs_global = []
-        st.session_state.qi_stats = None
-        st.session_state.gte_stats = None
-        st.session_state.last_B = None
-
-        st.session_state.log_lines = []
-        log(f"═══ DÉMARRAGE CHAÎNE {BUILD_TAG} ═══")
-        log(f"Pays: {st.session_state.pack.get('country_code')} | Niveau: {st.session_state.level} | Matières: {st.session_state.subjects}")
-
-        current_volume = int(base_volume)
-        prev_qcs: List[Dict[str, Any]] = []
-
-        chapters = st.session_state.pack.get("chapters", [])
-
-        for it in range(1, int(max_iter) + 1):
-            if st.session_state.sealed:
-                break
-
-            log(f"══ ITÉRATION {it} — Volume: {current_volume} sujets/matière ══")
-            render_log()
-
-            # Harvest per subject
-            all_pairs = []
-            all_manifests = []
-
-            def progress_cb(cur, total, url):
-                prog.progress(cur / max(1, total), text=f"Harvest {cur}/{total} — {url.split('/')[-1][:60]}")
-
-            for subj in st.session_state.subjects:
-                scope = f"{st.session_state.level}|{subj}"
-                log(f"[HARVEST] Scope: {scope} …")
-                render_log()
-
-                pairs, manifest = harvest_subjects(st.session_state.pack, st.session_state.level, subj, current_volume, progress_cb)
-                all_pairs.extend(pairs)
-                all_manifests.append(manifest)
-
-                log(f"[HARVEST] {scope}: {len(pairs)} pairs téléchargées (corrigé si trouvé).")
-                render_log()
-
-            prog.progress(1.0)
-
-            if not all_pairs:
-                log("⛔ 0 pairs récoltées. Arrêt.")
-                render_log()
-                break
-
-            # Ajouter à bibliothèque visible
-            before = len(st.session_state.library_pairs)
-            st.session_state.library_pairs.extend(all_pairs)
-            log(f"[BIBLIOTHÈQUE] +{len(st.session_state.library_pairs)-before} items (total={len(st.session_state.library_pairs)}).")
-            render_log()
-
-            # Extraction Qi/RQi (CAS 1 ONLY: POSABLE = has_rqi)
-            log("[EXTRACTION] Dépessage Qi/RQi …")
-            render_log()
-            qi_new, qi_stats = extract_qi_rqi(all_pairs)
-
-            # Merge by qi_id (déterministe)
-            existing = {q["qi_id"] for q in st.session_state.qi_global}
-            new_only = [q for q in qi_new if q.get("qi_id") not in existing]
-            st.session_state.qi_global.extend(new_only)
-            st.session_state.qi_stats = qi_stats | {"new_qi_added": len(new_only), "qi_global_total": len(st.session_state.qi_global)}
-
-            log(f"[EXTRACTION] +{len(new_only)} Qi (global={len(st.session_state.qi_global)}). POSABLE={sum(1 for q in st.session_state.qi_global if q.get('has_rqi'))}")
-            render_log()
-
-            # Pipeline GTE (ARI/FRT/TRG -> QC) + mapping chapitre
-            log("[GTE] Construction QC (ARI/FRT/TRG -> QC) …")
-            render_log()
-            qcs, gte_stats = run_pipeline_gte(st.session_state.qi_global, chapters)
-            st.session_state.qcs_global = qcs
-            st.session_state.gte_stats = gte_stats
-
-            log(f"[GTE] QC total={len(qcs)} | clusters={gte_stats.get('clusters')} | singletons={gte_stats.get('singletons')}")
-            render_log()
-
-            # Validateurs B (bloquants)
-            okB, B = validate_B_blocking(chapters, st.session_state.qi_global, st.session_state.qcs_global)
-            st.session_state.last_B = B
-            log(f"[B] {'PASS' if okB else 'FAIL'} | orphans_global={len(B.get('orphans_global') or [])}")
-            render_log()
-
-            # Saturation delta proof sig
-            new_count, _added_sigs = saturation_delta(prev_qcs, qcs)
-
-            st.session_state.iterations.append({
-                "iter": it,
-                "volume": current_volume,
-                "pairs": len(all_pairs),
-                "new_qi": len(new_only),
-                "qc_total": len(qcs),
-                "new_proof_sig": new_count,
-                "B_ok": okB,
-                "timestamp": datetime.now().isoformat(),
-            })
-
-            iter_table.dataframe(st.session_state.iterations, use_container_width=True)
-
-            if new_count == 0 and okB:
-                st.session_state.sealed = True
-                log("🎯 ═══ SATURATION ATTEINTE — SEALED (new_proof_sig=0 ET B PASS) ═══")
-                render_log()
-                break
-            else:
-                if new_count == 0 and not okB:
-                    log("⛔ new_proof_sig=0 MAIS B FAIL -> SCELLEMENT INTERDIT")
-                else:
-                    log(f"Non scellé : new_proof_sig={new_count} | B_ok={okB}")
-                render_log()
-
-            prev_qcs = qcs[:]
-            current_volume += int(incr)
-            time.sleep(0.05)
-
-        if not st.session_state.sealed:
-            log("Fin chaîne: non scellé (limite itérations atteinte ou preuves insuffisantes).")
-            render_log()
-
-
-def ui_results_explorer_exports():
-    st.subheader("ÉTAPE 4 — RÉSULTATS / EXPLORATEUR / EXPORTS")
-
-    # KPI
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Qi global", len(st.session_state.qi_global))
-    c2.metric("Qi POSABLE", sum(1 for q in st.session_state.qi_global if q.get("has_rqi")))
-    c3.metric("QC", len(st.session_state.qcs_global))
-    c4.metric("SEALED", "YES" if st.session_state.sealed else "NO")
-
-    # Validateurs B
-    if st.session_state.pack and st.session_state.qcs_global:
-        okB, B = validate_B_blocking(st.session_state.pack.get("chapters", []), st.session_state.qi_global, st.session_state.qcs_global)
-        st.session_state.last_B = B
-
-        st.markdown("### Validateurs B (BLOQUANTS)")
-        if okB:
-            st.success("PASS — aucun orphelin POSABLE, preuve 100% sur chapitres actifs.")
-        else:
-            st.error("FAIL — violation bloquante (orphelins POSABLE ou couverture chapitre ≠ 100%).")
-            with st.expander("Détails FAIL", expanded=True):
-                st.json(B.get("failures"))
-
-        st.markdown("### Chapter Report (preuve)")
-        st.json((B.get("chapter_report") or {}))
-
-    st.markdown("---")
-    st.markdown("### Explorateur : QC → ARI → FRT → Triggers → Qi")
-
-    if not st.session_state.pack or not st.session_state.qcs_global:
-        st.info("Exécutez la chaîne complète pour obtenir des QC.")
-    else:
-        chapters = st.session_state.pack.get("chapters", [])
-        ch_label = {c.get("chapter_code"): c.get("label") for c in chapters}
-
-        by_ch = defaultdict(list)
-        for qc in st.session_state.qcs_global:
-            by_ch[qc.get("chapter_code") or "ORPHAN"].append(qc)
-
-        ch_options = sorted(by_ch.keys())
-        selected_ch = st.selectbox(
-            "Chapitre",
-            options=ch_options,
-            format_func=lambda x: f"{x} — {ch_label.get(x, x)} ({len(by_ch.get(x, []))} QC)",
+            st.session_state.pack = p
+            st.session_state.level = None
+            st.session_state.subjects = []
+            st.session_state.qi_global = []
+            st.session_state.qcs_global = []
+            st.session_state.qi_stats = None
+            st.session_state.gte_stats = None
+            st.session_state.sealed = False
+            st.session_state.last_B = None
+            st.session_state.harvest_manifest = None
+            st.session_state.iterations = []
+            st.session_state.logs = []
+            st.sidebar.success("Pack activé.")
+
+    if pack:
+        st.sidebar.markdown("---")
+        st.sidebar.success(f"Pack actif:\n\n**{pack.get('pack_id')}**")
+        st.sidebar.caption(f"Signature: {pack.get('signature', {}).get('hash')} / {pack.get('signature', {}).get('signed_at')}")
+
+        st.sidebar.markdown("### Niveaux")
+        acs = pack.get("academic_structure", {})
+        levels = sorted(acs.get("levels", []), key=lambda x: x.get("order", 999))
+        for lv in levels:
+            st.sidebar.caption(f"• {lv.get('label')} ({lv.get('id')})")
+
+        st.sidebar.markdown("### Chapitres (pack-driven)")
+        for ch in pack.get("chapters", []):
+            st.sidebar.caption(f"• {ch.get('chapter_code')} — {ch.get('label')}")
+
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("## ÉTAPE 2 — SÉLECTION")
+        level_ids = [l["id"] for l in levels]
+        level_labels = {l["id"]: l["label"] for l in levels}
+        st.session_state.level = st.sidebar.radio(
+            "Niveau",
+            level_ids,
+            index=level_ids.index(st.session_state.level) if st.session_state.level in level_ids else (level_ids.index("TERMINALE") if "TERMINALE" in level_ids else 0),
         )
 
-        qcs = by_ch.get(selected_ch, [])
-        if not qcs:
-            st.info("Aucune QC dans ce chapitre.")
-        else:
-            qc_ids = [qc.get("qc_id") for qc in qcs]
-            selected_qc_id = st.selectbox("QC", options=qc_ids)
+        subj_labels = {s["id"]: s["label"] for s in acs.get("subjects", [])}
+        allowed = acs.get("level_subjects", {}).get(st.session_state.level, [])
+        st.session_state.subjects = st.sidebar.multiselect(
+            "Matières (1–2 recommandé pour test)",
+            options=allowed,
+            default=[allowed[0]] if allowed else [],
+            format_func=lambda x: subj_labels.get(x, x),
+        )
 
-            qc_obj = next((q for q in qcs if q.get("qc_id") == selected_qc_id), None)
-            if qc_obj:
-                st.markdown(f"**Formulation**: {qc_obj.get('formulation')}")
-                st.caption(f"intent_code={qc_obj.get('intent_code')} | proof_sig={str(qc_obj.get('qc_proof_sig'))[:16]}… | n_q_cluster={qc_obj.get('n_q_cluster')}")
-                st.write("**ARI (template invariant)**")
-                st.json(qc_obj.get("ari"))
-                st.write("**FRT (template invariant)**")
-                st.json(qc_obj.get("frt"))
-                st.write("**Triggers**")
-                st.json(qc_obj.get("triggers"))
-                st.write("**Qi associées (preuve)**")
-                st.json((qc_obj.get("qi_ids") or [])[:60])
+        st.sidebar.markdown("---")
+        st.sidebar.success("Sélection:")
+        st.sidebar.write(f"• Niveau: **{level_labels.get(st.session_state.level, st.session_state.level)}**")
+        st.sidebar.write(f"• Matières: **{', '.join(st.session_state.subjects) if st.session_state.subjects else '—'}**")
 
-    st.markdown("---")
-    st.markdown("### Exports (preuves)")
-    colE1, colE2, colE3, colE4, colE5 = st.columns([1, 1, 1, 1, 1])
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("## Bibliothèque (visible)")
+        total, with_corr = library_counts()
+        st.sidebar.write(f"Items: **{total}**")
+        st.sidebar.write(f"Avec corrigé: **{with_corr}**")
 
-    with colE1:
-        st.download_button("qi_pack.json", canonical_json(st.session_state.qi_global), "qi_pack.json", use_container_width=True)
-    with colE2:
-        st.download_button("qc_pack.json", canonical_json(st.session_state.qcs_global), "qc_pack.json", use_container_width=True)
-    with colE3:
-        cr = (st.session_state.last_B or {}).get("chapter_report") or {}
-        st.download_button("chapter_report.json", canonical_json(cr), "chapter_report.json", use_container_width=True)
-    with colE4:
-        st.download_button("harvest_manifest.json", canonical_json(st.session_state.harvest_manifest or {}), "harvest_manifest.json", use_container_width=True)
-    with colE5:
-        st.download_button("logs.txt", "\n".join(st.session_state.log_lines), "logs.txt", use_container_width=True)
+def render_library_zone(title: str):
+    st.subheader(title)
+    total, with_corr = library_counts()
+    st.caption(f"Bibliothèque = Harvest AUTO + Upload manuel. Total={total} | Avec corrigé={with_corr}")
+
+    cols = st.columns([1, 1, 2])
+    with cols[0]:
+        if st.button("🧹 Vider bibliothèque", use_container_width=True):
+            st.session_state.library = []
+            st.session_state.qi_global = []
+            st.session_state.qcs_global = []
+            st.session_state.qi_stats = None
+            st.session_state.gte_stats = None
+            st.session_state.sealed = False
+            st.session_state.last_B = None
+            st.session_state.iterations = []
+            st.session_state.logs = []
+            st.success("Bibliothèque vidée (et résultats reset).")
+            return
+
+    rows = library_rows()
+    if not rows:
+        st.info("Aucun item en bibliothèque. Lancez la chaîne complète (Harvest AUTO) ou faites un upload manuel.")
+        return
+
+    st.dataframe(rows, use_container_width=True, height=300)
+
+    # Détails + download d’un item
+    pair_ids = [r["pair_id"] for r in rows if r.get("pair_id")]
+    choice = st.selectbox("Détails d’un sujet", options=["—"] + pair_ids, index=0)
+    if choice and choice != "—":
+        it = next((x for x in st.session_state.library if x.get("pair_id") == choice), None)
+        if it:
+            st.markdown("#### Détails item")
+            st.write({
+                "pair_id": it.get("pair_id"),
+                "scope_key": it.get("scope_key"),
+                "source": it.get("source"),
+                "subject_url": it.get("subject_url"),
+                "corr_url": it.get("corr_url"),
+                "subject_size_kb": int(len(it.get("subject_bytes") or b"") / 1024),
+                "corr_size_kb": int(len(it.get("correction_bytes") or b"") / 1024),
+                "added_at": it.get("added_at"),
+            })
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    "⬇️ Télécharger SUJET",
+                    data=it.get("subject_bytes") or b"",
+                    file_name=it.get("label") or "sujet.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            with c2:
+                if it.get("correction_bytes"):
+                    st.download_button(
+                        "⬇️ Télécharger CORRIGÉ",
+                        data=it.get("correction_bytes") or b"",
+                        file_name=("CORR_" + (it.get("label") or "corrige.pdf")),
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                else:
+                    st.warning("Aucun corrigé détecté pour cet item.")
 
 
 def main():
     st.set_page_config(page_title=f"SMAXIA GTE {BUILD_TAG}", layout="wide")
-
     init_state()
-    sidebar_activation_and_pack()
 
     st.title(f"🔒 SMAXIA GTE Console {BUILD_TAG}")
     st.caption("ISO-PROD TEST — Activation → Pack visible → Sélection → Harvest → Extraction → RUN GTE → Saturation → Résultats")
 
-    tabs = st.tabs([
-        "📥 Import PDF",
-        "⚡ Chaîne complète",
-        "📊 Résultats / Explorateur / Exports",
-    ])
+    pack = st.session_state.pack
+    sidebar(pack)
 
+    tabs = st.tabs(["📥 Import PDF", "⚡ Chaîne complète", "📊 Résultats / Explorateur / Exports"])
+
+    # -------------------------------------------------------------------------
+    # TAB 1 — Import PDF (auto library visible + upload manual)
+    # -------------------------------------------------------------------------
     with tabs[0]:
-        ui_import_pdf()
+        st.header("Import PDF (sujets + corrigés)")
+        st.caption("Bibliothèque = Harvest AUTO + Upload manuel. La chaîne GTE consomme la bibliothèque.")
 
+        colL, colR = st.columns([2, 1])
+        with colL:
+            render_library_zone("Bibliothèque Harvest (visible)")
+
+        with colR:
+            st.subheader("Upload manuel (optionnel)")
+            st.caption("Fallback si Harvest AUTO indisponible. Ajout direct en bibliothèque.")
+            subj_files = st.file_uploader("PDF Sujet", type=["pdf"], accept_multiple_files=True, key="manual_subj")
+            corr_files = st.file_uploader("PDF Correction (opt)", type=["pdf"], accept_multiple_files=True, key="manual_corr")
+
+            if st.button("➕ Ajouter à la bibliothèque", type="primary", use_container_width=True):
+                if not subj_files:
+                    st.error("Chargez au moins un PDF Sujet.")
+                else:
+                    # pairing best-effort par nom
+                    corr_list = corr_files or []
+                    pairs = []
+                    for i, sf in enumerate(subj_files, start=1):
+                        sb = sf.read()
+                        sf.seek(0)
+
+                        cb = None
+                        if corr_list:
+                            sname = sf.name.lower()
+                            for cf in corr_list:
+                                cname = cf.name.lower()
+                                if ("corrig" in cname or "correc" in cname) and (
+                                    re.sub(r"(corrig[eé]|correction|corrige)", "", cname)[:25] in re.sub(r"(enonce|énoncé)", "", sname)[:25]
+                                    or re.sub(r"(enonce|énoncé)", "", sname)[:25] in re.sub(r"(corrig[eé]|correction|corrige)", "", cname)[:25]
+                                ):
+                                    cb = cf.read()
+                                    cf.seek(0)
+                                    break
+
+                        pairs.append({
+                            "pair_id": f"MANUAL_{i:04d}_{sha8_bytes(sb)}",
+                            "scope_key": "MANUAL",
+                            "label": sf.name,
+                            "subject_url": None,
+                            "corr_url": None,
+                            "subject_bytes": sb,
+                            "correction_bytes": cb,
+                        })
+
+                    added = library_add_items(pairs, source="MANUAL")
+                    log(f"[BIBLIOTHÈQUE] +{added} items ajoutés (MANUAL).")
+                    st.success(f"Ajouté à la bibliothèque : {added} item(s).")
+
+    # -------------------------------------------------------------------------
+    # TAB 2 — Chaîne complète (Harvest -> Extraction -> RUN GTE -> Saturation)
+    # -------------------------------------------------------------------------
     with tabs[1]:
-        ui_chain_complete()
+        st.header("ÉTAPE 3 — LANCER CHAÎNE COMPLÈTE (Harvest → Extraction → RUN GTE → Saturation)")
+        st.caption("Objectif ISO-PROD : preuves exportables, validateurs B bloquants, scellement seulement si new_proof_sig=0 ET B PASS (et POSABLE>0 et QC>0).")
 
+        if not pack:
+            st.warning("Activez d’abord un pays.")
+        elif not st.session_state.level or not st.session_state.subjects:
+            st.warning("Sélectionnez Niveau + Matières dans la sidebar.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                base_volume = st.number_input("Volume initial (par matière)", min_value=5, value=25, step=5)
+            with c2:
+                max_iter = st.number_input("Max itérations", min_value=1, value=4, step=1)
+            with c3:
+                incr = st.number_input("Incrément volume", min_value=5, value=50, step=5)
+
+            btn = st.button("⚡ LANCER CHAÎNE COMPLÈTE", type="primary", use_container_width=True)
+
+            log_box = st.empty()
+            table_box = st.empty()
+
+            def render_logs():
+                log_box.code("\n".join(st.session_state.logs[-200:]), language="text")
+
+            if btn:
+                st.session_state.sealed = False
+                st.session_state.iterations = []
+                prev_qcs = st.session_state.qcs_global[:] if st.session_state.qcs_global else []
+                current_volume = int(base_volume)
+
+                log(f"═══ DÉMARRAGE CHAÎNE {BUILD_TAG} ═══")
+                log(f"Pays: {st.session_state.country} | Niveau: {st.session_state.level} | Matières: {st.session_state.subjects}")
+                render_logs()
+
+                for it in range(1, int(max_iter) + 1):
+                    if st.session_state.sealed:
+                        break
+
+                    log(f"══ ITÉRATION {it} — Volume: {current_volume} sujets/matière ══")
+                    render_logs()
+
+                    progress = st.progress(0.0, text="Harvest…")
+                    scanned = 0
+                    target = max(1, len(st.session_state.subjects) * current_volume)
+
+                    def pcb(cur, total, url):
+                        nonlocal scanned
+                        scanned += 1
+                        progress.progress(min(1.0, scanned / target), text=f"{scanned}/{target} — {url.split('/')[-1][:60]}")
+
+                    all_items = []
+                    all_manifests = []
+
+                    for subj in st.session_state.subjects:
+                        scope = f"{st.session_state.level}|{subj}"
+                        log(f"[HARVEST] Scope: {scope} …")
+                        items, manifest = harvest_subjects(pack, st.session_state.level, subj, current_volume, pcb)
+                        all_items.extend(items)
+                        all_manifests.append(manifest)
+                        log(f"[HARVEST] {scope}: {len(items)} pairs téléchargées (corrigé si trouvé).")
+                        render_logs()
+
+                    progress.empty()
+
+                    if not all_items:
+                        log("⚠️ 0 pairs récoltées. Arrêt.")
+                        render_logs()
+                        break
+
+                    added = library_add_items(all_items, source="AUTO")
+                    log(f"[BIBLIOTHÈQUE] +{added} items (total={len(st.session_state.library)}).")
+                    render_logs()
+
+                    # Extraction depuis la BIBLIOTHÈQUE (et non un lot seulement)
+                    log("[EXTRACTION] Dépessage Qi/RQi …")
+                    qi, qi_stats = extract_qi_rqi_from_library(st.session_state.library)
+                    st.session_state.qi_global = qi
+                    st.session_state.qi_stats = qi_stats
+                    log(f"[EXTRACTION] +{qi_stats.get('qi_total')} Qi (global={len(st.session_state.qi_global)}). POSABLE={qi_stats.get('qi_posable')}")
+                    render_logs()
+
+                    # RUN GTE
+                    log("[GTE] Construction QC (ARI/FRT/TRG -> QC) …")
+                    qcs, gte_stats = run_pipeline_gte(st.session_state.qi_global, pack.get("chapters", []))
+                    st.session_state.qcs_global = qcs
+                    st.session_state.gte_stats = gte_stats
+                    log(f"[GTE] QC total={len(qcs)} | clusters={gte_stats.get('clusters')} | singletons={gte_stats.get('singletons')}")
+                    render_logs()
+
+                    okB, B = validate_B_blocking(pack.get("chapters", []), st.session_state.qi_global, st.session_state.qcs_global)
+                    st.session_state.last_B = B
+                    log(f"[B] {'PASS' if okB else 'FAIL'} | qi_posable={B.get('qi_posable')} | qc_total={B.get('qc_total')} | orphans_global={len(B.get('orphans_global') or [])}")
+                    render_logs()
+
+                    new_count, _ = saturation_delta(prev_qcs, qcs)
+
+                    st.session_state.iterations.append({
+                        "iter": it,
+                        "volume": current_volume,
+                        "pairs": len(all_items),
+                        "library_total": len(st.session_state.library),
+                        "qi_total": len(st.session_state.qi_global),
+                        "qi_posable": B.get("qi_posable"),
+                        "qc_total": len(st.session_state.qcs_global),
+                        "new_proof_sig": new_count,
+                        "B_ok": okB,
+                        "timestamp": now_iso(),
+                    })
+                    table_box.dataframe(st.session_state.iterations, use_container_width=True)
+
+                    # SEALED condition strict
+                    can_seal = (new_count == 0 and okB and (B.get("qi_posable", 0) > 0) and (B.get("qc_total", 0) > 0))
+                    if can_seal:
+                        st.session_state.sealed = True
+                        log("🎯 ═══ SATURATION ATTEINTE — SEALED (new_proof_sig=0 ET B PASS ET POSABLE>0 ET QC>0) ═══")
+                        render_logs()
+                        break
+                    else:
+                        if new_count == 0 and not okB:
+                            log("⛔ new_proof_sig=0 MAIS B FAIL -> interdit de sceller.")
+                        else:
+                            log(f"↻ Non scellé : new_proof_sig={new_count} | B_ok={okB}")
+                        render_logs()
+
+                    prev_qcs = qcs[:]
+                    current_volume += int(incr)
+
+                if not st.session_state.sealed:
+                    log("⚠️ Saturation non atteinte (ou preuves insuffisantes) dans la limite d'itérations.")
+                    render_logs()
+
+    # -------------------------------------------------------------------------
+    # TAB 3 — Résultats / Explorateur / Exports
+    # -------------------------------------------------------------------------
     with tabs[2]:
-        ui_results_explorer_exports()
+        st.header("ÉTAPE 4 — RÉSULTATS / EXPLORATEUR / EXPORTS")
 
-    # Manifest global (après actions)
-    if st.session_state.pack:
-        st.session_state.harvest_manifest = {
-            "build_tag": BUILD_TAG,
-            "country": st.session_state.country,
-            "pack_id": st.session_state.pack.get("pack_id"),
-            "level": st.session_state.level,
-            "subjects": st.session_state.subjects,
-            "library_total_pairs": len(st.session_state.library_pairs),
-            "generated_at": datetime.now().isoformat(),
-        }
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Qi global", len(st.session_state.qi_global))
+        m2.metric("Qi POSABLE", sum(1 for q in st.session_state.qi_global if q.get("has_rqi")))
+        m3.metric("QC", len(st.session_state.qcs_global))
+        m4.metric("SEALED", "YES" if st.session_state.sealed else "NO")
+
+        st.markdown("---")
+        st.subheader("Explorateur : QC → ARI → FRT → Triggers → Qi")
+
+        if not st.session_state.qcs_global:
+            st.info("Exécutez la chaîne complète pour obtenir des QC (et vérifiez qu’il y a des corrigés pour obtenir des Qi POSABLE).")
+        else:
+            by_ch = defaultdict(list)
+            for qc in st.session_state.qcs_global:
+                by_ch[qc.get("chapter_code") or "ORPHAN"].append(qc)
+
+            ch_label = {c.get("chapter_code"): c.get("label") for c in (pack.get("chapters", []) if pack else [])}
+
+            for ch_code in sorted(by_ch.keys()):
+                label = ch_label.get(ch_code, ch_code)
+                with st.expander(f"{ch_code} — {label} ({len(by_ch[ch_code])} QC)", expanded=False):
+                    for qc in by_ch[ch_code]:
+                        st.markdown(f"### {qc.get('qc_id')}")
+                        st.caption(f"intent_code={qc.get('intent_code')} | proof_sig={str(qc.get('qc_proof_sig'))[:16]}…")
+                        st.write(f"**Formulation**: {qc.get('formulation')}")
+                        st.write(f"**Cluster**: {qc.get('n_q_cluster')} Qi")
+                        st.write("**ARI (template invariant)**")
+                        st.json(qc.get("ari"))
+                        st.write("**FRT (template invariant)**")
+                        st.json(qc.get("frt"))
+                        st.write("**Triggers**")
+                        st.json(qc.get("triggers"))
+                        st.write("**Qi associées (preuve)**")
+                        st.json((qc.get("qi_ids") or [])[:30])
+
+        st.markdown("---")
+        st.subheader("Exports (preuves)")
+        c1, c2, c3, c4, c5 = st.columns(5)
+
+        with c1:
+            st.download_button("qi_pack.json", canonical_json(st.session_state.qi_global), "qi_pack.json", use_container_width=True)
+        with c2:
+            st.download_button("qc_pack.json", canonical_json(st.session_state.qcs_global), "qc_pack.json", use_container_width=True)
+        with c3:
+            chapter_report = (st.session_state.last_B or {}).get("chapter_report") or {}
+            st.download_button("chapter_report.json", canonical_json(chapter_report), "chapter_report.json", use_container_width=True)
+        with c4:
+            st.download_button("harvest_manifest.json", canonical_json(st.session_state.harvest_manifest or {}), "harvest_manifest.json", use_container_width=True)
+        with c5:
+            st.download_button("logs.txt", "\n".join(st.session_state.logs), "logs.txt", use_container_width=True)
 
 
 if __name__ == "__main__":
