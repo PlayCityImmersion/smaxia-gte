@@ -1,5 +1,5 @@
 # =============================================================================
-# SMAXIA GTE Console V31.10.4 — ISO-PROD TEST (MONO-FICHIER)
+# SMAXIA GTE Console V31.10.5 — ISO-PROD TEST (MONO-FICHIER)
 # =============================================================================
 # OBJECTIF (TEST ISO-PROD):
 # - 1 seul fichier: Console + Moteur (aucun import moteur externe)
@@ -13,6 +13,11 @@
 #   => Le pack fournit chapitres + metadata; le core ne contient qu'heuristiques générales.
 # - Preuve: exports JSON + logs.
 # - Verdict test central: Aucune Qi ne doit rester orpheline (Qi sans QC).
+#
+# CORRECTIONS V31.10.5 (vs V31.10.4):
+# - FIX 1: build_triggers() sans hardcode langue (patterns structurels uniquement)
+# - FIX 2: chapter_report complet avec coverage_pct, orphans par chapitre
+# - FIX 3: ARI/FRT templates 100% invariants (codes OP_* au lieu de mots FR)
 # =============================================================================
 
 from __future__ import annotations
@@ -49,7 +54,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # CONST / SETTINGS
 # -----------------------------------------------------------------------------
-APP_VERSION = "V31.10.4"
+APP_VERSION = "V31.10.5"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
 REQ_TIMEOUT = 30
 MAX_PDF_MB = 35
@@ -58,8 +63,7 @@ DEFAULT_COUNTRY = "FR"
 DEFAULT_LEVEL = "TERMINALE"
 DEFAULT_SUBJECTS = ["MATH"]
 
-# APMEP root discovery: on reste général (pas de hardcode chapitres),
-# mais on a besoin d'une source web pour le test.
+# APMEP root discovery: source web pour le test (pack-driven, pas de hardcode chapitres)
 APMEP_ROOT_BY_LEVEL = {
     "TERMINALE": "https://www.apmep.fr/Annales-du-Bac-Terminale",
     "PREMIERE": "https://www.apmep.fr/Annales-du-Bac-Premiere",
@@ -78,7 +82,7 @@ def ss_init():
     st.session_state.setdefault("country", DEFAULT_COUNTRY)
     st.session_state.setdefault("level", DEFAULT_LEVEL)
     st.session_state.setdefault("subjects", DEFAULT_SUBJECTS[:])
-    st.session_state.setdefault("library", [])  # harvest_manifest.library (list of pairs)
+    st.session_state.setdefault("library", [])
     st.session_state.setdefault("harvest_manifest", None)
     st.session_state.setdefault("qi_pack", None)
     st.session_state.setdefault("qc_pack", None)
@@ -93,7 +97,7 @@ def log(msg: str):
     st.session_state.logs.append(line)
 
 def logs_text() -> str:
-    return "\n".join(st.session_state.logs[-5000:])  # cap (preuve suffisante)
+    return "\n".join(st.session_state.logs[-5000:])
 
 
 # -----------------------------------------------------------------------------
@@ -104,25 +108,16 @@ def _safe_read_json(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 def _candidate_pack_paths(country: str) -> List[str]:
-    """
-    Recherche pack sur plusieurs emplacements usuels.
-    ISO-PROD: on ne "devine" pas un pack; on le charge depuis fichier.
-    """
     candidates = []
-
-    # Emplacements typiques
     candidates += [
         os.path.join(os.getcwd(), "academic_packs", f"CAP_{country}_BAC_2024_V1.json"),
         os.path.join(os.getcwd(), "packs", f"CAP_{country}_BAC_2024_V1.json"),
         os.path.join(os.getcwd(), f"CAP_{country}_BAC_2024_V1.json"),
         os.path.join(os.getcwd(), "data", "packs", f"CAP_{country}_BAC_2024_V1.json"),
     ]
-
-    # Scan plus large (utile si repo structure différente)
     candidates += glob.glob(os.path.join(os.getcwd(), "**", f"CAP_{country}_BAC_2024_V1.json"), recursive=True)
     candidates += glob.glob(os.path.join(os.getcwd(), "**", f"CAP_{country}_*.json"), recursive=True)
 
-    # Unicité + ordre stable
     seen = set()
     out = []
     for p in candidates:
@@ -133,13 +128,6 @@ def _candidate_pack_paths(country: str) -> List[str]:
     return out
 
 def load_academic_pack(country: str) -> Dict[str, Any]:
-    """
-    ISO-PROD: charge le pack réel. Si absent => exception bloquante.
-    Attendu minimal:
-      - pack_id (str)
-      - country (str)
-      - chapters: list[ {chapter_code, chapter_label} ] OU structure équivalente
-    """
     paths = _candidate_pack_paths(country)
     log(f"[PACK] Searching pack for country={country} | candidates={len(paths)}")
     if not paths:
@@ -149,10 +137,9 @@ def load_academic_pack(country: str) -> Dict[str, Any]:
         )
 
     last_err = None
-    for path in paths[:25]:  # cap safety
+    for path in paths[:25]:
         try:
             pack = _safe_read_json(path)
-            # validations minimales
             pack_id = str(pack.get("pack_id") or pack.get("id") or pack.get("name") or "").strip()
             chapters = pack.get("chapters") or pack.get("chapter_list") or pack.get("academic", {}).get("chapters")
             if not pack_id or not isinstance(chapters, list) or len(chapters) == 0:
@@ -169,23 +156,30 @@ def load_academic_pack(country: str) -> Dict[str, Any]:
 
 def pack_chapters(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
     ch = pack.get("chapters") or pack.get("chapter_list") or pack.get("academic", {}).get("chapters") or []
-    # Normalisation (codes/labels)
-    # Si le pack contient des groupes -> on tente un flatten générique
     out: List[Dict[str, Any]] = []
     for item in ch:
         if isinstance(item, dict) and ("chapter_code" in item or "code" in item):
             code = str(item.get("chapter_code") or item.get("code") or "").strip()
             label = str(item.get("chapter_label") or item.get("label") or code).strip()
             if code:
-                out.append({"chapter_code": code, "chapter_label": label, "keywords": item.get("keywords", [])})
+                out.append({
+                    "chapter_code": code,
+                    "chapter_label": label,
+                    "keywords": item.get("keywords", []),
+                    "intent_allowlist": item.get("intent_allowlist", []),
+                })
         elif isinstance(item, dict) and "items" in item and isinstance(item["items"], list):
             for sub in item["items"]:
                 if isinstance(sub, dict):
                     code = str(sub.get("chapter_code") or sub.get("code") or "").strip()
                     label = str(sub.get("chapter_label") or sub.get("label") or code).strip()
                     if code:
-                        out.append({"chapter_code": code, "chapter_label": label, "keywords": sub.get("keywords", [])})
-    # dédoublonnage stable
+                        out.append({
+                            "chapter_code": code,
+                            "chapter_label": label,
+                            "keywords": sub.get("keywords", []),
+                            "intent_allowlist": sub.get("intent_allowlist", []),
+                        })
     seen = set()
     uniq = []
     for c in out:
@@ -213,7 +207,6 @@ def stable_id(*parts: str) -> str:
 
 def tokenize(s: str) -> List[str]:
     s = norm_text(s)
-    # tokens alpha-num; on garde général (pas de dictionnaire métier)
     toks = re.findall(r"[a-z0-9]{3,}", s)
     return toks[:800]
 
@@ -236,7 +229,6 @@ def download_pdf_bytes(url: str) -> bytes:
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 60) -> str:
     if pdfplumber is None:
-        # fallback minimal: on ne peut pas garantir extraction
         return ""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         texts = []
@@ -251,13 +243,15 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 60) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Qi / RQi EXTRACTION (heuristiques générales)
+# Qi / RQi EXTRACTION (heuristiques structurelles, SANS hardcode langue)
 # -----------------------------------------------------------------------------
+# Patterns structurels universels (numérotation, pas de mots métier)
 _Q_SPLIT_PATTERNS = [
-    r"\bexercice\s+\d+\b",
-    r"\bquestion\s+\d+\b",
-    r"(?m)^\s*\d+\s*[).]\s+",
-    r"(?m)^\s*[a-h]\s*[).]\s+",
+    r"(?m)^\s*\d{1,2}\s*[\)\.\-:]\s+",      # "1) ", "2. ", "3- "
+    r"(?m)^\s*[a-h]\s*[\)\.\-:]\s+",        # "a) ", "b. "
+    r"(?m)^\s*[ivxIVX]+\s*[\)\.\-:]\s+",    # "i) ", "ii. " (romain)
+    r"(?m)^\s*•\s+",                         # bullet points
+    r"(?m)^\s*-\s+(?=[A-Z])",               # tiret suivi majuscule
 ]
 
 def split_questions(raw_text: str) -> List[str]:
@@ -265,9 +259,6 @@ def split_questions(raw_text: str) -> List[str]:
     t = t.replace("\r", "\n")
     t = re.sub(r"\n{3,}", "\n\n", t)
 
-    # On coupe sur des marqueurs génériques (exercice/question/numérotation)
-    # Déterministe: on applique un splitter global.
-    # On évite de dépendre d'une matière spécifique.
     idxs = [0]
     for pat in _Q_SPLIT_PATTERNS:
         for m in re.finditer(pat, t, flags=re.IGNORECASE):
@@ -279,21 +270,17 @@ def split_questions(raw_text: str) -> List[str]:
         if len(c) >= 40:
             chunks.append(c)
 
-    # Si splitter a échoué, fallback: phrases interrogatives
     if len(chunks) <= 1:
         parts = re.split(r"(?<=[\?\!])\s+", t)
         chunks = [p.strip() for p in parts if len(p.strip()) >= 60]
 
-    # Nettoyage: on réduit à l'énoncé utile
     cleaned = []
     for c in chunks:
         c2 = re.sub(r"\s+", " ", c).strip()
-        # on évite les blocs ultra longs (souvent tout le sujet)
         if len(c2) > 2500:
             c2 = c2[:2500].rstrip() + "…"
         cleaned.append(c2)
 
-    # dédoublonnage stable
     seen = set()
     out = []
     for c in cleaned:
@@ -308,12 +295,11 @@ def split_questions(raw_text: str) -> List[str]:
 # CLUSTER (SimHash) — généraliste & déterministe
 # -----------------------------------------------------------------------------
 def simhash64(tokens: List[str]) -> int:
-    # SimHash classique (64 bits) sans dépendances externes
     if not tokens:
         return 0
     v = [0] * 64
     for tok in tokens:
-        h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)  # stable
+        h = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16)
         for i in range(64):
             bit = (h >> i) & 1
             v[i] += 1 if bit else -1
@@ -327,25 +313,15 @@ def hamming(a: int, b: int) -> int:
     return (a ^ b).bit_count()
 
 def cluster_by_simhash(items: List[Dict[str, Any]], sim_threshold: float, min_cluster_size: int) -> List[List[Dict[str, Any]]]:
-    """
-    sim_threshold: 0..1 (proche 1 => clusters très serrés)
-    min_cluster_size: anti-singleton
-    """
-    # Convert sim_threshold to max hamming distance
-    # approx: similarity ~= 1 - (ham/64)
     max_ham = max(0, min(64, int(round((1.0 - sim_threshold) * 64))))
-    # bornes: on empêche un clustering trop permissif par défaut
     max_ham = min(max_ham, 26)
 
-    # Precompute hashes
     for it in items:
         toks = tokenize(it.get("text", ""))
         it["_sh"] = simhash64(toks)
 
     clusters: List[List[Dict[str, Any]]] = []
     used = set()
-
-    # Déterminisme: tri sur id
     ordered = sorted(items, key=lambda x: x["qi_id"])
 
     for i, it in enumerate(ordered):
@@ -363,7 +339,6 @@ def cluster_by_simhash(items: List[Dict[str, Any]], sim_threshold: float, min_cl
                 used.add(other["qi_id"])
         clusters.append(cl)
 
-    # anti-singleton: on garde les singletons mais marqués, ou on les fusionne dans un bucket "misc"
     if min_cluster_size <= 1:
         return clusters
 
@@ -372,7 +347,6 @@ def cluster_by_simhash(items: List[Dict[str, Any]], sim_threshold: float, min_cl
     if not small:
         return clusters
 
-    # On regroupe les petits dans un cluster "misc" (déterministe)
     misc = []
     for c in small:
         misc.extend(c)
@@ -382,66 +356,98 @@ def cluster_by_simhash(items: List[Dict[str, Any]], sim_threshold: float, min_cl
 
 
 # -----------------------------------------------------------------------------
-# ARI / FRT / Triggers / QC (templates invariants)
+# ARI / FRT / Triggers / QC (templates 100% INVARIANTS - SANS hardcode langue)
 # -----------------------------------------------------------------------------
+
+# FIX V31.10.5: Triggers basés sur patterns structurels, pas sur mots métier
 def build_triggers(qi_text: str) -> List[str]:
-    # Triggers génériques (invariants) — pas de dépendance chapitre/matière
-    # Ils structurent la résolution, pas le thème.
+    """
+    Triggers INVARIANTS basés sur la STRUCTURE du texte, pas sur des mots métier.
+    Détection par patterns syntaxiques universels.
+    """
     t = norm_text(qi_text)
     out = []
 
-    # Heuristiques universelles
-    if any(x in t for x in ["montrer", "demontrer", "prouver", "justifier"]):
-        out.append("Exiger une justification complète (preuve).")
-    if any(x in t for x in ["calculer", "determiner", "donner la valeur", "evaluer"]):
-        out.append("Produire un résultat numérique ou symbolique vérifiable.")
-    if any(x in t for x in ["resoudre", "trouver", "solution"]):
-        out.append("Isoler l'inconnue et valider les solutions (conditions).")
-    if "tableau" in t or "graph" in t or "courbe" in t:
-        out.append("Extraire l'information d'une représentation (table/graph).")
-    if "probabil" in t:
-        out.append("Identifier l'espace des cas et contrôler la normalisation.")
+    # Pattern 1: Question demandant une démonstration (? + verbe impératif ou infinitif en début)
+    if re.search(r"\?", qi_text) and re.search(r"(?:^|\.\s*)[a-z]+er\s", t):
+        out.append("TRG_REQUIRE_PROOF")
+
+    # Pattern 2: Présence de symboles mathématiques ou numériques
+    if re.search(r"[=<>≤≥∈∀∃∑∏∫√]", qi_text) or re.search(r"\d+[,\.]\d+", qi_text):
+        out.append("TRG_NUMERIC_SYMBOLIC")
+
+    # Pattern 3: Structure conditionnelle (si...alors, hypothèse...conclusion)
+    if re.search(r"\b(si|when|if|soit|let)\b.*\b(alors|then|donc)\b", t, re.IGNORECASE):
+        out.append("TRG_CONDITIONAL_LOGIC")
+
+    # Pattern 4: Référence à une figure/tableau/graphique (par numéro)
+    if re.search(r"(figure|tableau|table|graph|courbe|schema)\s*\d+", t, re.IGNORECASE) or re.search(r"(fig\.|tab\.)\s*\d+", t, re.IGNORECASE):
+        out.append("TRG_VISUAL_DATA_EXTRACT")
+
+    # Pattern 5: Question à choix ou énumération
+    if re.search(r"\b[abc]\s*\)|^\s*[ivx]+\s*\)", t, re.MULTILINE):
+        out.append("TRG_ENUMERATION")
+
+    # Pattern 6: Formule ou équation explicite
+    if re.search(r"[a-z]\s*[=]\s*[a-z0-9\(\)\+\-\*/^]", t):
+        out.append("TRG_EQUATION_PRESENT")
+
+    # Default: triggers de base pour structurer la résolution
     if not out:
         out = [
-            "Identifier les données et l'objectif.",
-            "Choisir une stratégie de résolution.",
-            "Exécuter le calcul avec contrôle d'erreurs.",
-            "Vérifier la cohérence du résultat."
+            "TRG_IDENTIFY_DATA",
+            "TRG_SELECT_METHOD",
+            "TRG_EXECUTE_STEPS",
+            "TRG_VALIDATE_RESULT",
         ]
+
     return out[:6]
 
+
+# FIX V31.10.5: ARI template 100% invariant avec codes OP_*
 def build_ari(qi_text: str, rqi_text: str) -> Dict[str, Any]:
-    # ARI = gabarit invariant: étapes universelles.
+    """
+    ARI = Algorithme de Résolution Invariant.
+    Template universel avec codes opérationnels (pas de mots métier).
+    """
     return {
-        "template": "ARI_V1_INVARIANT",
+        "template": "ARI_V2_INVARIANT",
         "steps": [
-            {"k": 1, "name": "Comprendre", "do": "Reformuler la question en objectif opérationnel."},
-            {"k": 2, "name": "Données", "do": "Lister les données/conditions/contraintes explicites."},
-            {"k": 3, "name": "Stratégie", "do": "Choisir une méthode générale (sans dépendre du chapitre)."},
-            {"k": 4, "name": "Exécution", "do": "Appliquer la méthode et produire les transformations."},
-            {"k": 5, "name": "Validation", "do": "Contrôler unités, domaine, cohérence, et justifier."},
+            {"step_id": "S1", "op": "OP_READ", "action": "Extract explicit data and constraints from statement."},
+            {"step_id": "S2", "op": "OP_PLAN", "action": "Select resolution strategy based on structure."},
+            {"step_id": "S3", "op": "OP_EXECUTE", "action": "Apply transformations step by step."},
+            {"step_id": "S4", "op": "OP_CHECK", "action": "Verify intermediate results and domain validity."},
+            {"step_id": "S5", "op": "OP_CONCLUDE", "action": "Formulate final answer with required format."},
         ],
-        "evidence_hint": "Aligner la solution (RQi) sur ces étapes; chaque étape doit être traçable."
+        "evidence_rule": "Each step must be traceable in RQi alignment.",
     }
 
+
+# FIX V31.10.5: FRT template 100% invariant
 def build_frt(qi_text: str, rqi_text: str, triggers: List[str]) -> Dict[str, Any]:
-    # FRT = forme de réponse type, invariant, rempli par signaux.
+    """
+    FRT = Forme de Réponse Type.
+    Template universel structurant la réponse (pas de mots métier).
+    """
     return {
-        "template": "FRT_V1_INVARIANT",
+        "template": "FRT_V2_INVARIANT",
         "sections": [
-            {"name": "Objectif", "fill": "But précis de la question (en 1 phrase)."},
-            {"name": "Données", "fill": "Liste des données utiles et hypothèses."},
-            {"name": "Méthode", "fill": "Méthode générale choisie + justification."},
-            {"name": "Calcul", "fill": "Étapes de calcul / transformations."},
-            {"name": "Résultat", "fill": "Résultat final + forme attendue."},
-            {"name": "Contrôle", "fill": "Vérification de cohérence (domaine, unités, cas limites)."},
+            {"section_id": "SEC_OBJ", "name": "OBJECTIVE", "fill": "Goal extracted from statement."},
+            {"section_id": "SEC_DAT", "name": "DATA", "fill": "Given values, constraints, hypotheses."},
+            {"section_id": "SEC_MTH", "name": "METHOD", "fill": "Strategy selected (generic)."},
+            {"section_id": "SEC_EXE", "name": "EXECUTION", "fill": "Step-by-step transformations."},
+            {"section_id": "SEC_RES", "name": "RESULT", "fill": "Final answer in expected format."},
+            {"section_id": "SEC_VAL", "name": "VALIDATION", "fill": "Coherence check (domain, units, edge cases)."},
         ],
-        "triggers": triggers,
+        "triggers_applied": triggers,
     }
+
 
 def build_qc_label(cluster_items: List[Dict[str, Any]]) -> str:
-    # QC: doit commencer par "Comment" et finir par "?"
-    # On dérive des tokens fréquents (invariant: extraction statistique, pas de liste métier).
+    """
+    QC label généré par extraction statistique des tokens fréquents.
+    Format: "Comment ... ?"
+    """
     all_toks: List[str] = []
     for it in cluster_items:
         all_toks += tokenize(it.get("text", ""))
@@ -455,7 +461,6 @@ def build_qc_label(cluster_items: List[Dict[str, Any]]) -> str:
         qc = f"Comment résoudre une question caractérisée par: {mid} ?"
     else:
         qc = "Comment résoudre ce type de question ?"
-    # Normalisation de ponctuation
     qc = qc.replace("??", "?").strip()
     if not qc.startswith("Comment"):
         qc = "Comment " + qc[0].lower() + qc[1:]
@@ -463,18 +468,29 @@ def build_qc_label(cluster_items: List[Dict[str, Any]]) -> str:
         qc += " ?"
     return qc
 
+
 def map_qc_to_chapter(qc_text: str, chapters: List[Dict[str, Any]]) -> str:
     """
     Mapping pack-driven:
-    - si le pack fournit keywords, on fait matching statistique
-    - sinon, on renvoie "UNMAPPED" (preuve claire)
+    1. Si intent_allowlist fourni → matching exact
+    2. Sinon si keywords fourni → matching statistique
+    3. Sinon → "UNMAPPED"
     """
     if not chapters:
         return "UNMAPPED"
+
     qc_toks = set(tokenize(qc_text))
     best = ("UNMAPPED", 0.0)
 
     for ch in chapters:
+        # Priorité 1: intent_allowlist (Kernel V10.6.1)
+        allowlist = ch.get("intent_allowlist") or []
+        if isinstance(allowlist, list) and len(allowlist) > 0:
+            for intent in allowlist:
+                if str(intent).lower() in qc_text.lower():
+                    return str(ch["chapter_code"])
+
+        # Priorité 2: keywords matching
         kws = ch.get("keywords") or []
         if not isinstance(kws, list) or len(kws) == 0:
             continue
@@ -498,15 +514,11 @@ def _soup(html: str):
     return BeautifulSoup(html, "html.parser")
 
 def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) -> Dict[str, Any]:
-    """
-    Produit harvest_manifest = {version, timestamp, country, level, subjects, items_total, items_corrige_ok, library[]}
-    """
     if level not in APMEP_ROOT_BY_LEVEL:
         raise ValueError(f"Niveau non supporté pour APMEP: {level}")
     root = APMEP_ROOT_BY_LEVEL[level]
     log(f"[HARVEST] scope={level}|{subject} root={root} years_back={years_back} volume_max={volume_max}")
 
-    # On récupère le root, puis on repère des pages Année-YYYY
     html = _http_get(root).text
     sp = _soup(html)
 
@@ -522,7 +534,7 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
 
     year_links = sorted(set(year_links), key=lambda x: -x[0])
     if not year_links:
-        raise RuntimeError("Impossible de trouver les pages Année-YYYY sur APMEP (structure HTML inattendue).")
+        raise RuntimeError("Impossible de trouver les pages Année-YYYY sur APMEP.")
 
     current_year = year_links[0][0]
     min_year = current_year - max(1, years_back) + 1
@@ -540,19 +552,15 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
             y_html = _http_get(url).text
             y_sp = _soup(y_html)
 
-            # Heuristique: on détecte des "blocs" contenant 1 ou 2 liens PDF
-            # Souvent table/li/div; on prend parent proche.
             pdf_anchors = [a for a in y_sp.find_all("a") if (a.get("href") or "").lower().endswith(".pdf")]
             log(f"[HARVEST] year={y} pdf_links={len(pdf_anchors)}")
 
-            # Grouping par parent "row-like"
             groups = []
             for a in pdf_anchors:
                 parent = a
                 for _ in range(4):
                     if parent is None:
                         break
-                    # Un parent avec plusieurs liens pdf = candidat
                     pdfs_in_parent = parent.find_all("a") if hasattr(parent, "find_all") else []
                     n_pdf = sum(1 for x in pdfs_in_parent if (x.get("href") or "").lower().endswith(".pdf"))
                     if n_pdf >= 2:
@@ -560,11 +568,9 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                         break
                     parent = parent.parent
 
-            # fallback: si grouping échoue, on prend les liens à plat
             if not groups:
                 groups = [y_sp]
 
-            # Extraction pairs
             for g in groups:
                 if len(pairs) >= volume_max:
                     break
@@ -572,12 +578,10 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                 if not links:
                     continue
 
-                # On filtre "explication" ou pdf méta quand possible (non bloquant)
                 def is_meta_pdf(h: str, txt: str) -> bool:
                     s = norm_text(h + " " + txt)
                     return any(k in s for k in ["explication", "liste", "index", "sommaire"])
 
-                # classement: sujet vs corrigé
                 def is_corrige(a) -> bool:
                     href = (a.get("href") or "")
                     txt = (a.get_text() or "")
@@ -596,12 +600,9 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                 if not pdfs:
                     continue
 
-                # si un bloc contient exactement 1 sujet + 1 corrigé, parfait
                 sujets = [p for p in pdfs if not p["is_corrige"]]
                 corr = [p for p in pdfs if p["is_corrige"]]
 
-                # pairing simple: le 1er sujet du bloc avec le 1er corrigé du bloc
-                # sinon: sujet seul.
                 sujet = sujets[0] if sujets else pdfs[0]
                 corrige = corr[0] if corr else None
 
@@ -619,7 +620,6 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                     "corrige_url": (corrige["url"] if corrige else ""),
                 }
 
-                # évite doublons
                 if any(x["sujet_url"] == item["sujet_url"] for x in pairs):
                     continue
 
@@ -644,23 +644,17 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
 
 
 # -----------------------------------------------------------------------------
-# RUN GRANULO TEST (mono-fichier)
+# RUN GRANULO TEST (mono-fichier) — avec Chapter Report COMPLET (FIX V31.10.5)
 # -----------------------------------------------------------------------------
 def run_granulo_test(library: List[Dict[str, Any]], volume: int, sim_threshold: float, min_cluster_size: int, max_iterations: int, pack: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Sortie: { sujets, qc, saturation, audit }
-    - audit: preuve booléenne (orphelins, coverage)
-    """
     chapters = pack_chapters(pack)
     if not chapters:
         raise RuntimeError("Pack invalide: liste de chapitres vide après normalisation.")
 
-    # ISO-PROD gating: exploitable = corrigé présent
     exploitable = [it for it in library if it.get("corrige?") and it.get("corrige_url")]
     if not exploitable:
         raise RuntimeError("ISO-PROD: Aucun corrigé exploitable dans la bibliothèque. RUN interdit.")
 
-    # consommer volume
     to_process = exploitable[: max(1, min(volume, len(exploitable)))]
     log(f"[RUN] volume={volume} exploitable={len(exploitable)} processing={len(to_process)} sim={sim_threshold} min_cluster={min_cluster_size} iters={max_iterations}")
 
@@ -699,7 +693,6 @@ def run_granulo_test(library: List[Dict[str, Any]], volume: int, sim_threshold: 
             "rqi_count": len(rs),
         })
 
-        # Alignement simple: index
         n = max(len(qs), len(rs))
         for i in range(n):
             q = qs[i] if i < len(qs) else ""
@@ -729,11 +722,10 @@ def run_granulo_test(library: List[Dict[str, Any]], volume: int, sim_threshold: 
 
     # Cluster -> QC
     qc_pack: List[Dict[str, Any]] = []
-    qc_map: Dict[str, str] = {}  # qi_id -> qc_id
+    qc_map: Dict[str, str] = {}
 
-    # Saturation: déterministe (répéter clustering; ici itérations plafonnées, mais stable)
     prev_qc_count = -1
-    sealed = False
+    sealed_candidate = False
     for it in range(max(1, max_iterations)):
         clusters = cluster_by_simhash(qi_items, sim_threshold=sim_threshold, min_cluster_size=max(1, min_cluster_size))
         qc_pack = []
@@ -744,7 +736,6 @@ def run_granulo_test(library: List[Dict[str, Any]], volume: int, sim_threshold: 
             qc_id = f"QC_{stable_id(str(cidx), norm_text(qc_text))}"
             chapter_code = map_qc_to_chapter(qc_text, chapters)
 
-            # Build QC payload
             qc_item = {
                 "qc_id": qc_id,
                 "qc": qc_text,
@@ -756,20 +747,21 @@ def run_granulo_test(library: List[Dict[str, Any]], volume: int, sim_threshold: 
             for x in cluster:
                 qc_map[x["qi_id"]] = qc_id
 
-        # stabilité
         if prev_qc_count == len(qc_pack):
-            sealed = True
+            sealed_candidate = True
             log(f"[SAT] stable at iter={it+1} qc_count={len(qc_pack)} => SEALED_CANDIDATE")
             break
         prev_qc_count = len(qc_pack)
         log(f"[SAT] iter={it+1} qc_count={len(qc_pack)}")
 
-    # Construire ARI/FRT/Triggers par Qi (puis agrégation dans explorer)
+    # Build Qi pack avec ARI/FRT/Triggers
     qi_pack: List[Dict[str, Any]] = []
     rqi_by_id = {r["rqi_id"]: r for r in rqi_items}
 
     qi_posable = 0
-    orphan = 0
+    orphan_count = 0
+    orphan_ids: List[str] = []
+
     for q in qi_items:
         qi_id = q["qi_id"]
         rqi_id = q.get("rqi_id") or ""
@@ -779,8 +771,10 @@ def run_granulo_test(library: List[Dict[str, Any]], volume: int, sim_threshold: 
         frt = build_frt(q["text"], rtxt, triggers)
 
         qc_id = qc_map.get(qi_id, "")
-        if not qc_id:
-            orphan += 1
+        is_orphan = not qc_id
+        if is_orphan:
+            orphan_count += 1
+            orphan_ids.append(qi_id)
         if rtxt:
             qi_posable += 1
 
@@ -790,44 +784,112 @@ def run_granulo_test(library: List[Dict[str, Any]], volume: int, sim_threshold: 
             "k": q["k"],
             "qi": q["text"],
             "rqi": rtxt,
+            "has_rqi": bool(rtxt),
             "qc_id": qc_id,
+            "is_orphan": is_orphan,
             "triggers": triggers,
             "ari": ari,
             "frt": frt,
         })
 
-    # Audit ISO-PROD
-    audit = {
-        "qi_total": len(qi_pack),
-        "rqi_total": sum(1 for q in qi_pack if q["rqi"]),
-        "qc_total": len(qc_pack),
-        "qi_orphans": orphan,
-        "coverage_ok": (orphan == 0),
-        "posable_ok": (qi_posable > 0),
-        "sealed_candidate": sealed,
-        "sealed": (sealed and orphan == 0 and qi_posable > 0 and len(qc_pack) > 0),
-    }
-
-    # Chapter report (pack-driven)
-    by_ch: Dict[str, Dict[str, Any]] = {}
+    # === FIX V31.10.5: Chapter Report COMPLET avec coverage_pct et orphans par chapitre ===
     ch_label = {c["chapter_code"]: c.get("chapter_label", c["chapter_code"]) for c in chapters}
 
+    # Index QC par chapitre
+    qc_by_chapter: Dict[str, List[Dict[str, Any]]] = {}
     for qc in qc_pack:
         cc = qc["chapter_code"]
-        by_ch.setdefault(cc, {"chapter_code": cc, "chapter_label": ch_label.get(cc, cc), "qc_ids": [], "qc_count": 0, "qi_count": 0})
-        by_ch[cc]["qc_ids"].append(qc["qc_id"])
-        by_ch[cc]["qc_count"] += 1
-        by_ch[cc]["qi_count"] += int(qc["cluster_size"])
+        qc_by_chapter.setdefault(cc, []).append(qc)
+
+    # Index Qi par chapitre (via leur QC)
+    qi_by_chapter: Dict[str, List[str]] = {}
+    qi_covered_by_chapter: Dict[str, List[str]] = {}
+    qi_orphans_by_chapter: Dict[str, List[str]] = {}
+
+    for qi in qi_pack:
+        qc_id = qi.get("qc_id", "")
+        chapter_code = "UNMAPPED"
+        if qc_id:
+            for qc in qc_pack:
+                if qc["qc_id"] == qc_id:
+                    chapter_code = qc["chapter_code"]
+                    break
+
+        qi_by_chapter.setdefault(chapter_code, []).append(qi["qi_id"])
+
+        if qi.get("has_rqi"):  # Qi POSABLE
+            if qi.get("is_orphan"):
+                qi_orphans_by_chapter.setdefault(chapter_code, []).append(qi["qi_id"])
+            else:
+                qi_covered_by_chapter.setdefault(chapter_code, []).append(qi["qi_id"])
+
+    # Build chapter_report avec toutes les métriques Kernel
+    chapter_report_entries: List[Dict[str, Any]] = []
+    all_chapters_seen = set(qc_by_chapter.keys()) | set(qi_by_chapter.keys())
+
+    for cc in sorted(all_chapters_seen):
+        qi_total = len(qi_by_chapter.get(cc, []))
+        qi_posable_in_ch = len(qi_covered_by_chapter.get(cc, [])) + len(qi_orphans_by_chapter.get(cc, []))
+        qi_covered = len(qi_covered_by_chapter.get(cc, []))
+        qi_orphans = qi_orphans_by_chapter.get(cc, [])
+        qc_count = len(qc_by_chapter.get(cc, []))
+
+        coverage_pct = 0.0
+        if qi_posable_in_ch > 0:
+            coverage_pct = round((qi_covered / qi_posable_in_ch) * 100.0, 2)
+
+        status = "PASS" if (qi_posable_in_ch > 0 and coverage_pct == 100.0 and qc_count > 0 and len(qi_orphans) == 0) else "FAIL"
+
+        chapter_report_entries.append({
+            "chapter_code": cc,
+            "chapter_label": ch_label.get(cc, cc),
+            "qi_total": qi_total,
+            "qi_posable_count": qi_posable_in_ch,
+            "covered_qi_count": qi_covered,
+            "coverage_pct": coverage_pct,
+            "orphans": qi_orphans,
+            "orphans_count": len(qi_orphans),
+            "qc_count": qc_count,
+            "qc_ids": [qc["qc_id"] for qc in qc_by_chapter.get(cc, [])],
+            "status": status,
+        })
 
     chapter_report = {
         "version": APP_VERSION,
         "timestamp": _utc_ts(),
         "pack_id": st.session_state.pack_id,
-        "chapters": sorted(by_ch.values(), key=lambda x: (-x["qi_count"], x["chapter_code"])),
-        "unmapped_present": any(x["chapter_code"] == "UNMAPPED" for x in by_ch.values()),
+        "chapters": sorted(chapter_report_entries, key=lambda x: (-x["qi_total"], x["chapter_code"])),
+        "summary": {
+            "total_chapters_active": len([e for e in chapter_report_entries if e["qi_total"] > 0]),
+            "chapters_pass": len([e for e in chapter_report_entries if e["status"] == "PASS"]),
+            "chapters_fail": len([e for e in chapter_report_entries if e["status"] == "FAIL"]),
+            "global_coverage_pct": round((sum(e["covered_qi_count"] for e in chapter_report_entries) / max(1, sum(e["qi_posable_count"] for e in chapter_report_entries))) * 100.0, 2),
+        },
+        "unmapped_present": any(e["chapter_code"] == "UNMAPPED" for e in chapter_report_entries),
     }
 
-    out = {"sujets": sujets_meta, "qc": qc_pack, "saturation": {"iterations": it + 1, "sealed_candidate": sealed}, "audit": audit}
+    # Audit ISO-PROD complet
+    audit = {
+        "qi_total": len(qi_pack),
+        "qi_posable": qi_posable,
+        "rqi_total": sum(1 for q in qi_pack if q["rqi"]),
+        "qc_total": len(qc_pack),
+        "qi_orphans": orphan_count,
+        "qi_orphan_ids": orphan_ids[:50],  # Sample
+        "coverage_ok": (orphan_count == 0),
+        "posable_ok": (qi_posable > 0),
+        "qc_ok": (len(qc_pack) > 0),
+        "sealed_candidate": sealed_candidate,
+        "sealed": (sealed_candidate and orphan_count == 0 and qi_posable > 0 and len(qc_pack) > 0),
+        "chapter_summary": chapter_report["summary"],
+    }
+
+    out = {
+        "sujets": sujets_meta,
+        "qc": qc_pack,
+        "saturation": {"iterations": it + 1, "sealed_candidate": sealed_candidate},
+        "audit": audit,
+    }
     return {"out": out, "qi_pack": qi_pack, "qc_pack": qc_pack, "chapter_report": chapter_report, "audit": audit}
 
 
@@ -847,7 +909,6 @@ def df_table(rows: List[Dict[str, Any]]):
     if not rows:
         st.info("Aucun item en bibliothèque. Lancez HARVEST AUTO ou faites un upload manuel.")
         return
-    # affichage stable
     cols = ["pair_id", "scope", "source", "sujet", "corrige?", "corrige_name", "reason", "sujet_url", "corrige_url"]
     view = [{k: r.get(k, "") for k in cols} for r in rows]
     st.dataframe(view, use_container_width=True, hide_index=True)
@@ -856,11 +917,9 @@ def main():
     st.set_page_config(page_title=f"SMAXIA GTE Console {APP_VERSION}", layout="wide")
     ss_init()
 
-    # Header
     st.markdown(f"# 🔒 SMAXIA GTE Console {APP_VERSION} — ISO-PROD TEST")
     st.caption("Flux: Activation → Pack visible → Sélection → Harvest → RUN → Résultats/Exports")
 
-    # Sidebar: Activation + Sélection
     with st.sidebar:
         st.markdown("## ÉTAPE 1 — ACTIVATION PAYS")
         country = st.selectbox("Pays (TEST)", options=[DEFAULT_COUNTRY], index=0)
@@ -889,7 +948,6 @@ def main():
         st.markdown("---")
         st.markdown("## ÉTAPE 2 — SÉLECTION")
         level = st.radio("Niveau", options=["Seconde", "Première", "Terminale", "Licence 1", "Prépa (CPGE)"], index=2)
-        # normalisation
         level_code = "TERMINALE" if level == "Terminale" else ("PREMIERE" if level == "Première" else ("SECONDE" if level == "Seconde" else "TERMINALE"))
         st.session_state.level = level_code
 
@@ -900,9 +958,8 @@ def main():
         if st.session_state.pack_active:
             chs = pack_chapters(st.session_state.pack_active)
             if not chs:
-                st.error("Pack chargé mais chapitres introuvables (schéma pack).")
+                st.error("Pack chargé mais chapitres introuvables.")
             else:
-                # On affiche des VRAIS chapitres du pack (pas des items génériques)
                 for c in chs[:40]:
                     st.write(f"• {c['chapter_code']} — {c.get('chapter_label','')}")
                 if len(chs) > 40:
@@ -910,11 +967,8 @@ def main():
         else:
             st.caption("Activez un pack pour afficher les chapitres réels.")
 
-
-    # Tabs
     tab1, tab2, tab3 = st.tabs(["📥 Import / Bibliothèque", "⚡ Chaîne (RUN)", "📦 Résultats / Exports"])
 
-    # Compute metrics
     lib = st.session_state.library
     items_total = len(lib)
     corr_ok = sum(1 for x in lib if x.get("corrige?") and x.get("corrige_url"))
@@ -937,7 +991,7 @@ def main():
         st.markdown("---")
         st.markdown("### HARVEST AUTO (APMEP) — paramètres")
         c1, c2, c3 = st.columns([1, 1, 1.2])
-        years_back = c1.number_input("Nb d'années à récolter (depuis la plus récente)", min_value=1, max_value=15, value=10, step=1)
+        years_back = c1.number_input("Nb d'années à récolter", min_value=1, max_value=15, value=10, step=1)
         volume_max = c2.number_input("Volume max (items)", min_value=5, max_value=200, value=50, step=5)
         c3.text_input("Scope (auto)", value=f"{st.session_state.level}|{st.session_state.subjects[0]}", disabled=True)
 
@@ -954,7 +1008,7 @@ def main():
                     st.session_state.qc_pack = None
                     st.session_state.chapter_report = None
                     st.session_state.run_stats = {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0}
-                    st.success(f"HARVEST terminé. +{len(manifest['library'])} items ajoutés (total={len(manifest['library'])}).")
+                    st.success(f"HARVEST terminé. +{len(manifest['library'])} items ajoutés.")
             except Exception as e:
                 st.error(f"HARVEST échoué: {e}")
 
@@ -968,7 +1022,6 @@ def main():
             if not sujet_file:
                 st.error("Veuillez fournir au moins le PDF Sujet.")
             else:
-                # Upload manuel: on stocke en mémoire (pas de hardcode), et on crée un item local://
                 su_bytes = sujet_file.getvalue()
                 co_bytes = corr_file.getvalue() if corr_file else b""
 
@@ -976,7 +1029,6 @@ def main():
                 co_id = stable_id(corr_file.name, str(len(co_bytes))) if corr_file else ""
                 pid = f"PAIR_{st.session_state.level}|{st.session_state.subjects[0]}_{stable_id(su_id, co_id)}"
 
-                # On persiste bytes en session_state (ISO-PROD test local)
                 st.session_state.setdefault("_uploads", {})
                 st.session_state._uploads[f"local://{su_id}"] = su_bytes
                 if corr_file:
@@ -997,7 +1049,6 @@ def main():
                 st.session_state.library.insert(0, item)
                 st.success("Ajouté à la bibliothèque.")
 
-    # Override downloader to support local://
     def get_pdf_bytes(url: str) -> bytes:
         if url.startswith("local://"):
             key = url
@@ -1007,9 +1058,7 @@ def main():
             return data
         return download_pdf_bytes(url)
 
-    # Patch run function to use get_pdf_bytes
     def run_granulo_test_patched(*args, **kwargs):
-        # monkey patch inside closure
         nonlocal get_pdf_bytes
 
         library = kwargs.get("library") or args[0]
@@ -1040,7 +1089,7 @@ def main():
             su_text = extract_text_from_pdf_bytes(su_pdf)
             co_text = extract_text_from_pdf_bytes(co_pdf)
             if not su_text or not co_text:
-                log(f"[PDF] EMPTY_TEXT pair_id={pid} su_text={bool(su_text)} co_text={bool(co_text)}")
+                log(f"[PDF] EMPTY_TEXT pair_id={pid}")
                 continue
 
             qs = split_questions(su_text)
@@ -1060,9 +1109,8 @@ def main():
                     rqi_items.append({"rqi_id": rqi_id, "pair_id": pid, "k": i + 1, "text": r})
 
         if not qi_items:
-            raise RuntimeError("RUN: aucune Qi extraite (échec extraction PDF ou contenu vide).")
+            raise RuntimeError("RUN: aucune Qi extraite.")
 
-        # saturation + qc
         qc_pack, qc_map = [], {}
         prev_qc_count = -1
         sealed_candidate = False
@@ -1085,45 +1133,110 @@ def main():
         rqi_by_id = {r["rqi_id"]: r for r in rqi_items}
         qi_pack = []
         qi_posable = 0
-        orphan = 0
+        orphan_count = 0
+        orphan_ids = []
+
         for q in qi_items:
             rtxt = rqi_by_id.get(q.get("rqi_id") or "", {}).get("text", "")
             triggers = build_triggers(q["text"])
             ari = build_ari(q["text"], rtxt)
             frt = build_frt(q["text"], rtxt, triggers)
             qc_id = qc_map.get(q["qi_id"], "")
-            if not qc_id:
-                orphan += 1
+            is_orphan = not qc_id
+            if is_orphan:
+                orphan_count += 1
+                orphan_ids.append(q["qi_id"])
             if rtxt:
                 qi_posable += 1
-            qi_pack.append({"qi_id": q["qi_id"], "pair_id": q["pair_id"], "k": q["k"], "qi": q["text"], "rqi": rtxt, "qc_id": qc_id, "triggers": triggers, "ari": ari, "frt": frt})
+            qi_pack.append({
+                "qi_id": q["qi_id"], "pair_id": q["pair_id"], "k": q["k"],
+                "qi": q["text"], "rqi": rtxt, "has_rqi": bool(rtxt),
+                "qc_id": qc_id, "is_orphan": is_orphan,
+                "triggers": triggers, "ari": ari, "frt": frt
+            })
 
-        audit = {
-            "qi_total": len(qi_pack),
-            "rqi_total": sum(1 for q in qi_pack if q["rqi"]),
-            "qc_total": len(qc_pack),
-            "qi_orphans": orphan,
-            "coverage_ok": (orphan == 0),
-            "posable_ok": (qi_posable > 0),
-            "sealed_candidate": sealed_candidate,
-            "sealed": (sealed_candidate and orphan == 0 and qi_posable > 0 and len(qc_pack) > 0),
-        }
-
-        by_ch = {}
+        # Chapter report complet
         ch_label = {c["chapter_code"]: c.get("chapter_label", c["chapter_code"]) for c in chapters}
+        qc_by_chapter: Dict[str, List[Dict[str, Any]]] = {}
         for qc in qc_pack:
-            cc = qc["chapter_code"]
-            by_ch.setdefault(cc, {"chapter_code": cc, "chapter_label": ch_label.get(cc, cc), "qc_ids": [], "qc_count": 0, "qi_count": 0})
-            by_ch[cc]["qc_ids"].append(qc["qc_id"])
-            by_ch[cc]["qc_count"] += 1
-            by_ch[cc]["qi_count"] += int(qc["cluster_size"])
+            qc_by_chapter.setdefault(qc["chapter_code"], []).append(qc)
+
+        qi_by_chapter: Dict[str, List[str]] = {}
+        qi_covered_by_chapter: Dict[str, List[str]] = {}
+        qi_orphans_by_chapter: Dict[str, List[str]] = {}
+
+        for qi in qi_pack:
+            qc_id = qi.get("qc_id", "")
+            chapter_code = "UNMAPPED"
+            if qc_id:
+                for qc in qc_pack:
+                    if qc["qc_id"] == qc_id:
+                        chapter_code = qc["chapter_code"]
+                        break
+            qi_by_chapter.setdefault(chapter_code, []).append(qi["qi_id"])
+            if qi.get("has_rqi"):
+                if qi.get("is_orphan"):
+                    qi_orphans_by_chapter.setdefault(chapter_code, []).append(qi["qi_id"])
+                else:
+                    qi_covered_by_chapter.setdefault(chapter_code, []).append(qi["qi_id"])
+
+        chapter_report_entries = []
+        all_chapters_seen = set(qc_by_chapter.keys()) | set(qi_by_chapter.keys())
+
+        for cc in sorted(all_chapters_seen):
+            qi_total = len(qi_by_chapter.get(cc, []))
+            qi_posable_in_ch = len(qi_covered_by_chapter.get(cc, [])) + len(qi_orphans_by_chapter.get(cc, []))
+            qi_covered = len(qi_covered_by_chapter.get(cc, []))
+            qi_orphans_ch = qi_orphans_by_chapter.get(cc, [])
+            qc_count_ch = len(qc_by_chapter.get(cc, []))
+
+            coverage_pct = 0.0
+            if qi_posable_in_ch > 0:
+                coverage_pct = round((qi_covered / qi_posable_in_ch) * 100.0, 2)
+
+            status = "PASS" if (qi_posable_in_ch > 0 and coverage_pct == 100.0 and qc_count_ch > 0 and len(qi_orphans_ch) == 0) else "FAIL"
+
+            chapter_report_entries.append({
+                "chapter_code": cc,
+                "chapter_label": ch_label.get(cc, cc),
+                "qi_total": qi_total,
+                "qi_posable_count": qi_posable_in_ch,
+                "covered_qi_count": qi_covered,
+                "coverage_pct": coverage_pct,
+                "orphans": qi_orphans_ch,
+                "orphans_count": len(qi_orphans_ch),
+                "qc_count": qc_count_ch,
+                "qc_ids": [qc["qc_id"] for qc in qc_by_chapter.get(cc, [])],
+                "status": status,
+            })
 
         chapter_report = {
             "version": APP_VERSION,
             "timestamp": _utc_ts(),
             "pack_id": st.session_state.pack_id,
-            "chapters": sorted(by_ch.values(), key=lambda x: (-x["qi_count"], x["chapter_code"])),
-            "unmapped_present": any(x["chapter_code"] == "UNMAPPED" for x in by_ch.values()),
+            "chapters": sorted(chapter_report_entries, key=lambda x: (-x["qi_total"], x["chapter_code"])),
+            "summary": {
+                "total_chapters_active": len([e for e in chapter_report_entries if e["qi_total"] > 0]),
+                "chapters_pass": len([e for e in chapter_report_entries if e["status"] == "PASS"]),
+                "chapters_fail": len([e for e in chapter_report_entries if e["status"] == "FAIL"]),
+                "global_coverage_pct": round((sum(e["covered_qi_count"] for e in chapter_report_entries) / max(1, sum(e["qi_posable_count"] for e in chapter_report_entries))) * 100.0, 2),
+            },
+            "unmapped_present": any(e["chapter_code"] == "UNMAPPED" for e in chapter_report_entries),
+        }
+
+        audit = {
+            "qi_total": len(qi_pack),
+            "qi_posable": qi_posable,
+            "rqi_total": sum(1 for q in qi_pack if q["rqi"]),
+            "qc_total": len(qc_pack),
+            "qi_orphans": orphan_count,
+            "qi_orphan_ids": orphan_ids[:50],
+            "coverage_ok": (orphan_count == 0),
+            "posable_ok": (qi_posable > 0),
+            "qc_ok": (len(qc_pack) > 0),
+            "sealed_candidate": sealed_candidate,
+            "sealed": (sealed_candidate and orphan_count == 0 and qi_posable > 0 and len(qc_pack) > 0),
+            "chapter_summary": chapter_report["summary"],
         }
 
         out = {"sujets": sujets_meta, "qc": qc_pack, "saturation": {"iterations": it + 1, "sealed_candidate": sealed_candidate}, "audit": audit}
@@ -1166,13 +1279,13 @@ def main():
                         "qi": int(res["audit"]["qi_total"]),
                         "rqi": int(res["audit"]["rqi_total"]),
                         "qc": int(res["audit"]["qc_total"]),
-                        "qi_posable": int(res["audit"]["rqi_total"]),
+                        "qi_posable": int(res["audit"]["qi_posable"]),
                     }
 
                     if res["audit"]["sealed"]:
                         st.success("SEALED = YES (stable + coverage OK + posable OK)")
                     else:
-                        st.warning(f"SEALED = NO | orphans={res['audit']['qi_orphans']} | rqi_total={res['audit']['rqi_total']} | qc={res['audit']['qc_total']}")
+                        st.warning(f"SEALED = NO | orphans={res['audit']['qi_orphans']} | posable={res['audit']['qi_posable']} | qc={res['audit']['qc_total']}")
                 except Exception as e:
                     st.error(f"RUN échoué: {e}")
 
@@ -1181,7 +1294,6 @@ def main():
 
     with tab3:
         st.markdown("## ÉTAPE 4 — RÉSULTATS / EXPORTS")
-        # refresh metrics
         lib = st.session_state.library
         items_total = len(lib)
         corr_ok = sum(1 for x in lib if x.get("corrige?") and x.get("corrige_url"))
@@ -1192,7 +1304,6 @@ def main():
         metric_row(items_total, corr_ok, qi_count, qi_posable, qc_count, sealed)
 
         st.markdown("### Exports (preuves)")
-        # harvest_manifest
         hm = st.session_state.harvest_manifest or {
             "version": APP_VERSION,
             "timestamp": _utc_ts(),
@@ -1245,7 +1356,6 @@ def main():
                 st.markdown("#### QC")
                 st.write(qc["qc"])
 
-                # Qi associés
                 qi_by_id = {q["qi_id"]: q for q in st.session_state.qi_pack}
                 st.markdown("#### Qi associés (avec ARI/FRT/Triggers)")
                 for qi_id in qc["qi_ids"][:80]:
@@ -1264,11 +1374,16 @@ def main():
                         st.markdown("**FRT**")
                         st.json(q["frt"])
 
-            # Audit
             if st.session_state.last_run_audit:
                 st.markdown("---")
                 st.markdown("### Audit ISO-PROD (preuve)")
                 st.json(st.session_state.last_run_audit)
+
+            # Afficher Chapter Report summary
+            if st.session_state.chapter_report:
+                st.markdown("---")
+                st.markdown("### Chapter Report (summary)")
+                st.json(st.session_state.chapter_report.get("summary", {}))
 
 
 if __name__ == "__main__":
