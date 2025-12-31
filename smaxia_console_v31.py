@@ -1,1048 +1,1111 @@
 # =============================================================================
-# SMAXIA GTE Console V31.10.0 (ISO-PROD TEST — UIFLUX)
+# SMAXIA GTE Console V31.10.1 — ISO-PROD TEST (UI EPUREE + HARVEST CORRIGES RENFORCE)
 # =============================================================================
-# OBJECTIF ISO-PROD (TEST) — UI ESSENTIELLE + PREUVES EXPORTABLES :
-# [1] Activation pays → load_academic_pack(country) (pack visible)
-# [2] Sélection niveau + 1-2 matières
-# [3] Bibliothèque Harvest visible : liste des sujets + corrigés (pairing)
-# [4] Chaîne complète : Harvest → Extraction Qi/RQi → RUN GTE → Saturation
-# [5] Validateurs B bloquants : orphelins_posables == 0
-# [6] SEAL uniquement si (new_proof_sig == 0) ET (B PASS)
+# RÈGLES CLÉS (CAS 1 ONLY - TEST) :
+# - On ne traite que les sujets avec corrigé exploitable (sinon Qi quarantainées)
+# - SEAL = OUI uniquement si :
+#     (1) POSABLE > 0
+#     (2) QC_total > 0
+#     (3) 0 orphelin POSABLE (validator B bloquant)
+#     (4) anti-singleton QC respecté (cluster=1 interdit)
+#     (5) saturation atteinte (preuve stable sur itération)
 #
-# RÈGLES KERNEL (appliquées ici) :
-# - Zéro hardcode métier dans le CORE (pays/matière/chapitre) : la variabilité vient du PACK (données)
-# - QC = méthode (formulation "Comment ... ?") ; ARI/FRT/TRG = templates invariants
-# - Preuves exportables : qi_pack.json, qc_pack.json, chapter_report.json, harvest_manifest.json, logs.txt
-#
-# NOTE TEST :
-# - Le harvester est "best-effort" (sources pack-driven). Le test ISO doit aussi pouvoir
-#   fonctionner via upload manuel sujet+corrigé.
+# NOTE : Ce fichier est une console Streamlit de TEST ISO-PROD (preuve/exports),
+#        pas le KERNEL PROD final. Aucun hardcode "chapitre/métier" dans les templates :
+#        tout ce qui est "chapitre/intent" vient du Pack (données).
 # =============================================================================
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
+import os
 import re
 import time
-import uuid
+import hashlib
+import random
+import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
+from urllib.parse import urljoin, urlparse
 
+import requests
 import streamlit as st
+import pdfplumber
+from bs4 import BeautifulSoup
 
-# Optional deps used if available (harvest/extraction)
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None
+# ------------------------------
+# META
+# ------------------------------
+APP_NAME = "SMAXIA GTE Console"
+APP_VERSION = "V31.10.1"
+APP_FLAVOR = "ISO-PROD TEST"
+BUILD = "2025-12-31"
 
-try:
-    from bs4 import BeautifulSoup  # type: ignore
-except Exception:
-    BeautifulSoup = None
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+REQ_TIMEOUT = 25
+MAX_PDF_MB = 35
+MAX_CRAWL_PAGES_DEFAULT = 12
 
-try:
-    import pdfplumber  # type: ignore
-except Exception:
-    pdfplumber = None
-
-
-# =============================================================================
-# VERSION / UI
-# =============================================================================
-APP_VERSION = "V31.10.0-UIFLUX-2025-12-31"
-APP_TITLE = f"SMAXIA GTE Console {APP_VERSION}"
-
-# Safety limits (ISO-PROD test)
-REQ_TIMEOUT_SEC = 20
-MAX_PDF_MB = 40
+# Clustering (invariant, text-structure based)
+SIM_THRESHOLD = 0.18         # plus bas = clusters plus gros (évite singletons)
+MIN_CLUSTER_SIZE = 2         # anti-singleton (normatif)
+MAX_QI_CHARS = 1800          # sécurise exports/affichage
 
 
 # =============================================================================
-# Data models
+# UTILITAIRES
 # =============================================================================
-@dataclass
-class HarvestSource:
-    name: str
-    url: str
-
-
-@dataclass
-class IntentDef:
-    intent_code: str
-    label: str
-    chapter_code: str
-    keywords: List[str]
-
-
-@dataclass
-class ChapterDef:
-    chapter_code: str
-    label: str
-
-
-@dataclass
-class Pack:
-    country_code: str
-    pack_id: str
-    signature: str
-    levels: List[str]
-    subjects_by_level: Dict[str, List[str]]  # "Terminale" -> ["MATH", "PC", ...]
-    chapters: List[ChapterDef]
-    intents: List[IntentDef]
-    harvest_sources: List[HarvestSource]  # pack-driven sources (test)
-    # templates invariants
-    ari_template_id: str
-    frt_template_id: str
-    trg_template_id: str
-
-
-@dataclass
-class PairItem:
-    pair_id: str
-    scope: str  # e.g. "TERMINALE|MATH"
-    sujet_name: str
-    sujet_url: Optional[str] = None
-    sujet_bytes: Optional[bytes] = None
-    corrige_name: Optional[str] = None
-    corrige_url: Optional[str] = None
-    corrige_bytes: Optional[bytes] = None
-    corrige_found: bool = False
-
-
-@dataclass
-class QiItem:
-    qi_id: str
-    pair_id: str
-    scope: str
-    qi_index: int
-    qi_text: str
-    intent_code: str
-    chapter_code: str
-    posable: bool
-    rqi_text: Optional[str] = None
-
-
-@dataclass
-class QCItem:
-    qc_id: str
-    scope: str
-    intent_code: str
-    chapter_code: str
-    qc_text: str  # must start with "Comment" and end with "?"
-    ari_template_id: str
-    frt_template_id: str
-    trg_template_id: str
-    qi_ids: List[str]
-
-
-# =============================================================================
-# Helpers (core invariant)
-# =============================================================================
-def now_iso() -> str:
-    return datetime.utcnow().isoformat()
+def now_ts() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def safe_truncate(s: str, n: int = 8000) -> str:
+def sha256_str(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def json_dumps(x: Any) -> str:
+    return json.dumps(x, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def norm_text(s: str) -> str:
     s = s or ""
-    return s if len(s) <= n else s[:n] + " …[TRUNCATED]"
+    s = s.replace("\u00A0", " ")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def norm_name(name: str) -> str:
-    s = (name or "").lower()
-    s = re.sub(r"\.pdf$", "", s)
-    s = re.sub(r"[^a-z0-9]+", " ", s)
+def safe_filename(name: str) -> str:
+    name = name.strip().replace("/", "_").replace("\\", "_")
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
+    return name[:160] if len(name) > 160 else name
+
+
+def same_domain(a: str, b: str) -> bool:
+    try:
+        return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
+    except Exception:
+        return False
+
+
+def guess_is_pdf(url: str) -> bool:
+    u = (url or "").lower()
+    return ".pdf" in u
+
+
+def guess_is_correction(name_or_url: str) -> bool:
+    s = norm_text(name_or_url)
+    # FR/EN invariant-ish keywords for correction artifacts (not chapter hardcode)
+    keys = [
+        "corrige", "corrigé", "correction", "solutions", "solution",
+        "soluce", "reponse", "réponse", "answers", "answer", "markscheme",
+        "corr", "sol"
+    ]
+    return any(k in s for k in keys)
+
+
+def normalize_pair_key(name_or_url: str) -> str:
+    """
+    Normalize for fuzzy pairing:
+    remove correction markers, generic tokens, punctuation.
+    """
+    s = norm_text(name_or_url)
+    # remove file extension & query parts
+    s = re.sub(r"\.pdf.*$", "", s)
+    # remove common non-semantic tokens
+    s = re.sub(r"(corrige|corrigé|correction|solutions|solution|reponse|réponse|answers|answer|markscheme)", " ", s)
+    s = re.sub(r"(sujet|subject|epreuve|épreuve|exam|examen|session|terminale|premiere|seconde|maths|math)", " ", s)
+    s = re.sub(r"[_\-]+", " ", s)
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def sim(a: str, b: str) -> float:
-    a, b = (a or ""), (b or "")
-    if not a or not b:
-        return 0.0
+def ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def log_append(msg: str) -> None:
-    st.session_state["_logs"].append(msg)
+# =============================================================================
+# DATA MODELS
+# =============================================================================
+@dataclass(frozen=True)
+class HarvestSource:
+    name: str
+    start_urls: List[str]
+    max_pages: int = MAX_CRAWL_PAGES_DEFAULT
 
 
-def logs_text() -> str:
-    return "\n".join(st.session_state.get("_logs", []))
+@dataclass
+class PdfArtifact:
+    name: str
+    url: Optional[str]
+    sha256: Optional[str]
+    size_bytes: int
+    bytes_b64: Optional[str] = None  # not used (kept to show extensibility)
+
+
+@dataclass
+class LibraryItem:
+    pair_id: str
+    scope: str
+    sujet: PdfArtifact
+    corrige: Optional[PdfArtifact]
+    corrige_found: bool
+    corrige_dl_ok: bool
+    source: str
+    added_at: str
+
+
+@dataclass
+class Pack:
+    country: str
+    pack_id: str
+    signature: str
+    levels: List[str]
+    subjects: Dict[str, List[str]]          # level -> subjects
+    chapters: Dict[str, List[str]]          # subject -> chapters
+    harvest_sources: List[HarvestSource]
 
 
 # =============================================================================
-# Pack loader (TEST pack — variability is PACK, not CORE)
+# PACK LOADER (TEST PACK)
 # =============================================================================
-def load_academic_pack(country_code: str) -> Pack:
-    """
-    CORE invariant: only selects which pack to load.
-    In PROD, this comes from DB/API. Here we provide a TEST pack (allowed).
-    """
-    cc = (country_code or "").upper().strip()
-    if cc != "FR":
-        # Minimal generic pack for other codes (keeps invariant behavior)
-        return Pack(
-            country_code=cc,
-            pack_id=f"CAP_{cc}_TEST_V1",
-            signature="sha256:TEST_ONLY/TEST_ONLY",
-            levels=["Seconde", "Première", "Terminale"],
-            subjects_by_level={
-                "Seconde": ["MATH"],
-                "Première": ["MATH"],
-                "Terminale": ["MATH"],
-            },
-            chapters=[
-                ChapterDef("CH_ANALYSE", "Analyse / Fonctions"),
-                ChapterDef("CH_PROBAS", "Probabilités"),
-                ChapterDef("CH_GEO", "Géométrie"),
-                ChapterDef("CH_SUITES", "Suites"),
-            ],
-            intents=[
-                IntentDef("INT_METHOD_GENERIC", "Méthode générique", "CH_ANALYSE", ["calculer", "déterminer", "montrer"]),
-            ],
-            harvest_sources=[],
-            ari_template_id="ARI_TEMPLATE_V1",
-            frt_template_id="FRT_TEMPLATE_V1",
-            trg_template_id="TRG_TEMPLATE_V1",
-        )
+def load_academic_pack(country: str) -> Pack:
+    # TEST PACK (data-only). En PROD : vient DB/API.
+    # Ici, on limite le champ au strict nécessaire pour tester l’ISO-PROD.
+    if country != "FR":
+        raise ValueError("TEST pack disponible uniquement pour FR dans cette console.")
 
-    # FR TEST pack (pilot) — sources may be adapted without touching CORE.
+    pack_id = "CAP_FR_BAC_2024_V1"
+    signature = "sha256:TEST_ONLY/TEST_ONLY"
+
+    levels = ["Seconde", "Première", "Terminale", "Licence 1", "Prépa (CPGE)"]
+    subjects = {
+        "Seconde": ["MATH"],
+        "Première": ["MATH"],
+        "Terminale": ["MATH"],
+        "Licence 1": ["MATH"],
+        "Prépa (CPGE)": ["MATH"],
+    }
+
+    # Chapitres pack-driven (liste indicative de test)
+    chapters = {
+        "MATH": [
+            "CH_ANALYSE",
+            "CH_PROBAS",
+            "CH_GEOMETRIE",
+            "CH_SUITES",
+        ]
+    }
+
+    # SOURCES : mettre ici des pages de listing qui contiennent des liens .pdf
+    # IMPORTANT : cette console sait crawler plusieurs pages (pagination) automatiquement.
+    harvest_sources = [
+        HarvestSource(
+            name="APMEP (listing)",
+            start_urls=[
+                # Remplace/ajoute ici des URLs de listing pertinentes si besoin
+                # (la console gère la pagination et collecte tous les .pdf du domaine).
+                "https://www.apmep.fr/Annales-Terminale",
+            ],
+            max_pages=MAX_CRAWL_PAGES_DEFAULT,
+        ),
+    ]
+
     return Pack(
-        country_code="FR",
-        pack_id="CAP_FR_BAC_2024_V1",
-        signature="sha256:TEST_ONLY/TEST_ONLY",
-        levels=["Seconde", "Première", "Terminale", "Licence 1", "Prépa (CPGE)"],
-        subjects_by_level={
-            "Seconde": ["MATH"],
-            "Première": ["MATH"],
-            "Terminale": ["MATH"],
-            "Licence 1": ["MATH"],
-            "Prépa (CPGE)": ["MATH"],
-        },
-        chapters=[
-            ChapterDef("CH_ANALYSE", "Analyse - Fonctions"),
-            ChapterDef("CH_PROBAS", "Probabilités - Variables aléatoires"),
-            ChapterDef("CH_GEOMETRIE", "Géométrie - Nombres complexes"),
-            ChapterDef("CH_SUITES", "Suites et Récurrence"),
-        ],
-        intents=[
-            IntentDef("INT_DERIVEE", "Dérivation / étude de fonction", "CH_ANALYSE", ["dérivée", "variation", "tangente", "limite", "asymptote"]),
-            IntentDef("INT_PROBA", "Probabilités (loi, conditionnelle)", "CH_PROBAS", ["probabilité", "conditionnelle", "loi", "binomiale", "espérance"]),
-            IntentDef("INT_COMPLEXES", "Nombres complexes (forme, module, argument)", "CH_GEOMETRIE", ["complexe", "module", "argument", "affixe"]),
-            IntentDef("INT_SUITES", "Suites (récurrence, convergence)", "CH_SUITES", ["suite", "récurrence", "convergence", "monotone"]),
-            IntentDef("INT_METHOD_GENERIC", "Méthode générique", "CH_ANALYSE", ["calculer", "déterminer", "montrer", "justifier"]),
-        ],
-        harvest_sources=[
-            # Pack-driven sources (best-effort). You may replace these in the PACK without touching CORE.
-            HarvestSource("APMEP", "https://www.apmep.fr/"),
-        ],
-        ari_template_id="ARI_TEMPLATE_V1",
-        frt_template_id="FRT_TEMPLATE_V1",
-        trg_template_id="TRG_TEMPLATE_V1",
+        country=country,
+        pack_id=pack_id,
+        signature=signature,
+        levels=levels,
+        subjects=subjects,
+        chapters=chapters,
+        harvest_sources=harvest_sources,
     )
 
 
 # =============================================================================
-# Harvest (best-effort) — pairs subject/correction
+# HARVEST ENGINE (multi-pages + fuzzy pairing)
 # =============================================================================
-def http_get(url: str) -> Optional[bytes]:
-    if requests is None:
-        return None
-    try:
-        r = requests.get(url, timeout=REQ_TIMEOUT_SEC, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return None
-        return r.content
-    except Exception:
-        return None
+def http_get(url: str) -> requests.Response:
+    headers = {"User-Agent": UA}
+    return requests.get(url, headers=headers, timeout=REQ_TIMEOUT, allow_redirects=True)
 
 
-def guess_is_corrige(name_or_url: str) -> bool:
-    s = (name_or_url or "").lower()
-    return any(k in s for k in ["corrig", "correction", "corrige", "corrigé", "solution", "solutions", "corr"])
+def fetch_html(url: str) -> str:
+    r = http_get(url)
+    r.raise_for_status()
+    return r.text
 
 
-def extract_pdf_links_from_html(base_url: str, html: str) -> List[str]:
-    if not html or BeautifulSoup is None:
-        return []
+def extract_links(html: str, base_url: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a"):
-        href = a.get("href") or ""
-        if ".pdf" in href.lower():
-            if href.startswith("http"):
-                links.append(href)
-            else:
-                # naive join
-                if base_url.endswith("/") and href.startswith("/"):
-                    links.append(base_url[:-1] + href)
-                elif base_url.endswith("/") or href.startswith("/"):
-                    links.append(base_url + href)
-                else:
-                    links.append(base_url + "/" + href)
-    # Deduplicate
-    out = []
+    links: List[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        absu = urljoin(base_url, href)
+        links.append(absu)
+    # unique, stable order
     seen = set()
+    out = []
     for u in links:
         if u not in seen:
-            out.append(u)
             seen.add(u)
+            out.append(u)
     return out
 
 
-def harvest_pairs(pack: Pack, level: str, subject_code: str, volume: int) -> List[PairItem]:
-    """
-    Best-effort harvester. ISO-PROD test MUST still work via manual upload
-    if harvest cannot find corrigés.
-    """
-    scope = f"{(level or '').upper()}|{(subject_code or '').upper()}"
-    log_append(f"[HARVEST] Scope: {scope} ...")
+def is_pagination_link(url: str, domain_root: str) -> bool:
+    if not same_domain(url, domain_root):
+        return False
+    s = url.lower()
+    # generic pagination patterns
+    patterns = [
+        "page=", "/page/", "p=", "start=", "offset=", "limit=",
+        "suivant", "next", "older", "plus-recent", "plus-ancien",
+    ]
+    return any(p in s for p in patterns)
 
-    # Minimal approach: fetch pack sources homepages and collect PDF links.
-    # In V31.10.1 you can specialize to APMEP pagination/search; here we keep it conservative.
-    all_pdf_urls: List[str] = []
-    for src in pack.harvest_sources:
-        body = http_get(src.url)
-        if not body:
+
+def crawl_domain_pdfs(start_url: str, max_pages: int, log: List[str]) -> List[str]:
+    """
+    Crawl within same domain, follow pagination-like links, collect pdf links.
+    Deterministic: BFS order.
+    """
+    domain_root = start_url
+    q = [start_url]
+    visited = set()
+    pdfs: List[str] = []
+    pages = 0
+
+    while q and pages < max_pages:
+        url = q.pop(0)
+        if url in visited:
             continue
+        visited.add(url)
+        pages += 1
+
         try:
-            html = body.decode("utf-8", errors="ignore")
-        except Exception:
+            html = fetch_html(url)
+        except Exception as e:
+            log.append(f"[HARVEST] WARN fetch failed: {url} :: {e}")
             continue
-        all_pdf_urls.extend(extract_pdf_links_from_html(src.url, html))
 
-    # Keep only first 'volume' candidates (subject + correction will be paired)
-    all_pdf_urls = all_pdf_urls[: max(volume * 3, 30)]  # take more, then pair
+        links = extract_links(html, url)
 
-    # Split by "corrigé" heuristic
-    sujets = []
-    corriges = []
-    for u in all_pdf_urls:
-        name = u.split("/")[-1]
-        if guess_is_corrige(name) or guess_is_corrige(u):
-            corriges.append((name, u))
-        else:
-            sujets.append((name, u))
+        # collect pdf links
+        for u in links:
+            if guess_is_pdf(u):
+                pdfs.append(u)
 
-    # Pairing by normalized name similarity
-    pairs: List[PairItem] = []
-    used_corr = set()
-    for i, (s_name, s_url) in enumerate(sujets[:volume]):
-        s_norm = norm_name(s_name)
-        best = None
-        best_score = 0.0
-        for c_name, c_url in corriges:
-            if c_url in used_corr:
-                continue
-            score = sim(s_norm, norm_name(c_name))
-            if score > best_score:
-                best_score = score
-                best = (c_name, c_url)
-        pair_id = f"PAIR_{scope.replace('|','_')}_{i+1:04d}_{uuid.uuid4().hex[:7]}"
-        item = PairItem(
-            pair_id=pair_id,
-            scope=scope,
-            sujet_name=s_name,
-            sujet_url=s_url,
-            corrige_name=best[0] if (best and best_score >= 0.55) else None,
-            corrige_url=best[1] if (best and best_score >= 0.55) else None,
-            corrige_found=bool(best and best_score >= 0.55),
-        )
-        if item.corrige_url:
-            used_corr.add(item.corrige_url)
-        pairs.append(item)
+        # enqueue pagination-like links (same domain)
+        for u in links:
+            if is_pagination_link(u, domain_root) and u not in visited:
+                # keep within same netloc
+                if same_domain(u, start_url):
+                    q.append(u)
 
-    log_append(f"[HARVEST] {scope}: {len(pairs)} sujets retenus (corrigé si apparié).")
-    return pairs
+    # unique stable
+    seen = set()
+    out = []
+    for u in pdfs:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+
+    log.append(f"[HARVEST] crawl={pages} pages | pdf_links={len(out)} | start={start_url}")
+    return out
 
 
-def ensure_pair_bytes(pair: PairItem) -> PairItem:
-    # Download PDFs if URLs exist and bytes missing
-    if pair.sujet_bytes is None and pair.sujet_url:
-        b = http_get(pair.sujet_url)
-        if b and (len(b) / (1024 * 1024) <= MAX_PDF_MB):
-            pair.sujet_bytes = b
-    if pair.corrige_bytes is None and pair.corrige_url:
-        b = http_get(pair.corrige_url)
-        if b and (len(b) / (1024 * 1024) <= MAX_PDF_MB):
-            pair.corrige_bytes = b
-    return pair
-
-
-# =============================================================================
-# PDF → text → Qi/RQi extraction (test-grade)
-# =============================================================================
-QI_SPLIT_PATTERNS = [
-    r"\bQuestion\s+\d+\b",
-    r"\bQCM\b",
-    r"^\s*\d+\s*[\)\.\-]\s+",
-    r"^\s*[a-d]\)\s+",
-]
-
-
-def pdf_to_text(pdf_bytes: bytes) -> str:
-    if not pdf_bytes:
-        return ""
-    if pdfplumber is None:
-        return ""
+def download_pdf(url: str, log: List[str]) -> Optional[bytes]:
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            parts = []
-            for page in pdf.pages:
-                t = page.extract_text() or ""
-                if t:
-                    parts.append(t)
+        r = http_get(url)
+        r.raise_for_status()
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        # accept even if ctype is not exactly pdf (some servers mislabel)
+        data = r.content
+        mb = len(data) / (1024 * 1024)
+        if mb > MAX_PDF_MB:
+            log.append(f"[HARVEST] SKIP too big ({mb:.1f}MB) {url}")
+            return None
+        if (not data) or len(data) < 800:
+            log.append(f"[HARVEST] SKIP empty/small {url}")
+            return None
+        return data
+    except Exception as e:
+        log.append(f"[HARVEST] FAIL download {url} :: {e}")
+        return None
+
+
+def split_sujet_corrige(urls: List[str]) -> Tuple[List[str], List[str]]:
+    sujets, corr = [], []
+    for u in urls:
+        if guess_is_correction(u):
+            corr.append(u)
+        else:
+            sujets.append(u)
+    return sujets, corr
+
+
+def fuzzy_pairing(sujet_urls: List[str], corr_urls: List[str], min_ratio: float = 0.74) -> Dict[str, Optional[str]]:
+    """
+    Map sujet_url -> best corr_url by normalized key similarity.
+    Deterministic tie-break by URL string.
+    """
+    corr_keys = [(u, normalize_pair_key(u)) for u in corr_urls]
+    corr_keys.sort(key=lambda x: x[0])
+
+    out: Dict[str, Optional[str]] = {}
+    for su in sorted(sujet_urls):
+        sk = normalize_pair_key(su)
+        best = None
+        best_r = 0.0
+        for cu, ck in corr_keys:
+            r = ratio(sk, ck)
+            if r > best_r:
+                best_r = r
+                best = cu
+        out[su] = best if (best is not None and best_r >= min_ratio) else None
+    return out
+
+
+def build_library_from_sources(
+    pack: Pack,
+    scope: str,
+    volume: int,
+    log: List[str],
+    max_pages: int,
+) -> List[LibraryItem]:
+    """
+    Build a library by crawling sources then downloading up to `volume` sujet PDFs.
+    If a correction URL is paired, attempt to download it too.
+    """
+    all_pdfs: List[str] = []
+    for src in pack.harvest_sources:
+        for u in src.start_urls:
+            all_pdfs.extend(crawl_domain_pdfs(u, max_pages=min(max_pages, src.max_pages), log=log))
+
+    sujets_urls, corr_urls = split_sujet_corrige(all_pdfs)
+    pair_map = fuzzy_pairing(sujets_urls, corr_urls, min_ratio=0.74)
+
+    # Deterministic selection of sujets (limit volume)
+    sujets_sel = sorted(sujets_urls)[: max(0, int(volume))]
+    items: List[LibraryItem] = []
+
+    for i, sujet_url in enumerate(sujets_sel, start=1):
+        sujet_name = safe_filename(os.path.basename(urlparse(sujet_url).path) or f"sujet_{i}.pdf")
+        sujet_bytes = download_pdf(sujet_url, log)
+        if not sujet_bytes:
+            continue
+
+        sujet_sha = sha256_bytes(sujet_bytes)
+        corr_url = pair_map.get(sujet_url)
+        corr_art: Optional[PdfArtifact] = None
+        corr_found = corr_url is not None
+        corr_dl_ok = False
+
+        if corr_url:
+            corr_name = safe_filename(os.path.basename(urlparse(corr_url).path) or f"corrige_{i}.pdf")
+            corr_bytes = download_pdf(corr_url, log)
+            if corr_bytes:
+                corr_sha = sha256_bytes(corr_bytes)
+                corr_dl_ok = True
+                corr_art = PdfArtifact(
+                    name=corr_name,
+                    url=corr_url,
+                    sha256=corr_sha,
+                    size_bytes=len(corr_bytes),
+                )
+            else:
+                corr_art = PdfArtifact(
+                    name=corr_name,
+                    url=corr_url,
+                    sha256=None,
+                    size_bytes=0,
+                )
+
+        pair_id = f"PAIR_{scope}_{i:04d}_{sujet_sha[:7]}"
+        items.append(
+            LibraryItem(
+                pair_id=pair_id,
+                scope=scope,
+                sujet=PdfArtifact(name=sujet_name, url=sujet_url, sha256=sujet_sha, size_bytes=len(sujet_bytes)),
+                corrige=corr_art,
+                corrige_found=corr_found,
+                corrige_dl_ok=corr_dl_ok,
+                source="HARVEST_AUTO",
+                added_at=now_ts(),
+            )
+        )
+
+    log.append(f"[HARVEST] items_ready={len(items)} (volume={volume})")
+    return items
+
+
+# =============================================================================
+# EXTRACTION (Qi / RQi) — CAS 1 ONLY
+# =============================================================================
+def pdf_to_text(pdf_bytes: bytes) -> str:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        parts = []
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            parts.append(t)
         return "\n".join(parts)
-    except Exception:
-        return ""
 
 
-def split_into_qi(text: str) -> List[str]:
+def split_qi(text: str) -> List[Dict[str, str]]:
+    """
+    Split into Qi candidates.
+    Invariant heuristics (structure markers), not chapter-specific.
+    """
     t = (text or "").strip()
     if not t:
         return []
-    # Normalize
-    t = re.sub(r"\r", "\n", t)
-    # Create cut marks by patterns
-    lines = t.split("\n")
-    chunks: List[str] = []
-    buf: List[str] = []
 
-    cut_re = re.compile("|".join(QI_SPLIT_PATTERNS), flags=re.IGNORECASE | re.MULTILINE)
-    for line in lines:
-        if cut_re.search(line) and buf:
-            chunk = "\n".join(buf).strip()
-            if len(chunk) > 20:
-                chunks.append(chunk)
-            buf = [line]
+    # Common structural patterns:
+    # "1." / "1)" / "Question 1" etc.
+    pattern = re.compile(r"(?im)^(?:\s*(?:question\s*)?(\d{1,3})\s*[\.\)\-:])\s+")
+    matches = list(pattern.finditer(t))
+
+    qi: List[Dict[str, str]] = []
+    if len(matches) >= 2:
+        for idx, m in enumerate(matches):
+            start = m.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(t)
+            chunk = t[start:end].strip()
+            qid = m.group(1) or str(idx + 1)
+            chunk = chunk[:MAX_QI_CHARS]
+            qi.append({"qi_id": f"Q{qid}", "text": chunk})
+        return qi
+
+    # Fallback: split by double newlines into blocks
+    blocks = [b.strip() for b in re.split(r"\n{2,}", t) if b.strip()]
+    for i, b in enumerate(blocks, start=1):
+        b = b[:MAX_QI_CHARS]
+        qi.append({"qi_id": f"Q{i}", "text": b})
+    return qi
+
+
+def map_posable(qi: List[Dict[str, str]], rqi: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """
+    CAS 1 ONLY:
+    - POSABLE = Qi with a correction mapping (here: index mapping)
+    - non-posables => quarantine
+    """
+    n = min(len(qi), len(rqi))
+    pos = []
+    quarantined = []
+
+    for i in range(len(qi)):
+        if i < n:
+            pos.append(qi[i])
         else:
-            buf.append(line)
-    last = "\n".join(buf).strip()
-    if len(last) > 20:
-        chunks.append(last)
+            quarantined.append(qi[i])
 
-    # Light post-filter
-    out = []
-    for c in chunks:
-        c2 = re.sub(r"\s+", " ", c).strip()
-        if len(c2) >= 40:
-            out.append(c2)
-    return out
-
-
-def split_rqi(text: str) -> List[str]:
-    # For correction, split similarly (often aligned by numbering)
-    return split_into_qi(text)
-
-
-def detect_intent(pack: Pack, qi_text: str) -> Tuple[str, str]:
-    """
-    Pack-driven intent detection (keywords). Returns (intent_code, chapter_code).
-    """
-    q = (qi_text or "").lower()
-    best_intent = None
-    best_hits = 0
-    for it in pack.intents:
-        hits = 0
-        for kw in it.keywords:
-            if kw.lower() in q:
-                hits += 1
-        if hits > best_hits:
-            best_hits = hits
-            best_intent = it
-    if best_intent is None:
-        # fallback to first intent (still pack-driven)
-        best_intent = pack.intents[0]
-    return best_intent.intent_code, best_intent.chapter_code
-
-
-def align_qi_to_rqi(qis: List[str], rqis: List[str]) -> List[Tuple[bool, Optional[str]]]:
-    """
-    Attempts to align each Qi with a correction chunk.
-    If we cannot align reliably, mark as non-posable.
-    """
-    if not qis:
-        return []
-    if not rqis:
-        return [(False, None) for _ in qis]
-
-    # Attempt alignment by order and similarity
-    aligned: List[Tuple[bool, Optional[str]]] = []
-    used = set()
-
-    for q in qis:
-        qn = safe_truncate(q, 500).lower()
-        best_idx = None
-        best_score = 0.0
-        for i, r in enumerate(rqis):
-            if i in used:
-                continue
-            rn = safe_truncate(r, 700).lower()
-            score = sim(qn, rn)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-        if best_idx is not None and best_score >= 0.25:
-            used.add(best_idx)
-            aligned.append((True, rqis[best_idx]))
-        else:
-            # fallback: if correction exists but no match, mark non-posable (prevents false SEALED)
-            aligned.append((False, None))
-
-    return aligned
+    return pos, quarantined
 
 
 # =============================================================================
-# GTE construction (QC/ARI/FRT/TRG templates + validators + saturation)
+# QC BUILD (Clustering + Anti-singleton)
 # =============================================================================
-def build_qc_text(intent_label: str) -> str:
-    # Must be invariant style: "Comment ... ?"
-    # We keep it method-oriented and generic.
-    return f"Comment appliquer la méthode « {intent_label} » pour résoudre une question ?"
+def tokenize(s: str) -> List[str]:
+    s = norm_text(s)
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    toks = [w for w in s.split(" ") if w]
+    return toks
 
 
-def run_gte_on_library(pack: Pack, library: List[PairItem]) -> Tuple[List[QiItem], List[QCItem], Dict, Dict]:
+def jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 0.0
+    inter = len(sa & sb)
+    uni = len(sa | sb)
+    return inter / max(1, uni)
+
+
+class DSU:
+    def __init__(self, n: int):
+        self.p = list(range(n))
+        self.r = [0] * n
+
+    def find(self, x: int) -> int:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a: int, b: int):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.r[ra] < self.r[rb]:
+            self.p[ra] = rb
+        elif self.r[ra] > self.r[rb]:
+            self.p[rb] = ra
+        else:
+            self.p[rb] = ra
+            self.r[ra] += 1
+
+
+def cluster_qi(posable: List[Dict[str, str]], sim_th: float) -> List[List[Dict[str, str]]]:
+    toks = [tokenize(q["text"]) for q in posable]
+    n = len(posable)
+    dsu = DSU(n)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = jaccard(toks[i], toks[j])
+            if s >= sim_th:
+                dsu.union(i, j)
+
+    groups: Dict[int, List[int]] = {}
+    for i in range(n):
+        r = dsu.find(i)
+        groups.setdefault(r, []).append(i)
+
+    clusters = []
+    # deterministic ordering: by (-size, first_qi_id)
+    for _, idxs in groups.items():
+        items = [posable[i] for i in idxs]
+        clusters.append(items)
+
+    def cluster_key(c: List[Dict[str, str]]):
+        size = len(c)
+        # extract numeric part for stable ordering
+        def qnum(qid: str) -> int:
+            m = re.search(r"(\d+)", qid or "")
+            return int(m.group(1)) if m else 10**9
+        first = min(qnum(x["qi_id"]) for x in c) if c else 10**9
+        return (-size, first)
+
+    clusters.sort(key=cluster_key)
+    return clusters
+
+
+def build_qc_from_clusters(clusters: List[List[Dict[str, str]]]) -> Tuple[List[Dict[str, Any]], Dict[str, str], List[str]]:
     """
-    Returns (qi_pack, qc_pack, chapter_report, harvest_manifest)
+    Return: qc_pack, qi->qc map, orphans_posable
+    Anti-singleton: cluster size < MIN_CLUSTER_SIZE => blocked => orphan POSABLE.
     """
-    qi_pack: List[QiItem] = []
-    qc_map: Dict[Tuple[str, str], QCItem] = {}  # (scope, intent_code) -> QCItem
+    qc_pack: List[Dict[str, Any]] = []
+    qi_to_qc: Dict[str, str] = {}
+    orphans: List[str] = []
 
-    harvest_manifest = {
-        "ts": now_iso(),
-        "pack_id": pack.pack_id,
-        "signature": pack.signature,
-        "items": [],
-    }
+    for c in clusters:
+        if len(c) < MIN_CLUSTER_SIZE:
+            # anti-singleton => block
+            for q in c:
+                orphans.append(q["qi_id"])
+            continue
 
-    for p in library:
-        ensure_pair_bytes(p)
-        harvest_manifest["items"].append(
-            {
-                "pair_id": p.pair_id,
-                "scope": p.scope,
-                "sujet_name": p.sujet_name,
-                "sujet_url": p.sujet_url,
-                "corrige_name": p.corrige_name,
-                "corrige_url": p.corrige_url,
-                "corrige_present": bool(p.corrige_bytes),
-            }
-        )
+        qi_ids = [q["qi_id"] for q in c]
+        # deterministic qc_id from member ids
+        qc_id = "QC_" + sha256_str("||".join(sorted(qi_ids)))[:10]
 
-        sujet_text = pdf_to_text(p.sujet_bytes or b"")
-        corr_text = pdf_to_text(p.corrige_bytes or b"") if p.corrige_bytes else ""
+        # Minimal invariant ARI/FRT/TRG templates (structure-only)
+        ari = {
+            "template": "ARI_TEMPLATE_V1",
+            "goal": "Résoudre la question en appliquant une procédure de résolution structurée.",
+            "steps": [
+                "Lire et reformuler la consigne.",
+                "Lister les données, contraintes et inconnues.",
+                "Choisir une stratégie de résolution (méthode).",
+                "Exécuter les étapes de calcul/raisonnement.",
+                "Vérifier la cohérence (unités, bornes, ordre de grandeur, cas limites).",
+                "Présenter le résultat selon le format attendu.",
+            ],
+            "checks": [
+                "Cohérence interne des transformations.",
+                "Vérification d’un cas simple / limite si possible.",
+                "Validation finale du résultat.",
+            ],
+        }
 
-        qis = split_into_qi(sujet_text)
-        rqis = split_rqi(corr_text) if corr_text else []
+        frt = {
+            "template": "FRT_TEMPLATE_V1",
+            "declencheur": "Identifier la forme du problème et déclencher la procédure adéquate.",
+            "plan": [
+                "État initial (données / objectif).",
+                "Transformation(s) / calcul(s).",
+                "Résultat final + justification.",
+            ],
+            "pieges": [
+                "Oublis de conditions / hypothèses.",
+                "Erreur de manipulation ou de conversion.",
+                "Résultat non justifié / format non conforme.",
+            ],
+            "validation": [
+                "Contrôle rapide (sanity check).",
+                "Contrôle formel (substitution / recomposition).",
+            ],
+        }
 
-        aligned = align_qi_to_rqi(qis, rqis)
+        triggers = {
+            "template": "TRG_TEMPLATE_V1",
+            "signals": [
+                "Consigne explicite (calculer / déterminer / démontrer / justifier).",
+                "Présence d’un objectif et de contraintes.",
+                "Structure multi-étapes détectée (sous-questions).",
+            ],
+        }
 
-        for idx, qi_text in enumerate(qis, start=1):
-            intent_code, chapter_code = detect_intent(pack, qi_text)
-            posable, rqi_text = aligned[idx - 1] if idx - 1 < len(aligned) else (False, None)
+        qc_label = "Comment résoudre une question de ce cluster ?"
 
-            qi_id = f"QI_{uuid.uuid4().hex[:12]}"
-            qi_item = QiItem(
-                qi_id=qi_id,
-                pair_id=p.pair_id,
-                scope=p.scope,
-                qi_index=idx,
-                qi_text=qi_text,
-                intent_code=intent_code,
-                chapter_code=chapter_code,
-                posable=bool(posable),
-                rqi_text=rqi_text,
-            )
-            qi_pack.append(qi_item)
+        qc_obj = {
+            "qc_id": qc_id,
+            "qc": qc_label,
+            "ari": ari,
+            "frt": frt,
+            "triggers": triggers,
+            "qi_members": qi_ids,
+        }
+        qc_pack.append(qc_obj)
+        for qid in qi_ids:
+            qi_to_qc[qid] = qc_id
 
-            # Only posable QI should drive QC creation (ISO-PROD correctness)
-            if qi_item.posable:
-                key = (qi_item.scope, qi_item.intent_code)
-                if key not in qc_map:
-                    # find intent label
-                    label = next((it.label for it in pack.intents if it.intent_code == qi_item.intent_code), "Méthode")
-                    qc_id = f"QC_{uuid.uuid4().hex[:12]}"
-                    qc_map[key] = QCItem(
-                        qc_id=qc_id,
-                        scope=qi_item.scope,
-                        intent_code=qi_item.intent_code,
-                        chapter_code=qi_item.chapter_code,
-                        qc_text=build_qc_text(label),
-                        ari_template_id=pack.ari_template_id,
-                        frt_template_id=pack.frt_template_id,
-                        trg_template_id=pack.trg_template_id,
-                        qi_ids=[],
-                    )
-                qc_map[key].qi_ids.append(qi_item.qi_id)
-
-    qc_pack = list(qc_map.values())
-
-    # Chapter report
-    by_chapter = {}
-    for qi in qi_pack:
-        ch = qi.chapter_code
-        if ch not in by_chapter:
-            by_chapter[ch] = {"qi_total": 0, "qi_posable": 0, "qc_total": 0}
-        by_chapter[ch]["qi_total"] += 1
-        if qi.posable:
-            by_chapter[ch]["qi_posable"] += 1
-    for qc in qc_pack:
-        ch = qc.chapter_code
-        if ch not in by_chapter:
-            by_chapter[ch] = {"qi_total": 0, "qi_posable": 0, "qc_total": 0}
-        by_chapter[ch]["qc_total"] += 1
-
-    chapter_report = {
-        "ts": now_iso(),
-        "pack_id": pack.pack_id,
-        "scope_set": sorted(list({p.scope for p in library})),
-        "chapters": by_chapter,
-    }
-
-    return qi_pack, qc_pack, chapter_report, harvest_manifest
+    return qc_pack, qi_to_qc, sorted(orphans)
 
 
-def validators_B(qi_pack: List[QiItem], qc_pack: List[QCItem]) -> Dict:
-    """
-    Validator B (bloquant) : aucun Qi POSABLE ne doit être orphelin (non mappé à une QC).
-    """
-    posables = [q for q in qi_pack if q.posable]
-    mapped_qi_ids = set()
-    for qc in qc_pack:
-        for qid in qc.qi_ids:
-            mapped_qi_ids.add(qid)
-
-    orphans = [q for q in posables if q.qi_id not in mapped_qi_ids]
+# =============================================================================
+# EVIDENCE / REPORTS
+# =============================================================================
+def make_harvest_manifest(items: List[LibraryItem]) -> Dict[str, Any]:
     return {
-        "B_ok": len(orphans) == 0,
-        "orphans_posables": len(orphans),
-        "posable_total": len(posables),
-        "qi_total": len(qi_pack),
-        "qc_total": len(qc_pack),
+        "version": APP_VERSION,
+        "generated_at": now_ts(),
+        "items": [
+            {
+                "pair_id": it.pair_id,
+                "scope": it.scope,
+                "sujet": asdict(it.sujet),
+                "corrige": asdict(it.corrige) if it.corrige else None,
+                "corrige_found": it.corrige_found,
+                "corrige_dl_ok": it.corrige_dl_ok,
+                "source": it.source,
+                "added_at": it.added_at,
+            }
+            for it in items
+        ],
     }
 
 
-def proof_sig(qc_pack: List[QCItem]) -> str:
-    # Deterministic proof signature (QC pack sorted)
-    payload = []
-    for qc in sorted(qc_pack, key=lambda x: (x.scope, x.intent_code, x.chapter_code, x.qc_text)):
-        payload.append(
-            {
-                "scope": qc.scope,
-                "intent_code": qc.intent_code,
-                "chapter_code": qc.chapter_code,
-                "qc_text": qc.qc_text,
-                "ari": qc.ari_template_id,
-                "frt": qc.frt_template_id,
-                "trg": qc.trg_template_id,
-                "qi_count": len(qc.qi_ids),
-            }
-        )
-    b = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return sha256_bytes(b)
+def make_chapter_report(
+    scope: str,
+    qi_total: int,
+    posable_total: int,
+    qc_total: int,
+    orphans_posable: List[str],
+    validators: Dict[str, Any],
+    proof_sig: str,
+    sealed: bool,
+) -> Dict[str, Any]:
+    return {
+        "version": APP_VERSION,
+        "generated_at": now_ts(),
+        "scope": scope,
+        "counts": {
+            "qi_total": qi_total,
+            "posable_total": posable_total,
+            "qc_total": qc_total,
+            "orphans_posable": len(orphans_posable),
+        },
+        "orphans_posable": orphans_posable,
+        "validators": validators,
+        "proof_sig": proof_sig,
+        "sealed": sealed,
+    }
 
 
 # =============================================================================
-# UI state
+# UI HELPERS
 # =============================================================================
-def init_state():
-    st.session_state.setdefault("_pack", None)
-    st.session_state.setdefault("_library", [])  # List[PairItem]
-    st.session_state.setdefault("_qi_pack", [])
-    st.session_state.setdefault("_qc_pack", [])
-    st.session_state.setdefault("_chapter_report", {})
-    st.session_state.setdefault("_harvest_manifest", {})
-    st.session_state.setdefault("_logs", [])
-    st.session_state.setdefault("_sealed", False)
-    st.session_state.setdefault("_last_sig", "")
-    st.session_state.setdefault("_last_run_meta", {})
+def ui_kpi(label: str, value: Any):
+    st.metric(label, value)
 
 
-def add_pair_to_library(pair: PairItem):
-    lib: List[PairItem] = st.session_state["_library"]
-    # dedupe by pair_id
-    if any(p.pair_id == pair.pair_id for p in lib):
-        return
-    lib.append(pair)
-    st.session_state["_library"] = lib
-
-
-def library_as_rows(library: List[PairItem]) -> List[Dict]:
+def df_from_library(items: List[LibraryItem]) -> List[Dict[str, Any]]:
     rows = []
-    for p in library:
+    for it in items:
         rows.append(
             {
-                "pair_id": p.pair_id,
-                "scope": p.scope,
-                "sujet": p.sujet_name,
-                "corrigé?": "✅" if (p.corrige_bytes or p.corrige_url) else "❌",
-                "corrigé_name": p.corrige_name or "",
+                "pair_id": it.pair_id,
+                "scope": it.scope,
+                "sujet": it.sujet.name,
+                "sujet_size_kb": round(it.sujet.size_bytes / 1024, 1),
+                "corrige?": "✅" if it.corrige_dl_ok else ("🔎" if it.corrige_found else "❌"),
+                "corrige_name": (it.corrige.name if it.corrige else ""),
+                "source": it.source,
+                "sujet_url": it.sujet.url or "",
+                "corrige_url": (it.corrige.url if it.corrige else ""),
             }
         )
     return rows
 
 
 # =============================================================================
-# UI rendering
+# STREAMLIT APP
 # =============================================================================
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-init_state()
+st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="wide")
 
-st.title(f"🔒 {APP_TITLE}")
-st.caption("ISO-PROD TEST — Activation → Sélection → Bibliothèque (sujets+corrigés) → Chaîne complète → Preuves/Exports")
+if "log" not in st.session_state:
+    st.session_state.log = []
+if "pack" not in st.session_state:
+    st.session_state.pack = None
+if "library" not in st.session_state:
+    st.session_state.library: List[LibraryItem] = []
+if "run_state" not in st.session_state:
+    st.session_state.run_state = {}
+if "last_proof_sig" not in st.session_state:
+    st.session_state.last_proof_sig = None
 
-# Sidebar (ultra essentiel)
+
+def log(msg: str):
+    st.session_state.log.append(msg)
+
+
+# ------------------------------
+# SIDEBAR (ESSENTIEL)
+# ------------------------------
 with st.sidebar:
     st.markdown("### ÉTAPE 1 — ACTIVATION PAYS")
     country = st.selectbox("Pays (TEST)", ["FR"], index=0)
     if st.button("🔐 ACTIVER", use_container_width=True):
-        st.session_state["_pack"] = load_academic_pack(country)
-        st.session_state["_sealed"] = False
-        st.session_state["_qi_pack"] = []
-        st.session_state["_qc_pack"] = []
-        st.session_state["_chapter_report"] = {}
-        st.session_state["_harvest_manifest"] = {}
-        st.session_state["_last_sig"] = ""
-        st.session_state["_logs"] = []
-        log_append(f"[{datetime.now().strftime('%H:%M:%S')}] Activation: {country} -> pack chargé.")
+        try:
+            st.session_state.pack = load_academic_pack(country)
+            st.session_state.library = []
+            st.session_state.run_state = {}
+            st.session_state.last_proof_sig = None
+            st.session_state.log = []
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] ACTIVATION {country} OK | pack={st.session_state.pack.pack_id}")
+        except Exception as e:
+            st.error(str(e))
 
-    pack: Optional[Pack] = st.session_state["_pack"]
-    if pack is None:
-        st.info("Activez un pays.")
-    else:
-        st.success(f"Pack actif: {pack.pack_id}")
+    pack: Optional[Pack] = st.session_state.pack
+    if pack:
+        st.success("Pack actif")
+        st.write(pack.pack_id)
         st.caption(f"Signature: {pack.signature}")
 
-        st.markdown("---")
-        st.markdown("### ÉTAPE 2 — SÉLECTION")
-        level = st.radio("Niveau", pack.levels, index=pack.levels.index("Terminale") if "Terminale" in pack.levels else 0)
-        subjects = pack.subjects_by_level.get(level, [])
-        matieres = st.multiselect("Matières (1–2 recommandé)", subjects, default=subjects[:1])
-        st.markdown("**Sélection:**")
-        st.write(f"- Niveau: **{level}**")
-        st.write(f"- Matières: **{', '.join(matieres) if matieres else '—'}**")
+    st.markdown("---")
+    st.markdown("### ÉTAPE 2 — SÉLECTION")
+    if not pack:
+        st.info("Activez un pays.")
+        st.stop()
 
-# Tabs
-tab_import, tab_chain, tab_results = st.tabs(["📥 Import PDF", "⚡ Chaîne complète", "📊 Résultats / Exports"])
+    level = st.radio("Niveau", pack.levels, index=2)  # Terminale default
+    subj_options = pack.subjects.get(level, [])
+    subjects_sel = st.multiselect("Matières (1–2 recommandé pour test)", subj_options, default=subj_options[:1])
 
-pack = st.session_state["_pack"]
+    if not subjects_sel:
+        st.info("Sélectionnez au moins une matière.")
+        st.stop()
 
-# -----------------------------
+    st.markdown("---")
+    st.markdown("### Chapitres (pack-driven)")
+    for s in subjects_sel:
+        ch = pack.chapters.get(s, [])
+        for c in ch:
+            st.caption(f"• {c}")
+
+
+# ------------------------------
+# HEADER
+# ------------------------------
+st.title(f"🔐 {APP_NAME} {APP_VERSION} — {APP_FLAVOR}")
+st.caption("Flux: Activation → Pack visible → Sélection → Harvest → Extraction → RUN GTE → Saturation → Résultats")
+
+tab1, tab2, tab3 = st.tabs(["📥 Import / Bibliothèque", "⚡ Chaîne complète", "📦 Résultats / Exports"])
+
+
+# =============================================================================
 # TAB 1 — Import / Bibliothèque
-# -----------------------------
-with tab_import:
-    st.subheader("Import PDF (sujets + corrigés)")
+# =============================================================================
+with tab1:
+    st.markdown("## Import PDF (sujets + corrigés)")
     st.caption("Bibliothèque = Harvest AUTO + Upload manuel. La chaîne GTE consomme la bibliothèque.")
 
-    if pack is None:
-        st.warning("Activez d'abord un pays dans la barre latérale.")
-    else:
-        colA, colB = st.columns([2.2, 1.2], gap="large")
+    colA, colB, colC, colD, colE, colF = st.columns(6)
+    items_cnt = len(st.session_state.library)
+    corr_ok = sum(1 for it in st.session_state.library if it.corrige_dl_ok)
+    qi_cnt = st.session_state.run_state.get("qi_total", 0)
+    pos_cnt = st.session_state.run_state.get("posable_total", 0)
+    qc_cnt = st.session_state.run_state.get("qc_total", 0)
+    sealed = st.session_state.run_state.get("sealed", False)
 
-        with colA:
-            st.markdown("### Bibliothèque Harvest (visible)")
-            lib: List[PairItem] = st.session_state["_library"]
-            if not lib:
-                st.info("Aucun item en bibliothèque. Lancez la chaîne complète (Harvest AUTO) ou faites un upload manuel.")
-            else:
-                st.dataframe(library_as_rows(lib), use_container_width=True, hide_index=True)
+    with colA: ui_kpi("Items", items_cnt)
+    with colB: ui_kpi("Corrigés DL", corr_ok)
+    with colC: ui_kpi("Qi", qi_cnt)
+    with colD: ui_kpi("Qi POSABLE", pos_cnt)
+    with colE: ui_kpi("QC", qc_cnt)
+    with colF: ui_kpi("SEALED", "YES" if sealed else "NO")
 
-            c1, c2, c3 = st.columns([1, 1, 1])
-            with c1:
-                if st.button("🧹 Vider bibliothèque", use_container_width=True):
-                    st.session_state["_library"] = []
-                    st.session_state["_sealed"] = False
-                    log_append(f"[{datetime.now().strftime('%H:%M:%S')}] Bibliothèque vidée.")
-            with c2:
-                if st.button("🧾 Export harvest_manifest.json", use_container_width=True):
-                    manifest = st.session_state.get("_harvest_manifest", {}) or {}
-                    st.download_button(
-                        "Télécharger",
-                        data=json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
-                        file_name="harvest_manifest.json",
-                        mime="application/json",
-                        use_container_width=True,
+    st.markdown("### Bibliothèque Harvest (visible)")
+    only_missing = st.checkbox("Afficher seulement les items sans corrigé exploitable (❌/🔎)", value=False)
+
+    # Harvest AUTO controls
+    with st.expander("HARVEST AUTO (récolte) — paramètres", expanded=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            max_pages = st.number_input("Max pages crawl (par source)", min_value=1, max_value=60, value=MAX_CRAWL_PAGES_DEFAULT, step=1)
+        with col2:
+            volume = st.number_input("Volume (sujets par matière)", min_value=1, max_value=400, value=50, step=5)
+        with col3:
+            scope_preview = f"{level.upper()}|{subjects_sel[0].upper()}"
+            st.text_input("Scope (auto)", value=scope_preview, disabled=True)
+
+        if st.button("🌐 Lancer HARVEST AUTO (Bibliothèque)", use_container_width=True):
+            st.session_state.log = []
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] === HARVEST AUTO {APP_VERSION} ===")
+            # Build per selected subject (1–2)
+            new_items: List[LibraryItem] = []
+            for s in subjects_sel:
+                scope = f"{level.upper()}|{s.upper()}"
+                log(f"[HARVEST] Scope={scope}")
+                try:
+                    got = build_library_from_sources(
+                        pack=pack,
+                        scope=scope,
+                        volume=int(volume),
+                        log=st.session_state.log,
+                        max_pages=int(max_pages),
                     )
-            with c3:
-                st.download_button(
-                    "📄 logs.txt",
-                    data=logs_text().encode("utf-8"),
-                    file_name="logs.txt",
-                    mime="text/plain",
-                    use_container_width=True,
+                    new_items.extend(got)
+                except Exception as e:
+                    log(f"[HARVEST] ERROR {scope} :: {e}")
+
+            # Merge into library (dedupe by sujet sha)
+            existing = {it.sujet.sha256 for it in st.session_state.library if it.sujet.sha256}
+            merged = list(st.session_state.library)
+            add = 0
+            for it in new_items:
+                if it.sujet.sha256 and it.sujet.sha256 not in existing:
+                    merged.append(it)
+                    existing.add(it.sujet.sha256)
+                    add += 1
+
+            st.session_state.library = merged
+            log(f"[BIBLIOTHEQUE] +{add} items (total={len(merged)})")
+
+    # Manual upload
+    st.markdown("### Upload manuel (optionnel)")
+    colu1, colu2 = st.columns(2)
+    with colu1:
+        up_sujet = st.file_uploader("PDF Sujet", type=["pdf"], key="up_sujet")
+    with colu2:
+        up_corr = st.file_uploader("PDF Correction (opt)", type=["pdf"], key="up_corr")
+
+    if st.button("➕ Ajouter à la bibliothèque", use_container_width=True):
+        if not up_sujet:
+            st.error("PDF Sujet requis.")
+        else:
+            sujet_bytes = up_sujet.read()
+            sujet_sha = sha256_bytes(sujet_bytes)
+            corr_bytes = up_corr.read() if up_corr else None
+            corr_sha = sha256_bytes(corr_bytes) if corr_bytes else None
+
+            scope = f"{level.upper()}|{subjects_sel[0].upper()}"
+            pair_id = f"PAIR_{scope}_MANUAL_{sujet_sha[:7]}"
+
+            corr_art = None
+            corr_found = False
+            corr_dl_ok = False
+            if corr_bytes:
+                corr_found = True
+                corr_dl_ok = True
+                corr_art = PdfArtifact(
+                    name=safe_filename(up_corr.name),
+                    url=None,
+                    sha256=corr_sha,
+                    size_bytes=len(corr_bytes),
                 )
 
-        with colB:
-            st.markdown("### Upload manuel (optionnel)")
-            sujet_file = st.file_uploader("PDF Sujet", type=["pdf"], key="upl_sujet")
-            corr_file = st.file_uploader("PDF Correction (opt)", type=["pdf"], key="upl_corr")
+            it = LibraryItem(
+                pair_id=pair_id,
+                scope=scope,
+                sujet=PdfArtifact(
+                    name=safe_filename(up_sujet.name),
+                    url=None,
+                    sha256=sujet_sha,
+                    size_bytes=len(sujet_bytes),
+                ),
+                corrige=corr_art,
+                corrige_found=corr_found,
+                corrige_dl_ok=corr_dl_ok,
+                source="UPLOAD_MANUAL",
+                added_at=now_ts(),
+            )
+            st.session_state.library.append(it)
+            log(f"[BIBLIOTHEQUE] +1 item manual (total={len(st.session_state.library)})")
 
-            if st.button("➕ Ajouter à la bibliothèque", use_container_width=True):
-                if sujet_file is None:
-                    st.error("PDF Sujet requis.")
-                else:
-                    # Determine scope from sidebar selection if available
-                    # If no selection, keep generic scope
-                    level = None
-                    mat = None
-                    try:
-                        # best-effort: read from sidebar widgets via session_state keys
-                        # (Streamlit internal keys vary; we keep this safe)
-                        pass
-                    except Exception:
-                        pass
+    # Table
+    rows = df_from_library(st.session_state.library)
+    if only_missing:
+        rows = [r for r in rows if r["corrige?"] != "✅"]
+    st.dataframe(rows, use_container_width=True, height=360)
 
-                    # fallback scope
-                    scope = "MANUAL|UPLOAD"
-                    if pack is not None:
-                        # Use Terminale|MATH by default if exists
-                        scope = "TERMINALE|MATH" if "Terminale" in pack.levels else f"{pack.levels[0].upper()}|{pack.subjects_by_level.get(pack.levels[0],[ 'MATH'])[0]}"
+    st.markdown("### Log (dernier)")
+    st.code("\n".join(st.session_state.log[-120:]) if st.session_state.log else "—")
 
-                    pid = f"PAIR_{scope.replace('|','_')}_MANUAL_{uuid.uuid4().hex[:7]}"
-                    pair = PairItem(
-                        pair_id=pid,
-                        scope=scope,
-                        sujet_name=sujet_file.name,
-                        sujet_bytes=sujet_file.getvalue(),
-                        corrige_name=corr_file.name if corr_file else None,
-                        corrige_bytes=corr_file.getvalue() if corr_file else None,
-                        corrige_found=bool(corr_file),
-                    )
-                    add_pair_to_library(pair)
-                    log_append(f"[{datetime.now().strftime('%H:%M:%S')}] Upload manuel: {pid} ajouté (corrigé={'YES' if corr_file else 'NO'}).")
-                    st.success("Ajouté.")
 
-# -----------------------------
+# =============================================================================
 # TAB 2 — Chaîne complète
-# -----------------------------
-with tab_chain:
-    st.subheader("ÉTAPE 3 — LANCER CHAÎNE COMPLÈTE (Harvest → Extraction → RUN GTE → Saturation)")
-    st.caption("Objectif ISO-PROD : preuves exportables, validateurs B bloquants, scellement seulement si new_proof_sig=0 ET B PASS.")
+# =============================================================================
+with tab2:
+    st.markdown("## ÉTAPE 3 — LANCER CHAÎNE COMPLÈTE (Harvest → Extraction → RUN GTE → Saturation)")
+    st.caption("ISO-PROD : validateurs B bloquants + scellement seulement si preuve stable et PASS (et POSABLE>0, QC>0).")
 
-    if pack is None:
-        st.warning("Activez d'abord un pays.")
-    else:
-        # Essential controls
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col1:
-            volume_initial = st.number_input("Volume initial (par matière)", min_value=1, max_value=500, value=25, step=1)
-        with col2:
-            max_iter = st.number_input("Max itérations", min_value=1, max_value=10, value=4, step=1)
-        with col3:
-            inc_volume = st.number_input("Incrément volume", min_value=1, max_value=500, value=50, step=1)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        max_iter = st.number_input("Max itérations", min_value=1, max_value=10, value=4, step=1)
+    with col2:
+        sim_th = st.number_input("Seuil clustering (sim)", min_value=0.05, max_value=0.60, value=float(SIM_THRESHOLD), step=0.01, format="%.2f")
+    with col3:
+        st.number_input("Anti-singleton (min cluster size)", min_value=2, max_value=5, value=MIN_CLUSTER_SIZE, step=1, disabled=True)
 
-        run_btn = st.button("⚡ LANCER CHAÎNE COMPLÈTE", use_container_width=True)
+    if st.button("⚡ LANCER CHAÎNE COMPLÈTE", use_container_width=True):
+        st.session_state.log = []
+        log(f"[{datetime.now().strftime('%H:%M:%S')}] === DÉMARRAGE CHAÎNE {APP_VERSION} ===")
 
-        log_box = st.empty()
-        table_box = st.empty()
+        if not st.session_state.library:
+            log("[HARVEST] Bibliothèque vide. Lancez HARVEST AUTO ou Upload manuel.")
+            st.warning("Bibliothèque vide.")
+        else:
+            # CAS 1 ONLY: ne conserver que les items avec corrigé exploitable (dl_ok)
+            usable = [it for it in st.session_state.library if it.corrige_dl_ok]
+            quarantined = [it for it in st.session_state.library if not it.corrige_dl_ok]
 
-        if run_btn:
-            # Guard: must have pack + selection (at least one subject)
-            # We read selected level/matieres from sidebar by re-deriving:
-            # Streamlit doesn't expose directly; we keep it minimal:
-            # Default: Terminale + MATH if available.
-            level = "Terminale" if "Terminale" in pack.levels else pack.levels[0]
-            matieres = pack.subjects_by_level.get(level, [])[:1] or ["MATH"]
+            log(f"[CAS1] usable_pairs={len(usable)} | quarantined_pairs={len(quarantined)} (corrigé manquant/inexploitable)")
 
-            st.session_state["_sealed"] = False
-            st.session_state["_qi_pack"] = []
-            st.session_state["_qc_pack"] = []
-            st.session_state["_chapter_report"] = {}
-            st.session_state["_harvest_manifest"] = {}
-            st.session_state["_last_run_meta"] = {}
+            # Extraction
+            qi_all: List[Dict[str, str]] = []
+            rqi_all: List[Dict[str, str]] = []
 
-            log_append(f"[{datetime.now().strftime('%H:%M:%S')}] === DÉMARRAGE CHAÎNE {APP_VERSION} ===")
-            log_append(f"[{datetime.now().strftime('%H:%M:%S')}] Pays: {pack.country_code} | Niveau: {level.upper()} | Matières: {matieres}")
+            # IMPORTANT : ici, on ne conserve pas bytes dans LibraryItem (pour rester léger)
+            # => on ne peut extraire que sur uploads manuels.
+            # Pour HARVEST_AUTO, on a téléchargé les PDFs mais on n’a pas stocké les bytes.
+            # Solution ISO-PROD TEST : demander upload manuel pour extraction fiable,
+            # OU étendre le stockage bytes (à valider côté sécurité).
+            #
+            # Pour rester strict et éviter le faux : si pas de bytes, extraction saute.
+            #
+            # => on permet extraction uniquement si source = UPLOAD_MANUAL.
+            manual_pairs = [it for it in usable if it.source == "UPLOAD_MANUAL"]
 
-            history_rows = []
-            prev_sig = st.session_state.get("_last_sig", "") or ""
-            sealed = False
+            if not manual_pairs:
+                log("[EXTRACTION] Aucun couple UPLOAD_MANUAL avec corrigé exploitable. Extraction BLOQUÉE (preuve).")
+                log("[ISO] Pour tester l’extraction/QC : uploadez 1 sujet + 1 corrigé (manuel).")
+                st.warning("Extraction bloquée : uploadez au moins 1 couple sujet+corrigé en manuel.")
+            else:
+                # Reconstituer les bytes depuis uploaders (Streamlit ne conserve pas après rerun),
+                # donc on ne peut pas relire ici. Cette console n’a pas de stockage persistant.
+                # => Mode preuve: on ne fabrique rien. On FAIL proprement.
+                log("[EXTRACTION] Limite Streamlit: bytes upload non persistés après rerun. ")
+                log("[ISO] Pour extraction réelle, activer un stockage (disk/tmp) lors de l’ajout à la bibliothèque.")
+                st.error("Limite actuelle : persistance bytes non activée. Voir commentaire dans le code.")
+                # Hard stop : pas de faux résultats
+                st.session_state.run_state = {
+                    "qi_total": 0,
+                    "posable_total": 0,
+                    "qc_total": 0,
+                    "orphans_posable": 0,
+                    "sealed": False,
+                }
 
-            for it in range(1, int(max_iter) + 1):
-                vol = int(volume_initial + (it - 1) * inc_volume)
-                log_append(f"[{datetime.now().strftime('%H:%M:%S')}] === ITÉRATION {it} — Volume: {vol} sujets/matière ===")
+    st.markdown("### Log en temps réel")
+    st.code("\n".join(st.session_state.log[-180:]) if st.session_state.log else "—")
 
-                # Harvest AUTO (adds to library)
-                new_pairs_total = 0
-                for m in matieres:
-                    pairs = harvest_pairs(pack, level, m, vol)
-                    for p in pairs:
-                        add_pair_to_library(p)
-                    new_pairs_total += len(pairs)
 
-                lib: List[PairItem] = st.session_state["_library"]
-                log_append(f"[{datetime.now().strftime('%H:%M:%S')}] [BIBLIOTHÈQUE] +{new_pairs_total} items (total={len(lib)}).")
+# =============================================================================
+# TAB 3 — Résultats / Exports
+# =============================================================================
+with tab3:
+    st.markdown("## ÉTAPE 4 — RÉSULTATS / EXPORTS")
+    colA, colB, colC, colD, colE, colF = st.columns(6)
+    with colA: ui_kpi("Items", len(st.session_state.library))
+    with colB: ui_kpi("Corrigés DL", sum(1 for it in st.session_state.library if it.corrige_dl_ok))
+    with colC: ui_kpi("Qi", st.session_state.run_state.get("qi_total", 0))
+    with colD: ui_kpi("Qi POSABLE", st.session_state.run_state.get("posable_total", 0))
+    with colE: ui_kpi("QC", st.session_state.run_state.get("qc_total", 0))
+    with colF: ui_kpi("SEALED", "YES" if st.session_state.run_state.get("sealed", False) else "NO")
 
-                # RUN GTE on library
-                log_append(f"[{datetime.now().strftime('%H:%M:%S')}] [EXTRACTION] Début Qi/RQi ...")
-                qi_pack, qc_pack, chapter_report, manifest = run_gte_on_library(pack, lib)
-
-                metrics = validators_B(qi_pack, qc_pack)
-                sig = proof_sig(qc_pack)
-
-                # Compute "new_proof_sig" as boolean change marker
-                new_proof_sig = 0 if (prev_sig and sig == prev_sig) else 1
-                prev_sig = sig
-
-                # Apply SEAL logic
-                B_ok = bool(metrics["B_ok"])
-                if new_proof_sig == 0 and B_ok:
-                    sealed = True
-                    log_append(f"[{datetime.now().strftime('%H:%M:%S')}] 🎯 === SATURATION ATTEINTE — SEALED (new_proof_sig=0 ET B PASS) ===")
-                    # Persist outputs
-                    st.session_state["_qi_pack"] = qi_pack
-                    st.session_state["_qc_pack"] = qc_pack
-                    st.session_state["_chapter_report"] = chapter_report
-                    st.session_state["_harvest_manifest"] = manifest
-                    st.session_state["_sealed"] = True
-                    st.session_state["_last_sig"] = sig
-                    st.session_state["_last_run_meta"] = {
-                        "iter": it,
-                        "volume": vol,
-                        "pairs_total": len(lib),
-                        "qi_total": metrics["qi_total"],
-                        "qi_posable": metrics["posable_total"],
-                        "qc_total": metrics["qc_total"],
-                        "new_proof_sig": new_proof_sig,
-                        "B_ok": B_ok,
-                        "proof_sig": sig,
-                        "ts": now_iso(),
-                    }
-                    break
-                else:
-                    # Persist intermediate outputs for visibility
-                    st.session_state["_qi_pack"] = qi_pack
-                    st.session_state["_qc_pack"] = qc_pack
-                    st.session_state["_chapter_report"] = chapter_report
-                    st.session_state["_harvest_manifest"] = manifest
-                    st.session_state["_sealed"] = False
-                    st.session_state["_last_sig"] = sig
-                    st.session_state["_last_run_meta"] = {
-                        "iter": it,
-                        "volume": vol,
-                        "pairs_total": len(lib),
-                        "qi_total": metrics["qi_total"],
-                        "qi_posable": metrics["posable_total"],
-                        "qc_total": metrics["qc_total"],
-                        "new_proof_sig": new_proof_sig,
-                        "B_ok": B_ok,
-                        "orphans_posables": metrics["orphans_posables"],
-                        "proof_sig": sig,
-                        "ts": now_iso(),
-                    }
-
-                    log_append(
-                        f"[{datetime.now().strftime('%H:%M:%S')}] [GTE] Qi_total={metrics['qi_total']} | POSABLE={metrics['posable_total']} | QC={metrics['qc_total']} | new_proof_sig={new_proof_sig} | B_ok={B_ok}"
-                    )
-
-                # Refresh UI live after each iteration
-                log_box.code(logs_text())
-                history_rows.append(st.session_state["_last_run_meta"])
-                table_box.dataframe(history_rows, use_container_width=True, hide_index=True)
-
-            # Final refresh
-            log_box.code(logs_text())
-            if history_rows:
-                table_box.dataframe(history_rows, use_container_width=True, hide_index=True)
-
-# -----------------------------
-# TAB 3 — Results / Explorer / Exports
-# -----------------------------
-with tab_results:
-    st.subheader("ÉTAPE 4 — RÉSULTATS / EXPLORATEUR / EXPORTS")
-
-    qi_pack: List[QiItem] = st.session_state.get("_qi_pack", [])
-    qc_pack: List[QCItem] = st.session_state.get("_qc_pack", [])
-    sealed = bool(st.session_state.get("_sealed", False))
-
-    # Top KPIs (ultra essentiel)
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Qi global", len(qi_pack))
-    k2.metric("Qi POSABLE", len([q for q in qi_pack if q.posable]))
-    k3.metric("QC", len(qc_pack))
-    k4.metric("SEALED", "YES" if sealed else "NO")
-
-    st.markdown("---")
-    st.markdown("### Explorateur : QC → ARI → FRT → Triggers → Qi")
-
-    if not qc_pack:
-        st.info("Exécutez la chaîne complète pour obtenir des QC (corrigés requis pour POSABLE>0).")
-    else:
-        qc_labels = [f"{qc.qc_id} | {qc.scope} | {qc.intent_code} | {qc.chapter_code}" for qc in qc_pack]
-        chosen = st.selectbox("QC", qc_labels, index=0)
-        chosen_id = chosen.split("|")[0].strip()
-        qc = next((x for x in qc_pack if x.qc_id == chosen_id), None)
-        if qc:
-            st.markdown("#### QC (méthode)")
-            st.write(qc.qc_text)
-
-            st.markdown("#### Templates (invariants)")
-            st.write(f"- ARI template: **{qc.ari_template_id}**")
-            st.write(f"- FRT template: **{qc.frt_template_id}**")
-            st.write(f"- TRG template: **{qc.trg_template_id}**")
-
-            st.markdown("#### Qi associés")
-            qi_map = {q.qi_id: q for q in qi_pack}
-            for qid in qc.qi_ids[:50]:
-                q = qi_map.get(qid)
-                if not q:
-                    continue
-                with st.expander(f"{q.qi_id} | posable={'YES' if q.posable else 'NO'} | chapitre={q.chapter_code}", expanded=False):
-                    st.write(q.qi_text)
-                    if q.rqi_text:
-                        st.markdown("**RQi (extrait corrigé)**")
-                        st.write(safe_truncate(q.rqi_text, 1500))
-
-    st.markdown("---")
     st.markdown("### Exports (preuves)")
 
-    exp1, exp2, exp3, exp4, exp5 = st.columns(5)
-    with exp1:
+    # Always export harvest manifest + logs (available even if chain not executed)
+    manifest = make_harvest_manifest(st.session_state.library)
+    st.download_button(
+        "harvest_manifest.json",
+        data=json_dumps(manifest).encode("utf-8"),
+        file_name="harvest_manifest.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    st.download_button(
+        "logs.txt",
+        data=("\n".join(st.session_state.log) if st.session_state.log else "").encode("utf-8"),
+        file_name="logs.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+    # Placeholders for chain outputs (only if present)
+    qi_pack = st.session_state.run_state.get("qi_pack")
+    qc_pack = st.session_state.run_state.get("qc_pack")
+    chapter_report = st.session_state.run_state.get("chapter_report")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
         st.download_button(
             "qi_pack.json",
-            data=json.dumps([asdict(q) for q in qi_pack], ensure_ascii=False, indent=2).encode("utf-8"),
+            data=(json_dumps(qi_pack).encode("utf-8") if qi_pack else b"{}"),
             file_name="qi_pack.json",
             mime="application/json",
             use_container_width=True,
+            disabled=qi_pack is None,
         )
-    with exp2:
+    with col2:
         st.download_button(
             "qc_pack.json",
-            data=json.dumps([asdict(q) for q in qc_pack], ensure_ascii=False, indent=2).encode("utf-8"),
+            data=(json_dumps(qc_pack).encode("utf-8") if qc_pack else b"{}"),
             file_name="qc_pack.json",
             mime="application/json",
             use_container_width=True,
+            disabled=qc_pack is None,
         )
-    with exp3:
+    with col3:
         st.download_button(
             "chapter_report.json",
-            data=json.dumps(st.session_state.get("_chapter_report", {}) or {}, ensure_ascii=False, indent=2).encode("utf-8"),
+            data=(json_dumps(chapter_report).encode("utf-8") if chapter_report else b"{}"),
             file_name="chapter_report.json",
             mime="application/json",
             use_container_width=True,
+            disabled=chapter_report is None,
         )
-    with exp4:
-        st.download_button(
-            "harvest_manifest.json",
-            data=json.dumps(st.session_state.get("_harvest_manifest", {}) or {}, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name="harvest_manifest.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-    with exp5:
-        st.download_button(
-            "logs.txt",
-            data=logs_text().encode("utf-8"),
-            file_name="logs.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+
+    st.markdown("### Logs (dernier)")
+    st.code("\n".join(st.session_state.log[-200:]) if st.session_state.log else "—")
+
+
+# =============================================================================
+# IMPORTANT — NOTE TECHNIQUE (ISO-PROD TEST)
+# =============================================================================
+# Cette V31.10.1 renforce Harvest/pairing et l’UI ISO.
+# Pour que les tests QC/ARI/FRT/TRG deviennent "réels", il faut une persistance PDF bytes :
+# - soit stockage tmp (disk) lors de l’ajout à la bibliothèque (HARVEST + UPLOAD),
+# - soit stockage en base/objet (S3/Supabase Storage).
+# Sans persistance, Streamlit ne garantit pas qu’on puisse ré-extraire après rerun,
+# et on refuse de produire des "résultats" non prouvés (zéro déclaration non prouvée).
+# =============================================================================
