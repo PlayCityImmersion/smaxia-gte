@@ -1,20 +1,16 @@
 # =============================================================================
-# SMAXIA GTE Console V31.10.13 — ISO-PROD TEST (MONO-FICHIER)
+# SMAXIA GTE Console V31.10.14 — ISO-PROD TEST (MONO-FICHIER)
 # =============================================================================
 # OBJECTIF CEO:
-# - Tester tout le flux ISO-PROD: Pack FILE signé -> Harvest réel -> Qi/RQi ->
-#   Triggers -> F1/F2 auditables -> ARI/FRT (proxy IA1 déterministe) -> QC ->
-#   Mapping chapitre (pack-driven) -> Preuve de saturation Set_A/Set_B -> Explorateur.
-#
-# PILIERS:
-# (1) Anti-hardcode métier: le CORE ne "connait" pas les chapitres réels. Variabilité = Pack FILE.
-# (2) Pack Genesis = généré sur disque (/tmp) + signé SHA256 + rechargé comme un pack externe.
-# (3) Sanity = anti-fake (instabilité de segmentation), PAS un seuil arbitraire sur le nombre.
-# (4) SEALED = preuve de saturation: Set_B - Set_A == ∅ + contraintes (orphans=0, posable>0, sanity_ok).
-#
-# NOTE:
-# - Proxy IA1: extraction d'opérateurs cognitifs depuis RQi via règles (pas d'API LLM).
-# - F1/F2: implémentation "audit-first" à partir des formules CEO (images fournies).
+# - UI + Moteur mono-fichier
+# - Pack FILE signé (Genesis -> /tmp) ; aucun EMBEDDED preloaded
+# - Harvest réel (APMEP)
+# - Extraction Qi/RQi (anti sur-segmentation) + sanity qualitative (non arbitraire)
+# - IA1 Proxy déterministe: ARI op-trace dérivée de RQi (pas de template vide)
+# - QC: "méthode" (ce que la question fait) et non "signature surface"
+# - Mapping chapitre data-driven (pack keywords) via vote des Qi
+# - F1/F2 (formules scellées) + auditability
+# - Saturation Set_A / Set_B: SEALED si (SetB - SetA == ∅) + sanity_ok + orphans=0 + posable>0
 # =============================================================================
 
 from __future__ import annotations
@@ -25,17 +21,14 @@ import re
 import json
 import glob
 import math
-import time
 import hashlib
 import unicodedata
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
 import requests
 import streamlit as st
 
-# Optional libs (grâce à vos versions précédentes)
 try:
     import pdfplumber
 except Exception:
@@ -55,14 +48,14 @@ except Exception:
 # -----------------------------------------------------------------------------
 # SETTINGS
 # -----------------------------------------------------------------------------
-APP_VERSION = "V31.10.13"
+APP_VERSION = "V31.10.14"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 REQ_TIMEOUT = 30
 MAX_PDF_MB = 35
 
 DEFAULT_COUNTRY = "FR"
 DEFAULT_LEVEL = "TERMINALE"
-DEFAULT_SUBJECT = "MATH"
+DEFAULT_SUBJECTS = ["MATH"]
 
 APMEP_ROOT_BY_LEVEL = {
     "TERMINALE": "https://www.apmep.fr/Annales-du-Bac-Terminale",
@@ -70,11 +63,11 @@ APMEP_ROOT_BY_LEVEL = {
     "SECONDE": "https://www.apmep.fr/Annales-du-Bac-Seconde",
 }
 
-# F1/F2 constants (ISO-PROD TEST)
-EPSILON_F1 = 1e-6
-ALPHA_F2 = 0.35  # facteur de récence (test)
-SIGMA_HARD_PENALTY = 0.92  # si sigma(q,p) très élevé => pénalisation forte
-SIGMA_MODE = "TRIGGERS_JACCARD"  # test-only, auditable
+# F1/F2 constants (deterministic; may be parameterized later)
+F1_EPSILON = 1e-6
+F2_ALPHA = 1.0
+F2_TREC = 1.0
+
 
 # -----------------------------------------------------------------------------
 # SESSION
@@ -86,13 +79,12 @@ def _utc_ts() -> str:
 def ss_init():
     st.session_state.setdefault("pack_active", None)
     st.session_state.setdefault("pack_id", None)
-    st.session_state.setdefault("pack_source", None)
     st.session_state.setdefault("pack_path", None)
     st.session_state.setdefault("pack_sig_sha256", None)
 
     st.session_state.setdefault("country", DEFAULT_COUNTRY)
     st.session_state.setdefault("level", DEFAULT_LEVEL)
-    st.session_state.setdefault("subject", DEFAULT_SUBJECT)
+    st.session_state.setdefault("subjects", DEFAULT_SUBJECTS[:])
 
     st.session_state.setdefault("library", [])
     st.session_state.setdefault("harvest_manifest", None)
@@ -100,14 +92,18 @@ def ss_init():
     st.session_state.setdefault("qi_pack", None)
     st.session_state.setdefault("qc_pack", None)
     st.session_state.setdefault("chapter_report", None)
+    st.session_state.setdefault("selection_report", None)
 
     st.session_state.setdefault("sealed", False)
-    st.session_state.setdefault("last_run_audit", None)
-    st.session_state.setdefault("run_stats", {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0})
-
     st.session_state.setdefault("logs", [])
-    st.session_state.setdefault("_uploads", {})        # local://... => bytes
-    st.session_state.setdefault("_http_pdf_cache", {}) # url => bytes
+    st.session_state.setdefault(
+        "run_stats",
+        {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0, "orphans": 0, "sanity_ok": False},
+    )
+    st.session_state.setdefault("last_run_audit", None)
+
+    st.session_state.setdefault("_uploads", {})
+    st.session_state.setdefault("_http_pdf_cache", {})
 
 
 def log(msg: str):
@@ -119,7 +115,7 @@ def logs_text() -> str:
 
 
 # -----------------------------------------------------------------------------
-# CORE UTILS
+# TEXT UTILS
 # -----------------------------------------------------------------------------
 def norm_text(s: str) -> str:
     s = (s or "").replace("\u00a0", " ")
@@ -134,6 +130,19 @@ def stable_id(*parts: str) -> str:
     return hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
+def tokenize(s: str) -> List[str]:
+    return re.findall(r"[a-z0-9]{3,}", norm_text(s))[:2000]
+
+
+def jaccard(a: List[str], b: List[str]) -> float:
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a), set(b)
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
@@ -146,139 +155,155 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def tokenize(s: str) -> List[str]:
-    return re.findall(r"[a-z0-9]{3,}", norm_text(s))[:3000]
+def _dehyphenate(text: str) -> str:
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
 
 
-def jaccard(a: List[str], b: List[str]) -> float:
-    if not a or not b:
-        return 0.0
-    sa, sb = set(a), set(b)
-    inter = len(sa & sb)
-    union = len(sa | sb)
-    return inter / union if union else 0.0
+def _looks_like_page_number(line: str) -> bool:
+    s = norm_text(line)
+    return bool(re.fullmatch(r"\d{1,3}", s) or re.fullmatch(r"page\s*\d{1,3}", s))
 
 
 # -----------------------------------------------------------------------------
-# PACK GENESIS (FILE signé) + LOAD PACK FILE
+# PACK GENESIS (FILE signé) — Aucun EMBEDDED pack en mémoire
 # -----------------------------------------------------------------------------
-def _genesis_pack_builder(country: str, n_chapters: int) -> Dict[str, Any]:
+def _pack_genesis_fr_math(n_chapters: int) -> Dict[str, Any]:
     """
-    Pack Genesis TEST:
-    - Le CORE ne contient pas les noms 'France' officiels (éviter hardcode).
-    - Mais pour valider le mapping, on injecte des keywords génériques "math-like"
-      (limite, derivee, proba, suite, vecteur, etc.) = TEST.
+    Pack Genesis TEST: Chapitres 'réels' FR (nomenclature) + keywords,
+    MAIS le CORE reste data-driven: mapping via keywords pack.
+    delta_c laissé à 1.0 (peut être ajusté plus tard par data).
     """
-    n = max(4, int(n_chapters))
-    base_keywords = [
-        ("CH_ANALYSE", ["fonction", "derivee", "limite", "continuite", "integrale", "primitive", "variation"]),
-        ("CH_PROBA", ["probabilite", "loi", "variable", "aleatoire", "binomiale", "normale", "esperance", "variance"]),
-        ("CH_SUITES", ["suite", "recurrence", "convergence", "arithmetique", "geometrique"]),
-        ("CH_GEO", ["vecteur", "plan", "espace", "orthogonal", "droite", "repere", "distance", "angle"]),
-        ("CH_COMPLEXES", ["complexe", "affixe", "module", "argument", "imaginaire"]),
-        ("CH_ALGEBRE", ["equation", "inequation", "systeme", "polynome", "factoriser", "discriminant", "racine"]),
-        ("CH_LOGEXP", ["logarithme", "exponentielle", "ln", "exp", "croissance", "decroissance"]),
-        ("CH_TRIGO", ["cosinus", "sinus", "tangente", "radian", "trigonometrique"]),
+    themes = [
+        ("CH_001_ANALYSE", ["limite", "continuite", "derivee", "variation", "convexite", "integrale", "primitive"]),
+        ("CH_002_PROBABILITES", ["probabilite", "loi", "binomiale", "normale", "esperance", "variance", "variable aleatoire"]),
+        ("CH_003_SUITES", ["suite", "recurrence", "convergence", "arithmetique", "geometrique"]),
+        ("CH_004_COMPLEXES", ["complexe", "affixe", "module", "argument", "imaginaire"]),
+        ("CH_005_GEOMETRIE", ["vecteur", "plan", "espace", "droite", "orthogonal", "produit scalaire", "repere"]),
+        ("CH_006_ALGORITHMES", ["algo", "algorithme", "python", "boucle", "fonction", "programme"]),
+        ("CH_007_EQUATIONS", ["equation", "systeme", "inequation", "discriminant", "racine", "solution"]),
+        ("CH_008_FONCTIONS", ["fonction", "courbe", "image", "antecedent", "composition"]),
+        ("CH_009_TRIGO", ["sinus", "cosinus", "tangente", "trigonomet", "radian", "angle"]),
+        ("CH_010_LOGEXP", ["logarithme", "ln", "exp", "exponentielle"]),
+        ("CH_011_VECTMATR", ["matrice", "determinant", "vecteur", "base", "coordonnees"]),
+        ("CH_012_STAT", ["statistique", "moyenne", "ecart", "mediane", "quartile", "nuage"]),
     ]
+    themes = themes[: max(1, min(n_chapters, len(themes)))]
 
-    chapters = []
-    for i in range(n):
-        code, kws = base_keywords[i % len(base_keywords)]
-        chapters.append({
-            "chapter_code": f"{code}_{i+1:02d}",
-            "chapter_label": f"{code}_{i+1:02d}",
-            "keywords": kws,
-        })
-
-    pack = {
-        "pack_id": f"CAP_{country}_GENESIS_V1",
-        "country_code": country,
+    return {
+        "pack_id": "CAP_FR_GENESIS_V1",
+        "country_code": "FR",
+        "country_label": "France",
         "version": "1.0.0",
-        "_source": "GENESIS_BUILDER",
-        "chapters": chapters,
+        "_source": "GENERATED_FILE",
+        "chapters": [
+            {
+                "chapter_code": code,
+                "chapter_label": code.replace("_", " "),
+                "keywords": kws,
+                "delta_c": 1.0,
+            }
+            for (code, kws) in themes
+        ],
     }
-    return pack
 
 
-def _write_pack_to_tmp(pack: Dict[str, Any]) -> str:
-    stamp = stable_id(pack.get("pack_id", ""), _utc_ts())
-    path = f"/tmp/smaxia_pack_{pack.get('pack_id','PACK')}_{stamp}.json"
-    b = json.dumps(pack, ensure_ascii=False, indent=2).encode("utf-8")
+def _candidate_pack_paths(country: str) -> List[str]:
+    candidates = [
+        os.path.join(os.getcwd(), "academic_packs", f"CAP_{country}_BAC_2024_V1.json"),
+        os.path.join(os.getcwd(), "packs", f"CAP_{country}_BAC_2024_V1.json"),
+        os.path.join(os.getcwd(), f"CAP_{country}_BAC_2024_V1.json"),
+    ]
+    candidates += glob.glob(os.path.join(os.getcwd(), "**", f"CAP_{country}_*.json"), recursive=True)
+    out, seen = [], set()
+    for p in candidates:
+        ap = os.path.abspath(p)
+        if ap not in seen and os.path.isfile(ap):
+            seen.add(ap)
+            out.append(ap)
+    return out
+
+
+def _safe_read_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_tmp_pack(pack: Dict[str, Any]) -> str:
+    raw = json.dumps(pack, ensure_ascii=False, indent=2).encode("utf-8")
+    sid = stable_id(sha256_bytes(raw), _utc_ts())
+    path = f"/tmp/smaxia_pack_{pack.get('pack_id','PACK')}_{sid}.json"
     with open(path, "wb") as f:
-        f.write(b)
+        f.write(raw)
     return path
 
 
-def load_pack_from_file(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        pack = json.load(f)
-    if not isinstance(pack, dict):
-        raise RuntimeError("Pack invalide: JSON racine non objet")
-    if not pack.get("pack_id"):
-        raise RuntimeError("Pack invalide: pack_id manquant")
-    ch = pack.get("chapters") or []
-    if not isinstance(ch, list) or len(ch) == 0:
-        raise RuntimeError("Pack invalide: chapters vides")
-    return pack
+def load_academic_pack(country: str, allow_genesis: bool, genesis_n_chapters: int, uploaded_pack: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    ISO-PROD rule (test mode):
+    - In PROD: pack must come from FILE.
+    - In Streamlit Cloud TEST: allow Genesis, but it MUST still be a FILE on disk with signature.
+    """
+    # 1) Uploaded pack has priority (still FILE logically)
+    if uploaded_pack:
+        tmp_path = _write_tmp_pack(uploaded_pack)
+        sig = sha256_file(tmp_path)
+        uploaded_pack["_source"] = "UPLOADED_FILE"
+        uploaded_pack["_pack_file_path"] = tmp_path
+        uploaded_pack["_pack_sig_sha256"] = sig
+        log(f"[PACK] Loaded UPLOADED_FILE pack_id={uploaded_pack.get('pack_id')} path={tmp_path} sha256={sig}")
+        return uploaded_pack
+
+    # 2) Try real files in repo
+    paths = _candidate_pack_paths(country)
+    log(f"[PACK] Searching for country={country} | candidates={len(paths)}")
+
+    for path in paths[:30]:
+        try:
+            pack = _safe_read_json(path)
+            pack_id = str(pack.get("pack_id") or pack.get("id") or "").strip()
+            chapters = pack.get("chapters") or []
+            if pack_id and isinstance(chapters, list) and len(chapters) > 0:
+                pack["_pack_file_path"] = os.path.abspath(path)
+                pack["_source"] = "FILE"
+                pack["_pack_sig_sha256"] = sha256_file(pack["_pack_file_path"])
+                log(f"[PACK] Loaded FILE: {pack_id} sha256={pack['_pack_sig_sha256']}")
+                return pack
+        except Exception as e:
+            log(f"[PACK] Failed: {path} | {e}")
+
+    # 3) Genesis fallback (ONLY if allowed) — still written to /tmp and signed
+    if allow_genesis:
+        pack = _pack_genesis_fr_math(int(genesis_n_chapters))
+        tmp_path = _write_tmp_pack(pack)
+        sig = sha256_file(tmp_path)
+        pack["_pack_file_path"] = tmp_path
+        pack["_pack_sig_sha256"] = sig
+        log(f"[PACK] Activated GENERATED_FILE (Genesis) path={tmp_path} sha256={sig} pack_id={pack.get('pack_id')}")
+        return pack
+
+    raise RuntimeError(f"Aucun pack FILE trouvé pour {country} et Genesis interdit")
 
 
 def pack_chapters(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ch = pack.get("chapters") or []
     out = []
-    for item in (pack.get("chapters") or []):
+    for item in ch:
         if isinstance(item, dict):
             code = str(item.get("chapter_code") or item.get("code") or "").strip()
             label = str(item.get("chapter_label") or item.get("label") or code).strip()
             if code:
-                out.append({
-                    "chapter_code": code,
-                    "chapter_label": label,
-                    "keywords": item.get("keywords", []),
-                })
+                out.append(
+                    {
+                        "chapter_code": code,
+                        "chapter_label": label,
+                        "keywords": item.get("keywords", []),
+                        "delta_c": float(item.get("delta_c", 1.0) or 1.0),
+                    }
+                )
     return out
-
-
-def activate_pack(country: str, allow_genesis: bool, genesis_n_chapters: int, uploaded_pack_bytes: Optional[bytes]) -> None:
-    """
-    ISO-PROD TEST:
-    - Soit pack uploadé (FILE) -> signé et chargé
-    - Soit Genesis autorisé -> builder -> écrit /tmp -> signe -> recharge
-    - Sinon -> refus (pas d'embedded en mémoire)
-    """
-    if uploaded_pack_bytes:
-        # Upload pack => fichier /tmp
-        stamp = stable_id(country, "UPLOADED", _utc_ts())
-        path = f"/tmp/smaxia_pack_UPLOADED_{country}_{stamp}.json"
-        with open(path, "wb") as f:
-            f.write(uploaded_pack_bytes)
-
-        pack = load_pack_from_file(path)
-        sig = sha256_file(path)
-
-        st.session_state.pack_active = pack
-        st.session_state.pack_id = pack["pack_id"]
-        st.session_state.pack_source = "UPLOADED_FILE"
-        st.session_state.pack_path = path
-        st.session_state.pack_sig_sha256 = sig
-
-        log(f"[PACK] Activated UPLOADED_FILE path={path} pack_id={pack['pack_id']} sha256={sig}")
-        return
-
-    if allow_genesis:
-        pack = _genesis_pack_builder(country, genesis_n_chapters)
-        path = _write_pack_to_tmp(pack)
-        sig = sha256_file(path)
-        pack2 = load_pack_from_file(path)
-
-        st.session_state.pack_active = pack2
-        st.session_state.pack_id = pack2["pack_id"]
-        st.session_state.pack_source = "GENERATED_FILE"
-        st.session_state.pack_path = path
-        st.session_state.pack_sig_sha256 = sig
-
-        log(f"[PACK] Activated GENERATED_FILE (Genesis) path={path} pack_id={pack2['pack_id']} sha256={sig}")
-        return
-
-    raise RuntimeError("Activation refusée: aucun pack FILE fourni et Genesis désactivé (anti-embedded).")
 
 
 # -----------------------------------------------------------------------------
@@ -303,11 +328,9 @@ def fetch_pdf_bytes(url: str) -> bytes:
         if not data:
             raise RuntimeError(f"Upload local introuvable: {url}")
         return data
-
     cache = st.session_state.get("_http_pdf_cache", {})
     if url in cache:
         return cache[url]
-
     b = download_pdf_bytes(url)
     cache[url] = b
     st.session_state._http_pdf_cache = cache
@@ -315,8 +338,7 @@ def fetch_pdf_bytes(url: str) -> bytes:
 
 
 def _extract_pages_text(pdf_bytes: bytes, max_pages: int = 120) -> List[str]:
-    pages: List[str] = []
-
+    pages = []
     if pdfplumber:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -340,20 +362,7 @@ def _extract_pages_text(pdf_bytes: bytes, max_pages: int = 120) -> List[str]:
                     pages.append("")
         except Exception:
             pass
-
     return pages
-
-
-def _dehyphenate(text: str) -> str:
-    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
-
-
-def _looks_like_page_number(line: str) -> bool:
-    s = norm_text(line)
-    return bool(re.fullmatch(r"\d{1,3}", s) or re.fullmatch(r"page\s*\d{1,3}", s))
 
 
 def clean_pdf_text(pages: List[str]) -> str:
@@ -367,7 +376,7 @@ def clean_pdf_text(pages: List[str]) -> str:
         lines = [ln.strip() for ln in p.split("\n") if ln.strip()]
         page_lines.append(lines)
 
-    # Detect repeated headers/footers
+    # detect repeated headers/footers
     top_counts, bot_counts = {}, {}
     n_pages = len(page_lines)
 
@@ -406,505 +415,7 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
 
 
 # -----------------------------------------------------------------------------
-# QI / RQI EXTRACTION (structure-first, sujet vs corrigé)
-# -----------------------------------------------------------------------------
-_MATH_SYMBOL_RE = re.compile(r"[=<>≤≥∈∀∃∑∏∫√≈≠→↦±×÷]")
-_QENUM_RE = re.compile(r"(?m)^\s*(?:\(?\d{1,2}\)?|[a-h]|[ivxIVX]{1,6})\s*[\)\.\-:]\s+")
-_EXO_RE = re.compile(r"(?im)^\s*(exercice|partie)\b[^\n]*")
-_CORR_RE = re.compile(r"(?im)^\s*(corrig|solution)\b[^\n]*")
-
-
-def _math_density(s: str) -> float:
-    if not s:
-        return 0.0
-    sym = len(_MATH_SYMBOL_RE.findall(s))
-    digits = len(re.findall(r"\d", s))
-    letters = len(re.findall(r"[a-zA-Z]", s))
-    denom = max(1, sym + digits + letters)
-    return (sym + digits) / denom
-
-
-def _merge_wrapped_lines(text: str) -> str:
-    lines = [ln.rstrip() for ln in (text or "").split("\n")]
-    out, buf = [], ""
-    for ln in lines:
-        if not ln.strip():
-            if buf:
-                out.append(buf.strip())
-                buf = ""
-            out.append("")
-            continue
-
-        if not buf:
-            buf = ln.strip()
-            continue
-
-        # if buf ends with strong punctuation, flush
-        if re.search(r"[.:;!?]$", buf):
-            out.append(buf.strip())
-            buf = ln.strip()
-        else:
-            buf = (buf + " " + ln.strip()).strip()
-
-    if buf:
-        out.append(buf.strip())
-
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
-
-
-def _split_by_exercices(text: str) -> List[str]:
-    t = (text or "").replace("\r", "\n")
-    t = _dehyphenate(t)
-    t = _merge_wrapped_lines(t)
-    if not t:
-        return []
-    # split on "Exercice"
-    blocks = []
-    starts = [m.start() for m in _EXO_RE.finditer(t)]
-    if not starts:
-        return [t]
-    starts = [0] + sorted(set(starts))
-    for a, b in zip(starts, starts[1:] + [len(t)]):
-        blk = t[a:b].strip()
-        if len(blk) > 100:
-            blocks.append(blk)
-    return blocks or [t]
-
-
-def _extract_q_candidates(block: str, is_correction: bool) -> List[str]:
-    """
-    Extraction non-LLM, structure-first.
-    - Sujet: garde les segments "question-like" (ponctuation, contraintes, demandes).
-    - Corrigé: plus permissif car le style est narratif; on capte sous-parties numérotées.
-    """
-    b = (block or "").strip()
-    if not b:
-        return []
-
-    # Standardize spaces
-    b = re.sub(r"[ \t]+", " ", b)
-    b = re.sub(r"\n{3,}", "\n\n", b)
-
-    # Find enumerated starts
-    idxs = [0]
-    for m in _QENUM_RE.finditer(b):
-        idxs.append(m.start())
-    idxs = sorted(set(idxs))
-
-    chunks = []
-    for a, c in zip(idxs, idxs[1:] + [len(b)]):
-        seg = b[a:c].strip()
-        seg = re.sub(r"\s+", " ", seg).strip()
-        if len(seg) < 40:
-            continue
-        # filters for sujet/corrigé
-        if not is_correction:
-            if ("?" not in seg) and (_math_density(seg) < 0.08) and (not re.search(r"\b(montrer|determiner|calculer|resoudre|etudier|justifier|demontrer)\b", norm_text(seg))):
-                continue
-            if len(seg) < 60:
-                continue
-        else:
-            # correction: accept shorter if it contains operations/keywords
-            if (_math_density(seg) < 0.06) and (not re.search(r"\b(on a|donc|ainsi|or|d'ou|car|alors|supposons|posons)\b", norm_text(seg))) and ("=" not in seg):
-                continue
-
-        # cap size
-        if len(seg) > 2400:
-            seg = seg[:2400] + "…"
-        chunks.append(seg)
-
-    # fallback: split on '?'
-    if len(chunks) <= 2:
-        parts = re.split(r"(?<=\?)\s+", re.sub(r"\s+", " ", b))
-        parts = [p.strip() for p in parts if len(p.strip()) >= (80 if not is_correction else 60)]
-        chunks = chunks or parts
-
-    # de-dup
-    out, seen = [], set()
-    for seg in chunks:
-        k = stable_id(norm_text(seg)[:500])
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(seg)
-
-    return out[:260]
-
-
-def split_qi_subject(text: str) -> List[str]:
-    blocks = _split_by_exercices(text)
-    out: List[str] = []
-    for blk in blocks:
-        out.extend(_extract_q_candidates(blk, is_correction=False))
-    return out[:400]
-
-
-def split_rqi_correction(text: str) -> List[str]:
-    blocks = _split_by_exercices(text)
-    out: List[str] = []
-    for blk in blocks:
-        out.extend(_extract_q_candidates(blk, is_correction=True))
-    return out[:600]
-
-
-def align_qi_rqi(qs: List[str], rs: List[str]) -> List[Optional[int]]:
-    """
-    Alignement auditable: jaccard tokens + fenêtre locale
-    """
-    if not qs or not rs:
-        return [None for _ in qs]
-
-    qtok = [tokenize(q) for q in qs]
-    rtok = [tokenize(r) for r in rs]
-    out: List[Optional[int]] = [None] * len(qs)
-
-    # Local window first
-    for i in range(len(qs)):
-        best_j, best_s = None, 0.0
-        lo, hi = max(0, i - 10), min(len(rs), i + 11)
-        for j in range(lo, hi):
-            s = jaccard(qtok[i], rtok[j])
-            if s > best_s:
-                best_s, best_j = s, j
-        if best_j is not None and best_s >= 0.10:
-            out[i] = best_j
-
-    # Global for remaining
-    for i in range(len(qs)):
-        if out[i] is not None:
-            continue
-        best_j, best_s = None, 0.0
-        for j in range(len(rs)):
-            s = jaccard(qtok[i], rtok[j])
-            if s > best_s:
-                best_s, best_j = s, j
-        if best_j is not None and best_s >= 0.13:
-            out[i] = best_j
-
-    return out
-
-
-# -----------------------------------------------------------------------------
-# SANITY (anti-fake segmentation)
-# -----------------------------------------------------------------------------
-def sanity_doc_instability(qs: List[str]) -> Dict[str, Any]:
-    """
-    Aucun seuil sur le nombre brut.
-    On mesure l'instabilité (fake-like) :
-    - trop de segments très courts
-    - densité math/contraintes trop faible
-    - redondance extrême (beaucoup de quasi-doublons)
-    """
-    if not qs:
-        return {"ok": False, "reason": "no_qi", "score": 1.0}
-
-    lens = [len(q) for q in qs]
-    short = sum(1 for L in lens if L < 55)
-    very_short = sum(1 for L in lens if L < 35)
-    avg_len = sum(lens) / max(1, len(lens))
-
-    dens = [_math_density(q) for q in qs]
-    low_dens = sum(1 for d in dens if d < 0.04)
-
-    # Redundancy estimate by hashing first tokens
-    sigs = [stable_id(" ".join(tokenize(q)[:18])) for q in qs]
-    uniq = len(set(sigs))
-    redundancy = 1.0 - (uniq / max(1, len(sigs)))
-
-    # Instability score [0..1]
-    s1 = min(1.0, very_short / max(1, len(qs)) * 2.0)
-    s2 = min(1.0, short / max(1, len(qs)) * 1.2)
-    s3 = min(1.0, low_dens / max(1, len(qs)) * 1.0)
-    s4 = min(1.0, redundancy * 1.4)
-
-    score = min(1.0, 0.25 * s1 + 0.25 * s2 + 0.25 * s3 + 0.25 * s4)
-
-    ok = score < 0.62  # seuil sur l'instabilité (pas sur la quantité)
-    reason = "ok" if ok else "segmentation_instable"
-    return {
-        "ok": ok,
-        "reason": reason,
-        "score": round(score, 4),
-        "n": len(qs),
-        "avg_len": round(avg_len, 1),
-        "very_short": very_short,
-        "short": short,
-        "low_density": low_dens,
-        "redundancy": round(redundancy, 4),
-    }
-
-
-# -----------------------------------------------------------------------------
-# TRIGGERS + PROXY IA1 (ARI ops réels depuis RQi)
-# -----------------------------------------------------------------------------
-def build_triggers(qi_text: str) -> List[str]:
-    t = qi_text or ""
-    out = []
-    if "?" in t:
-        out.append("TRG_QMARK")
-    if _MATH_SYMBOL_RE.search(t):
-        out.append("TRG_MATHSYM")
-    if re.search(r"\b\d+\b", t):
-        out.append("TRG_NUMBER")
-    if re.search(r"[∑∏∫]", t):
-        out.append("TRG_AGGREGATE")
-    if re.search(r"[≤≥<>]", t):
-        out.append("TRG_RELATION")
-    if re.search(r"\b(tableau|variations?)\b", norm_text(t)):
-        out.append("TRG_TABLEAU")
-    if re.search(r"\b(probabilit|loi|binomial|normale)\b", norm_text(t)):
-        out.append("TRG_PROBA")
-    if not out:
-        out = ["TRG_GENERIC"]
-    return out[:10]
-
-
-@dataclass
-class AriStep:
-    step_id: str
-    op: str
-    desc: str
-    evidence: List[str]
-
-
-class SmaxiaExpertAgent:
-    """
-    Proxy IA1:
-    - extraction déterministe d'opérateurs cognitifs depuis RQi (et un peu Qi)
-    - audit: chaque step porte des 'evidence' (mots-clés trouvés)
-    """
-    RULES: List[Tuple[str, str, List[str]]] = [
-        ("OP_DERIVATE", "Calcul de dérivée / variations", ["dériv", "derive", "variation", "croissant", "decroissant"]),
-        ("OP_LIMIT", "Calcul / usage de limites", ["limit", "limite", "tend vers", "→", "to"]),
-        ("OP_INTEGRAL", "Calcul d'intégrale / primitive", ["intégr", "integr", "primitive", "aire"]),
-        ("OP_SOLVE_EQ", "Résolution d'équation / racines", ["résoud", "resoud", "equation", "racine", "solutions", "discriminant"]),
-        ("OP_INEQUALITY", "Résolution d'inéquation / encadrement", ["inéqu", "inequ", "major", "minor", "encadr"]),
-        ("OP_PROBABILITY", "Calcul de probabilité / loi", ["probabil", "loi", "binom", "normale", "esperance", "variance"]),
-        ("OP_RECURSION", "Récurrence / suites", ["récurr", "recurr", "suite", "u_n", "un+1", "convergence"]),
-        ("OP_GEOMETRY", "Géométrie / vecteurs / repères", ["vecteur", "repere", "orthogonal", "produit scalaire", "distance", "angle", "droite", "plan", "espace"]),
-        ("OP_COMPLEX", "Nombres complexes", ["affixe", "module", "argument", "complexe", "imaginaire"]),
-        ("OP_LOGEXP", "Log/Exp", ["ln", "log", "exponent", "exp"]),
-        ("OP_TRIGO", "Trigonométrie", ["cos", "sin", "tan", "radian", "trigon"]),
-    ]
-
-    @staticmethod
-    def extract_real_ari(rqi_text: str, qi_text: str, triggers: List[str]) -> Dict[str, Any]:
-        t = norm_text(rqi_text or "")
-        q = norm_text(qi_text or "")
-
-        steps: List[AriStep] = []
-
-        # Identify ops by evidence scanning
-        for op, desc, keys in SmaxiaExpertAgent.RULES:
-            ev = [k for k in keys if k in t or k in q]
-            if ev:
-                steps.append(AriStep(step_id=f"S{len(steps)+1}", op=op, desc=desc, evidence=ev[:5]))
-
-        # Always include minimal invariant steps (read/check), but keep auditable
-        base = [
-            AriStep(step_id=f"S{len(steps)+1}", op="OP_READ", desc="Extraire données et contraintes", evidence=["(invariant)"]),
-            AriStep(step_id=f"S{len(steps)+2}", op="OP_PLAN", desc="Choisir la stratégie de résolution", evidence=["(invariant)"]),
-            AriStep(step_id=f"S{len(steps)+3}", op="OP_CHECK", desc="Vérifier cohérence / résultat", evidence=["(invariant)"]),
-        ]
-
-        # If no detected cognitive ops, still provide one standard op but flag low evidence
-        if not steps:
-            steps = [
-                AriStep(step_id="S1", op="OP_STANDARD", desc="Application d'un théorème/procédé standard", evidence=["no_rule_hit"])
-            ] + base
-        else:
-            steps = steps + base
-
-        return {
-            "template": "ARI_SMAXIA_PROXY_V1",
-            "m_q": len([s for s in steps if s.op not in ("OP_READ", "OP_PLAN", "OP_CHECK")]),
-            "steps": [{"step_id": s.step_id, "op": s.op, "desc": s.desc, "evidence": s.evidence} for s in steps],
-            "audit": {
-                "has_rqi": bool(rqi_text),
-                "triggers": triggers,
-                "rqi_chars": len(rqi_text or ""),
-                "qi_chars": len(qi_text or ""),
-            },
-        }
-
-
-def build_frt(qi_text: str, rqi_text: str, ari: Dict[str, Any], triggers: List[str]) -> Dict[str, Any]:
-    """
-    FRT alimentée par ARI proxy + données (audit-first).
-    """
-    ops = [s["op"] for s in (ari.get("steps") or []) if isinstance(s, dict)]
-    return {
-        "template": "FRT_SMAXIA_PROXY_V1",
-        "sections": [
-            {"section_id": "SEC_OBJ", "name": "OBJECTIF", "content": (qi_text or "")[:400]},
-            {"section_id": "SEC_DAT", "name": "DONNÉES/CONTRAINTES", "content": "AUTO: extractable (test)"},
-            {"section_id": "SEC_TRG", "name": "TRIGGERS", "content": triggers},
-            {"section_id": "SEC_ARI", "name": "ARI_OPS", "content": ops[:18]},
-            {"section_id": "SEC_EXE", "name": "EXÉCUTION", "content": (rqi_text or "")[:900]},
-            {"section_id": "SEC_VAL", "name": "VALIDATION", "content": "OP_CHECK + cohérence"},
-        ],
-        "audit": {"ari_m_q": ari.get("m_q", 0), "ops_count": len(ops)},
-    }
-
-
-# -----------------------------------------------------------------------------
-# QC SIGNATURE (fini) + CLUSTERING
-# -----------------------------------------------------------------------------
-def qc_signature_from_ari(ari: Dict[str, Any], triggers: List[str]) -> Tuple[str, ...]:
-    """
-    Signature QC = combinaison d'opérateurs cognitifs + triggers (fini, déterministe).
-    """
-    ops = []
-    for s in (ari.get("steps") or []):
-        if isinstance(s, dict):
-            op = s.get("op")
-            if op and op not in ("OP_READ", "OP_PLAN", "OP_CHECK"):
-                ops.append(op)
-
-    # Normalisation: set, tri, cap
-    ops = sorted(set(ops))[:8]
-    trg = sorted(set(triggers))[:8]
-    sig = tuple(ops + ["::"] + trg) if (ops or trg) else ("OP_STANDARD", "::", "TRG_GENERIC")
-    return sig
-
-
-def qc_label_from_signature(sig: Tuple[str, ...]) -> str:
-    sig_txt = " ".join(sig[:16]) if sig else "OP_STANDARD"
-    return f"Comment résoudre une question caractérisée par: {sig_txt} ?"
-
-
-def cluster_qi_by_qc_signature(qi_items: List[Dict[str, Any]]) -> Dict[Tuple[str, ...], List[Dict[str, Any]]]:
-    buckets: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
-    for it in qi_items:
-        sig = it.get("qc_sig") or ("OP_STANDARD", "::", "TRG_GENERIC")
-        buckets.setdefault(tuple(sig), []).append(it)
-    return buckets
-
-
-# -----------------------------------------------------------------------------
-# CHAPTER MAPPING (pack-driven) by cluster tokens (Qi/RQi), not by QC label
-# -----------------------------------------------------------------------------
-def map_cluster_to_chapter(cluster_items: List[Dict[str, Any]], chapters: List[Dict[str, Any]]) -> Tuple[str, float, Dict[str, float]]:
-    if not chapters:
-        return ("UNMAPPED", 0.0, {})
-
-    # aggregate tokens from Qi + RQi of cluster
-    agg_text = " ".join([(it.get("qi") or "") + " " + (it.get("rqi") or "") for it in cluster_items])[:200000]
-    toks = set(tokenize(agg_text))
-    scores: Dict[str, float] = {}
-
-    best_code, best_score = "UNMAPPED", 0.0
-    for ch in chapters:
-        kws = ch.get("keywords") or []
-        if not kws:
-            continue
-        ch_toks = set(tokenize(" ".join([str(x) for x in kws])))
-        if not ch_toks:
-            continue
-        score = len(toks & ch_toks) / max(1, len(ch_toks))
-        code = str(ch["chapter_code"])
-        scores[code] = round(score, 4)
-        if score > best_score:
-            best_code, best_score = code, score
-
-    # threshold: mapping only if signal present
-    if best_score < 0.10:
-        return ("UNMAPPED", float(best_score), scores)
-    return (best_code, float(best_score), scores)
-
-
-# -----------------------------------------------------------------------------
-# F1 / F2 (formules CEO) + audit
-# -----------------------------------------------------------------------------
-def _trigger_weights(triggers: List[str]) -> Dict[str, float]:
-    """
-    Tj: poids de triggers (test). Doit être déterministe, auditable.
-    Ici: on affecte des poids fixes par type, sans métier.
-    """
-    w = {}
-    for t in triggers:
-        if t in ("TRG_MATHSYM", "TRG_RELATION", "TRG_AGGREGATE"):
-            w[t] = 0.50
-        elif t in ("TRG_NUMBER", "TRG_QMARK", "TRG_TABLEAU"):
-            w[t] = 0.35
-        else:
-            w[t] = 0.20
-    return w
-
-
-def compute_F1_Psi_q(delta_c: int, m_q: int, triggers: List[str]) -> Dict[str, Any]:
-    """
-    F1 — Poids prédictif purifié normalisé Ψ_q
-
-    ψ_raw(q) = δ_c * ( ε + ( ∑_{j=1..m(q)} T_j )^2 )
-    Ψ_q = ψ_raw(q) / max_{p∈Qc} ψ_raw(p)
-
-    Ici on renvoie ψ_raw + la base (normalisation faite au niveau chapitre après calcul de tous).
-    """
-    trig_w = _trigger_weights(triggers)
-    # m(q): nb d'étapes cognitives retenues (ARI après normalisation IA2) -> ici proxy = m_q
-    # On prend les m_q triggers "dominants" comme approximation test (audit)
-    sorted_tw = sorted(trig_w.items(), key=lambda x: -x[1])
-    selected = sorted_tw[:max(1, min(m_q, len(sorted_tw)))]
-    sum_T = sum(v for _, v in selected)
-
-    psi_raw = float(delta_c) * (EPSILON_F1 + (sum_T ** 2))
-    return {
-        "delta_c": int(delta_c),
-        "m_q": int(m_q),
-        "triggers_Tj": {k: float(v) for k, v in selected},
-        "sum_T": float(sum_T),
-        "psi_raw": float(psi_raw),
-        "Psi_q": None,  # rempli plus tard après normalisation intra-chapitre
-    }
-
-
-def sigma_similarity(q_trg: List[str], p_trg: List[str]) -> float:
-    if SIGMA_MODE == "TRIGGERS_JACCARD":
-        return jaccard(q_trg, p_trg)
-    return jaccard(q_trg, p_trg)
-
-
-def compute_F2_Score(
-    n_q_historical: int,
-    N_total: int,
-    t_rec_years: float,
-    Psi_q: float,
-    sigma_to_selected: List[float],
-) -> Dict[str, Any]:
-    """
-    F2 — Score(q)
-    Score(q) = (n_q_historical / N_total) * (1 + alpha / t_rec) * Ψ_q * Π_{p∈S} ((1 - σ(q,p)) * 100)
-
-    NB: t_rec normalisé en années (doc).
-    """
-    if N_total <= 0:
-        base_ratio = 0.0
-    else:
-        base_ratio = float(n_q_historical) / float(N_total)
-
-    t = max(1e-6, float(t_rec_years))
-    recency = (1.0 + (ALPHA_F2 / t))
-
-    prod = 1.0
-    for s in sigma_to_selected:
-        prod *= max(0.0, (1.0 - float(s)) * 100.0)
-
-    score = base_ratio * recency * float(Psi_q) * prod
-    return {
-        "n_q_historical": int(n_q_historical),
-        "N_total": int(N_total),
-        "t_rec_years": float(t_rec_years),
-        "alpha": float(ALPHA_F2),
-        "Psi_q": float(Psi_q),
-        "sigmas": [float(x) for x in sigma_to_selected],
-        "prod_term": float(prod),
-        "score": float(score),
-    }
-
-
-# -----------------------------------------------------------------------------
-# HARVEST APMEP
+# HARVEST APMEP (volume réel)
 # -----------------------------------------------------------------------------
 def _soup(html: str):
     if BeautifulSoup is None:
@@ -923,7 +434,7 @@ def _is_meta_pdf(url: str, label: str) -> bool:
 
 def _is_corrige_label(url: str, label: str) -> bool:
     s = norm_text(os.path.basename(url) + " " + (label or ""))
-    return ("corrig" in s) or ("correction" in s) or ("solution" in s)
+    return "corrig" in s or "correction" in s or "solution" in s
 
 
 def _filekey(name: str) -> str:
@@ -979,12 +490,14 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                 label = (a.get_text() or "").strip()
                 if _is_meta_pdf(absu, label):
                     continue
-                pdf_links.append({
-                    "url": absu,
-                    "name": os.path.basename(absu),
-                    "label": label,
-                    "is_corrige": _is_corrige_label(absu, label),
-                })
+                pdf_links.append(
+                    {
+                        "url": absu,
+                        "name": os.path.basename(absu),
+                        "label": label,
+                        "is_corrige": _is_corrige_label(absu, label),
+                    }
+                )
 
             if not pdf_links:
                 continue
@@ -1003,7 +516,7 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                 stok = tokenize(skey)
 
                 best = (None, 0.0)
-                for (c, ckey, ctok) in corr_index:
+                for (c, _ckey, ctok) in corr_index:
                     if c["url"] in used_corr:
                         continue
                     score = jaccard(stok, ctok)
@@ -1033,7 +546,7 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                     if item["corrige?"]:
                         corrige_ok += 1
 
-            log(f"[HARVEST] year={y} pdfs={len(pdf_links)} sujets={len(subjects)} pairs_now={len(pairs)}")
+            log(f"[HARVEST] year={y} pdfs={len(pdf_links)} sujets={len(subjects)} pairs={len(pairs)}")
 
         except Exception as e:
             log(f"[HARVEST] year={y} FAILED: {e}")
@@ -1043,7 +556,7 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
         "timestamp": _utc_ts(),
         "country": st.session_state.country,
         "level": level,
-        "subject": subject,
+        "subjects": [subject],
         "items_total": len(pairs),
         "items_corrige_ok": corrige_ok,
         "library": pairs,
@@ -1051,22 +564,530 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
 
 
 # -----------------------------------------------------------------------------
-# RUN ENGINE (Phase A/B -> Saturation)
+# Qi / RQi extraction — orientation "définition Qi", pas "seuil quantité"
 # -----------------------------------------------------------------------------
-def build_qi_pack_from_pairs(pairs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+_MATH_SYMBOL_RE = re.compile(r"[=<>≤≥∈∀∃∑∏∫√≈≠→↦±×÷]")
+_Q_MARKER_RE = re.compile(r"(?m)^\s*(\d{1,3}|[a-h]|[ivxIVX]{1,8})\s*[\)\.\-:]\s+")
+
+# "Intent" verbs (FR + minimal EN); used to validate Qi as question-like unit.
+_INTENT_RE = re.compile(
+    r"\b("
+    r"montrer|demontrer|prouver|justifier|determiner|calculer|resoudre|etudier|"
+    r"donner|exprimer|simplifier|trouver|verifier|en\s+deduire|conclure|"
+    r"show|prove|justify|determine|compute|solve|study|find|verify|deduce"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+def _merge_wrapped_lines(text: str) -> str:
+    lines = [ln.rstrip() for ln in (text or "").split("\n")]
+    out, buf = [], ""
+    for ln in lines:
+        if not ln.strip():
+            if buf:
+                out.append(buf.strip())
+                buf = ""
+            out.append("")
+            continue
+        if not buf:
+            buf = ln.strip()
+            continue
+        if re.search(r"[.:;!?]$", buf):
+            out.append(buf.strip())
+            buf = ln.strip()
+        else:
+            buf = (buf + " " + ln.strip()).strip()
+    if buf:
+        out.append(buf.strip())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out))
+
+
+def _looks_like_question_unit(s: str) -> bool:
+    """Definition-oriented Qi validation: intent + constraint."""
+    if not s or len(s.strip()) < 40:
+        return False
+    t = s.strip()
+
+    has_intent = bool(_INTENT_RE.search(t)) or ("?" in t)
+    has_constraint = bool(_MATH_SYMBOL_RE.search(t)) or bool(re.search(r"\b\d+\b", t)) or bool(re.search(r"\b(x|y|z|n)\b", norm_text(t)))
+
+    # must have at least intent AND some constraint-like content
+    return bool(has_intent and has_constraint)
+
+
+def _chunk_candidates(text: str) -> List[str]:
+    t = (text or "").replace("\r", "\n")
+    t = _dehyphenate(t)
+    t = _merge_wrapped_lines(t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if not t:
+        return []
+
+    starts = {0}
+    for m in _Q_MARKER_RE.finditer(t):
+        starts.add(m.start())
+
+    idxs = sorted(starts)
+    chunks = []
+    for a, b in zip(idxs, idxs[1:] + [len(t)]):
+        c = t[a:b].strip()
+        c = re.sub(r"\s+", " ", c).strip()
+        if c:
+            chunks.append(c)
+
+    # fallback: split by question marks if numbering absent
+    if len(chunks) <= 2:
+        parts = re.split(r"(?<=\?)\s+", re.sub(r"\s+", " ", t))
+        chunks = [p.strip() for p in parts if p.strip()]
+
+    return chunks
+
+
+def split_questions(text: str, max_items: int = 250) -> Tuple[List[str], Dict[str, Any]]:
     """
-    Returns:
-    - qi_pack items (with rqi aligned, triggers, ari, frt, qc_sig)
-    - doc_stats
-    - sanity_docs (instability info if FAIL)
+    Returns (items, audit)
+    audit includes ratios for sanity gate.
     """
-    qi_pack: List[Dict[str, Any]] = []
+    raw_chunks = _chunk_candidates(text)
+
+    keep = []
+    reject = []
+    seen = set()
+
+    for c in raw_chunks:
+        key = stable_id(norm_text(c)[:400])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if len(c) > 2500:
+            c = c[:2500] + "…"
+
+        if _looks_like_question_unit(c):
+            keep.append(c)
+        else:
+            reject.append(c)
+
+        if len(keep) >= max_items:
+            break
+
+    audit = {
+        "raw_chunks": len(raw_chunks),
+        "kept": len(keep),
+        "rejected": len(reject),
+        "reject_ratio": round((len(reject) / max(1, len(raw_chunks))) * 100, 2),
+    }
+    return keep, audit
+
+
+def align_qi_rqi(qs: List[str], rs: List[str]) -> List[Optional[int]]:
+    if not qs or not rs:
+        return [None for _ in qs]
+
+    qtok = [tokenize(q) for q in qs]
+    rtok = [tokenize(r) for r in rs]
+    out = [None] * len(qs)
+
+    # local window first
+    for i in range(len(qs)):
+        best_j, best_s = None, 0.0
+        lo, hi = max(0, i - 6), min(len(rs), i + 7)
+        for j in range(lo, hi):
+            s = jaccard(qtok[i], rtok[j])
+            if s > best_s:
+                best_s, best_j = s, j
+        if best_j is not None and best_s >= 0.10:
+            out[i] = best_j
+
+    # global for unmatched
+    for i in range(len(qs)):
+        if out[i] is not None:
+            continue
+        best_j, best_s = None, 0.0
+        for j in range(len(rs)):
+            s = jaccard(qtok[i], rtok[j])
+            if s > best_s:
+                best_s, best_j = s, j
+        if best_j is not None and best_s >= 0.14:
+            out[i] = best_j
+
+    return out
+
+
+# -----------------------------------------------------------------------------
+# IA1 Proxy (déterministe) — trace d'opérations depuis RQi (pas un LLM)
+# -----------------------------------------------------------------------------
+# Keyword -> operator code (operators are cognitive, not chapter labels)
+_OP_RULES: List[Tuple[str, str, str]] = [
+    (r"\bderiv", "OP_DERIVE", "Calculer une dérivée / variation"),
+    (r"\blimit", "OP_LIMIT", "Calculer / encadrer une limite"),
+    (r"\bintegr|primitive", "OP_INTEGRATE", "Calculer une intégrale / primitive"),
+    (r"\brecur|recurrence|induction", "OP_INDUCTION", "Raisonnement par récurrence"),
+    (r"\bdiscriminant|\bdelta\b", "OP_DISCRIMINANT", "Calculer un discriminant / racines"),
+    (r"\bequation|inequation|systeme", "OP_SOLVE_EQUATION", "Résoudre équation / système"),
+    (r"\bproba|probabil", "OP_PROBABILITY", "Calcul de probabilité"),
+    (r"\b(binomial|normale|loi)\b", "OP_DISTRIBUTION", "Manipuler une loi de probabilité"),
+    (r"\besperance|variance|ecart", "OP_MOMENTS", "Calculer espérance / variance"),
+    (r"\bcomplexe|affixe|module|argument", "OP_COMPLEX", "Manipuler des nombres complexes"),
+    (r"\bvecteur|orthogon|scalaire", "OP_VECTOR_GEOM", "Géométrie vectorielle / orthogonalité"),
+    (r"\btrigo|sinus|cosinus|tangente", "OP_TRIGO", "Manipuler identités trigonométriques"),
+    (r"\blog|ln|exp|exponent", "OP_LOGEXP", "Manipuler log/exp"),
+    (r"\btableau\b.*\bvariat|\bvariat\b.*\btableau", "OP_VARIATION_TABLE", "Construire un tableau de variations"),
+    (r"\bencadr|major|minim|borne", "OP_BOUND", "Encadrer / majorer / minorer"),
+    (r"\bmontrer|demontrer|prouver|justifier", "OP_PROVE", "Justifier / démontrer"),
+]
+
+
+def extract_op_trace(rqi_text: str, qi_text: str) -> List[Dict[str, Any]]:
+    t = norm_text(rqi_text or "")
+    steps = []
+    used = set()
+    for (pat, op, desc) in _OP_RULES:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            if op not in used:
+                used.add(op)
+                steps.append({"op": op, "desc": desc})
+
+    # Always include minimal cognitive scaffold if something exists
+    if not steps and (rqi_text or "").strip():
+        steps = [{"op": "OP_STANDARD", "desc": "Appliquer une méthode standard (trace faible)"}]
+
+    # deterministically cap length
+    return steps[:12]
+
+
+def normalize_ari_steps(op_trace: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    IA2-normalization proxy: deduplicate and keep order.
+    This list defines m(q) for F1.
+    """
+    out = []
+    seen = set()
+    for stp in op_trace or []:
+        op = stp.get("op") or ""
+        if op and op not in seen:
+            seen.add(op)
+            out.append(stp)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# TRIGGERS (enrichis, toujours déterministes)
+# -----------------------------------------------------------------------------
+def build_triggers(qi_text: str, op_trace: List[Dict[str, Any]]) -> List[str]:
+    t = qi_text or ""
+    out = []
+
+    # surface triggers (kept but not sufficient alone)
+    if "?" in t:
+        out.append("TRG_QMARK")
+    if _MATH_SYMBOL_RE.search(t):
+        out.append("TRG_MATHSYM")
+    if re.search(r"\b\d+\b", t):
+        out.append("TRG_NUMBER")
+
+    # operator-based triggers (stronger)
+    for stp in op_trace or []:
+        op = stp.get("op")
+        if op:
+            out.append("TRG_" + op)
+
+    # dedupe + cap
+    seen, res = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            res.append(x)
+    return res[:12] if res else ["TRG_GENERIC"]
+
+
+# -----------------------------------------------------------------------------
+# CHAPTER MAPPING (data-driven) — map Qi to chapter by keywords overlap
+# -----------------------------------------------------------------------------
+def map_qi_to_chapter(qi_text: str, chapters: List[Dict[str, Any]]) -> str:
+    if not chapters:
+        return "UNMAPPED"
+    qi_toks = set(tokenize(qi_text))
+    best = ("UNMAPPED", 0.0)
+    for ch in chapters:
+        kws = ch.get("keywords") or []
+        if not kws:
+            continue
+        ch_toks = set(tokenize(" ".join([str(x) for x in kws])))
+        if not ch_toks:
+            continue
+        score = len(qi_toks & ch_toks) / max(1, len(ch_toks))
+        if score > best[1]:
+            best = (str(ch["chapter_code"]), score)
+    return best[0] if best[1] >= 0.08 else "UNMAPPED"
+
+
+def majority_vote(values: List[str]) -> str:
+    if not values:
+        return "UNMAPPED"
+    counts: Dict[str, int] = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    # tie-break by lexical order for determinism
+    best = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+    return best
+
+
+# -----------------------------------------------------------------------------
+# QC BUILDING — "méthode" = op_trace majoritaire, pas features surface
+# -----------------------------------------------------------------------------
+def qc_method_label(op_codes: List[str]) -> str:
+    if not op_codes:
+        return "Comment résoudre une question par une méthode standard ?"
+    # keep first 3 ops for readability
+    core = " → ".join(op_codes[:3])
+    return f"Comment résoudre une question en appliquant: {core} ?"
+
+
+def sigma_similarity(qc_a: Dict[str, Any], qc_b: Dict[str, Any]) -> float:
+    """
+    σ(q,p): similarity in [0,1]. Deterministic.
+    Uses op_codes + tokens.
+    """
+    a_ops = qc_a.get("op_codes", [])
+    b_ops = qc_b.get("op_codes", [])
+    if a_ops and b_ops:
+        s_ops = jaccard(list(a_ops), list(b_ops))
+    else:
+        s_ops = 0.0
+    s_txt = jaccard(tokenize(qc_a.get("qc", "")), tokenize(qc_b.get("qc", "")))
+    return max(s_ops, 0.7 * s_txt)
+
+
+# -----------------------------------------------------------------------------
+# F1 / F2 (formules scellées) — implémentation + audit
+# -----------------------------------------------------------------------------
+def compute_trigger_weights(triggers: List[str]) -> Dict[str, float]:
+    """
+    Deterministic T_j in [0,1]: weight by type and multiplicity not used (dedup triggers).
+    We keep simple: each trigger contributes 1.0, then normalized by count.
+    """
+    uniq = []
+    seen = set()
+    for t in triggers or []:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    n = len(uniq)
+    if n == 0:
+        return {}
+    w = 1.0 / n
+    return {t: w for t in uniq}
+
+
+def f1_raw(delta_c: float, epsilon: float, Tj: Dict[str, float], m_q: int) -> float:
+    """
+    ψ_raw(q) = δ_c * ( ε + Σ_{j=1}^{m(q)} T_j )^2
+    Here m(q) = number of normalized ARI steps.
+    We interpret Σ T_j as sum of top-m_q trigger weights (deterministic ordering).
+    """
+    if not Tj:
+        s = 0.0
+    else:
+        # deterministic order
+        items = sorted(Tj.items(), key=lambda x: x[0])
+        top = items[: max(0, int(m_q))]
+        s = sum(v for _, v in top)
+
+    return float(delta_c) * float((epsilon + s) ** 2)
+
+
+def f1_normalize_in_chapter(qc_list: List[Dict[str, Any]]) -> None:
+    """
+    Compute Ψ_q = ψ_raw(q) / max ψ_raw(p) within chapter.
+    Mutates qc_list in-place with fields: psi_raw, Psi_q, f1_audit.
+    """
+    if not qc_list:
+        return
+    raws = [float(q.get("psi_raw", 0.0) or 0.0) for q in qc_list]
+    mx = max(raws) if raws else 0.0
+    for q in qc_list:
+        psi = float(q.get("psi_raw", 0.0) or 0.0)
+        Psi = psi / mx if mx > 0 else 0.0
+        # domain: (0,1] expected if mx>0 and psi>0
+        q["Psi_q"] = float(Psi)
+
+
+def f2_score(qc: Dict[str, Any], selected: List[Dict[str, Any]], n_q_historical: int, N_total: int, alpha: float, t_rec: float) -> Tuple[float, Dict[str, Any]]:
+    """
+    Score(q) = (n_q_historical / N_total) * (1 + alpha / t_rec) * Psi_q * Π_{p∈S} ((1 - σ(q,p)) * 100)
+    """
+    Psi_q = float(qc.get("Psi_q", 0.0) or 0.0)
+    base = (float(n_q_historical) / float(max(1, N_total))) * (1.0 + float(alpha) / float(max(1e-9, t_rec))) * Psi_q
+
+    prod = 1.0
+    sigmas = []
+    for p in selected:
+        s = sigma_similarity(qc, p)
+        sigmas.append(s)
+        prod *= (1.0 - s) * 100.0
+
+    score = base * prod
+    audit = {
+        "n_q_historical": n_q_historical,
+        "N_total": N_total,
+        "alpha": alpha,
+        "t_rec": t_rec,
+        "Psi_q": Psi_q,
+        "sigma_list": sigmas[:50],
+        "prod_term": prod,
+        "base_term": base,
+    }
+    return float(score), audit
+
+
+def progressive_select(qc_list: List[Dict[str, Any]], N_total: int, top_k: int = 12) -> List[Dict[str, Any]]:
+    """
+    Progressive selection per chapter using F2 score.
+    Deterministic tie-break by qc_id.
+    """
+    selected: List[Dict[str, Any]] = []
+    remaining = sorted(qc_list, key=lambda x: x.get("qc_id", ""))
+
+    for _ in range(min(top_k, len(remaining))):
+        best = None
+        for qc in remaining:
+            n_q_hist = int(qc.get("n_q_historical", qc.get("cluster_size", 1)) or 1)
+            sc, audit = f2_score(qc, selected, n_q_hist, N_total, F2_ALPHA, F2_TREC)
+            qc["_f2_score"] = sc
+            qc["_f2_audit"] = audit
+            if best is None:
+                best = qc
+            else:
+                # compare score then qc_id for determinism
+                if (sc > best["_f2_score"]) or (sc == best["_f2_score"] and qc.get("qc_id","") < best.get("qc_id","")):
+                    best = qc
+
+        if best is None:
+            break
+        selected.append(best)
+        remaining = [x for x in remaining if x.get("qc_id") != best.get("qc_id")]
+
+    return selected
+
+
+# -----------------------------------------------------------------------------
+# SANITY GATE — qualitative (non arbitraire) + audit
+# -----------------------------------------------------------------------------
+def sanity_eval(doc_audits: List[Dict[str, Any]], qi_items: List[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
+    """
+    - No fixed 'Qi>60' rule.
+    - Fail only if evidence of non-Qi fragments is strong.
+    """
+    total_raw = sum(int(d.get("raw_chunks", 0) or 0) for d in doc_audits)
+    total_kept = sum(int(d.get("kept", 0) or 0) for d in doc_audits)
+    total_rej = sum(int(d.get("rejected", 0) or 0) for d in doc_audits)
+
+    # duplicate ratio (by normalized text hash)
+    seen = set()
+    dups = 0
+    for q in qi_items:
+        k = stable_id(norm_text(q.get("text",""))[:300])
+        if k in seen:
+            dups += 1
+        else:
+            seen.add(k)
+
+    dup_ratio = dups / max(1, len(qi_items))
+
+    # fail if:
+    # - majority of chunks rejected (means segmentation produced non-questions)
+    # - or duplicates explode
+    # - or extreme explosion (safety for broken PDF extraction)
+    rej_ratio = total_rej / max(1, total_raw) if total_raw else 0.0
+
+    extreme_explosion = total_raw > 5000 and total_kept < 200  # indicates OCR/extraction disaster
+
+    ok = True
+    reasons = []
+    if rej_ratio > 0.55 and total_raw > 200:
+        ok = False
+        reasons.append(f"reject_ratio_high({round(rej_ratio*100,2)}%)")
+    if dup_ratio > 0.20 and len(qi_items) > 200:
+        ok = False
+        reasons.append(f"dup_ratio_high({round(dup_ratio*100,2)}%)")
+    if extreme_explosion:
+        ok = False
+        reasons.append("extreme_explosion_pdf_extraction")
+
+    audit = {
+        "total_raw_chunks": total_raw,
+        "total_kept": total_kept,
+        "total_rejected": total_rej,
+        "reject_ratio": round(rej_ratio * 100, 2),
+        "dup_ratio": round(dup_ratio * 100, 2),
+        "reasons": reasons,
+    }
+    return ok, audit
+
+
+# -----------------------------------------------------------------------------
+# RUN (Phase A / Phase B) — builds QC with F1/F2 + saturation sets
+# -----------------------------------------------------------------------------
+def build_qc_from_qi(qi_pack: List[Dict[str, Any]], chapters: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """
+    Build QC candidates by grouping Qi by (chapter_code, op_signature).
+    This creates method-like QC (op-trace), not feature signatures.
+    """
+    buckets: Dict[Tuple[str, Tuple[str, ...]], List[Dict[str, Any]]] = {}
+    for qi in qi_pack:
+        cc = qi.get("chapter_code", "UNMAPPED")
+        op_codes = tuple(qi.get("ari_norm_ops", []))
+        buckets.setdefault((cc, op_codes), []).append(qi)
+
+    qc_pack: List[Dict[str, Any]] = []
+    qc_map: Dict[str, str] = {}
+
+    for idx, ((cc, op_codes), items) in enumerate(sorted(buckets.items(), key=lambda x: (x[0][0], x[0][1])) , start=1):
+        # anti-singleton normative: at least 2 POSABLE Qi to canonize a QC
+        posable = [x for x in items if x.get("has_rqi")]
+        if len(posable) < 2:
+            continue
+
+        qc_text = qc_method_label(list(op_codes))
+        qc_id = f"QC_{stable_id(cc, qc_text)}"
+
+        # triggers hint: most common triggers across cluster
+        trig_counts: Dict[str, int] = {}
+        for it in items:
+            for t in it.get("triggers", []):
+                trig_counts[t] = trig_counts.get(t, 0) + 1
+        trig_sorted = [k for (k, _) in sorted(trig_counts.items(), key=lambda x: (-x[1], x[0]))][:10]
+
+        qc_obj = {
+            "qc_id": qc_id,
+            "qc": qc_text,
+            "chapter_code": cc,
+            "cluster_size": len(items),
+            "posable_in_cluster": len(posable),
+            "qi_ids": [x["qi_id"] for x in items],
+            "op_codes": list(op_codes),
+            "triggers_hint": trig_sorted,
+        }
+        qc_pack.append(qc_obj)
+        for it in items:
+            qc_map[it["qi_id"]] = qc_id
+
+    return qc_pack, qc_map
+
+
+def run_phase(library: List[Dict[str, Any]], volume_pairs: int, chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
+    exploitable = [it for it in library if it.get("corrige?") and it.get("corrige_url")]
+    to_process = exploitable[: max(1, min(int(volume_pairs), len(exploitable)))]
+    log(f"[RUN] phase processing pairs={len(to_process)}")
+
+    qi_items: List[Dict[str, Any]] = []
+    rqi_items: List[Dict[str, Any]] = []
+    doc_audits: List[Dict[str, Any]] = []
     doc_stats: List[Dict[str, Any]] = []
-    sanity_docs: List[Dict[str, Any]] = []
 
-    for pair in pairs:
+    for pair in to_process:
         pid = pair["pair_id"]
-
         try:
             su_pdf = fetch_pdf_bytes(pair["sujet_url"])
             co_pdf = fetch_pdf_bytes(pair["corrige_url"])
@@ -1081,359 +1102,322 @@ def build_qi_pack_from_pairs(pairs: List[Dict[str, Any]]) -> Tuple[List[Dict[str
             log(f"[PDF] EMPTY {pid}")
             continue
 
-        qs = split_qi_subject(su_text)
-        rs = split_rqi_correction(co_text)
+        qs, qs_audit = split_questions(su_text, max_items=260)
+        rs, rs_audit = split_questions(co_text, max_items=320)  # allow more in correction
 
-        san = sanity_doc_instability(qs)
-        if not san["ok"]:
-            sanity_docs.append({"pair_id": pid, **san})
+        doc_audits.append({"pair_id": pid, "role": "SUJET", **qs_audit})
+        doc_audits.append({"pair_id": pid, "role": "CORRIGE", **rs_audit})
 
         link = align_qi_rqi(qs, rs)
-
-        doc_stats.append({
-            "pair_id": pid,
-            "qi": len(qs),
-            "rqi": len(rs),
-            "sanity_ok": san["ok"],
-            "sanity_score": san["score"],
-        })
+        doc_stats.append({"pair_id": pid, "qi": len(qs), "rqi": len(rs)})
 
         for i, q in enumerate(qs):
+            if not q.strip():
+                continue
             j = link[i] if i < len(link) else None
             r = rs[j] if (j is not None and 0 <= j < len(rs)) else ""
 
-            qi_id = f"QI_{stable_id(pid, str(i), norm_text(q)[:200])}"
-            rqi_id = f"RQI_{stable_id(pid, str(j), norm_text(r)[:200])}" if r else ""
+            qi_id = f"QI_{stable_id(pid, str(i), norm_text(q)[:180])}"
+            rqi_id = f"RQI_{stable_id(pid, str(j), norm_text(r)[:180])}" if r else ""
 
-            triggers = build_triggers(q)
-            ari = SmaxiaExpertAgent.extract_real_ari(r, q, triggers)
-            frt = build_frt(q, r, ari, triggers)
+            # IA1 Proxy: op-trace from RQi
+            op_trace = extract_op_trace(r, q)
+            ari_norm = normalize_ari_steps(op_trace)
+            ari_ops = [x.get("op") for x in ari_norm if x.get("op")]
 
-            qc_sig = qc_signature_from_ari(ari, triggers)
+            triggers = build_triggers(q, op_trace)
+            chapter_code = map_qi_to_chapter(q, chapters)
 
-            qi_pack.append({
-                "qi_id": qi_id,
-                "pair_id": pid,
-                "k": i + 1,
-                "qi": q,
-                "rqi": r,
-                "has_rqi": bool(r),
-                "triggers": triggers,
-                "ari": ari,
-                "frt": frt,
-                "qc_sig": list(qc_sig),
-                "qc_id": "",
-                "is_orphan": False,
-                "F1_audit": None,
-                "F2_audit": None,
-            })
-
-    return qi_pack, doc_stats, sanity_docs
-
-
-def build_qc_pack_and_map(qi_pack: List[Dict[str, Any]], chapters: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, Any]]:
-    """
-    - Build QC by grouping on qc_sig
-    - Assign chapter by mapping cluster tokens (Qi+RQi) to pack chapter keywords
-    """
-    buckets = cluster_qi_by_qc_signature(qi_pack)
-
-    qc_pack: List[Dict[str, Any]] = []
-    qc_map: Dict[str, str] = {}
-    qc_chapter_debug: Dict[str, Any] = {}
-
-    # stable ordering
-    sig_keys = sorted(buckets.keys(), key=lambda s: (-len(buckets[s]), " ".join(s)))
-
-    for idx, sig in enumerate(sig_keys, start=1):
-        cluster = buckets[sig]
-        label = qc_label_from_signature(sig)
-        qc_id = f"QC_{stable_id(str(idx), norm_text(label), ' '.join(sig))}"
-
-        chapter_code, chapter_score, chapter_scores = map_cluster_to_chapter(cluster, chapters)
-
-        qc_pack.append({
-            "qc_id": qc_id,
-            "qc": label,
-            "signature": list(sig),
-            "cluster_size": len(cluster),
-            "chapter_code": chapter_code,
-            "chapter_score": chapter_score,
-            "qi_ids": [it["qi_id"] for it in cluster],
-        })
-
-        qc_chapter_debug[qc_id] = {
-            "chapter_code": chapter_code,
-            "chapter_score": chapter_score,
-            "chapter_scores": chapter_scores,
-        }
-
-        for it in cluster:
-            qc_map[it["qi_id"]] = qc_id
-
-    return qc_pack, qc_map, qc_chapter_debug
-
-
-def apply_F1_F2_selection(qi_pack: List[Dict[str, Any]], qc_pack: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    ISO-PROD TEST: calcul F1/F2 auditable par chapitre, sur les QC.
-    On construit pour chaque QC:
-    - m(q) depuis ARI proxy (m_q)
-    - triggers depuis une "QC-trigger-set" dérivée des Qi du cluster
-    - Ψ_q normalisé intra-chapitre
-    - Score(q) pour la sélection progressive (coverage-driven)
-    """
-    # Build helpers
-    qi_by_id = {q["qi_id"]: q for q in qi_pack}
-    qc_by_id = {q["qc_id"]: q for q in qc_pack}
-
-    # For each QC, compute F1 raw
-    qc_F1_raw: Dict[str, Dict[str, Any]] = {}
-    qc_triggers: Dict[str, List[str]] = {}
-    qc_mq: Dict[str, int] = {}
-
-    for qc in qc_pack:
-        qc_id = qc["qc_id"]
-        cluster_qis = [qi_by_id[qid] for qid in qc["qi_ids"] if qid in qi_by_id]
-
-        # delta_c: 1 si mappé à un chapitre, 0 sinon (test)
-        delta_c = 1 if qc.get("chapter_code") and qc["chapter_code"] != "UNMAPPED" else 0
-
-        # triggers QC = union triggers cluster
-        trg_set = set()
-        m_vals = []
-        for qi in cluster_qis:
-            trg_set.update(qi.get("triggers", []))
-            m_vals.append(int(qi.get("ari", {}).get("m_q", 0) or 0))
-
-        # m(q): moyenne robuste (cap)
-        m_q = int(round(sum(m_vals) / max(1, len(m_vals)))) if m_vals else 1
-        m_q = max(1, min(10, m_q))
-
-        tlist = sorted(trg_set)[:12]
-        qc_triggers[qc_id] = tlist
-        qc_mq[qc_id] = m_q
-
-        qc_F1_raw[qc_id] = compute_F1_Psi_q(delta_c=delta_c, m_q=m_q, triggers=tlist)
-
-    # Normalize Ψ_q intra-chapitre
-    by_chapter: Dict[str, List[str]] = {}
-    for qc in qc_pack:
-        ch = qc.get("chapter_code") or "UNMAPPED"
-        by_chapter.setdefault(ch, []).append(qc["qc_id"])
-
-    qc_F1: Dict[str, Dict[str, Any]] = {}
-    for ch, qc_ids in by_chapter.items():
-        max_raw = max((qc_F1_raw[qid]["psi_raw"] for qid in qc_ids), default=0.0)
-        max_raw = max(max_raw, EPSILON_F1)
-        for qid in qc_ids:
-            x = dict(qc_F1_raw[qid])
-            x["Psi_q"] = float(x["psi_raw"]) / float(max_raw)
-            qc_F1[qid] = x
-
-    # Progressive selection (F2) per chapter - coverage-driven:
-    # NOTE TEST: we compute scores but do not "finalize" selection list here;
-    # selection list can be added later. For audit, we compute score with a growing S.
-    qc_F2: Dict[str, Dict[str, Any]] = {}
-
-    now_year = datetime.utcnow().year
-
-    for ch, qc_ids in by_chapter.items():
-        selected: List[str] = []
-        N_total = len(qc_ids)
-
-        # heuristic n_q_historical = cluster_size (test proxy)
-        # t_rec: years since last occurrence (test proxy): use (now - median year) if possible else 1
-        # Here: we set t_rec_years=1.0 for test, auditable and non-fake.
-        t_rec_years = 1.0
-
-        # order by Psi desc for deterministic selection simulation
-        ordered = sorted(qc_ids, key=lambda qid: (-qc_F1[qid]["Psi_q"], qid))
-
-        for qid in ordered:
-            # compute sigma against already selected
-            sigmas = []
-            for pid in selected:
-                s = sigma_similarity(qc_triggers[qid], qc_triggers[pid])
-                # hard penalty if near-duplicate
-                if s >= SIGMA_HARD_PENALTY:
-                    s = min(1.0, s)
-                sigmas.append(s)
-
-            n_hist = int(qc_by_id[qid].get("cluster_size", 1) or 1)
-
-            f2 = compute_F2_Score(
-                n_q_historical=n_hist,
-                N_total=N_total,
-                t_rec_years=t_rec_years,
-                Psi_q=float(qc_F1[qid]["Psi_q"]),
-                sigma_to_selected=sigmas,
+            qi_items.append(
+                {
+                    "qi_id": qi_id,
+                    "pair_id": pid,
+                    "k": i + 1,
+                    "text": q,
+                    "rqi_id": rqi_id,
+                    "chapter_code": chapter_code,
+                    "has_rqi": bool(r),
+                    "op_trace": op_trace,
+                    "ari_norm": ari_norm,
+                    "ari_norm_ops": ari_ops,
+                    "triggers": triggers,
+                }
             )
-            qc_F2[qid] = f2
+            if r:
+                rqi_items.append({"rqi_id": rqi_id, "pair_id": pid, "k": i + 1, "text": r})
 
-            # add to selected list in simulation (keeps determinism)
-            selected.append(qid)
+    sanity_ok, sanity_audit = sanity_eval(doc_audits, qi_items)
 
     return {
-        "qc_F1": qc_F1,
-        "qc_F2": qc_F2,
-        "qc_triggers": qc_triggers,
-        "qc_mq": qc_mq,
-        "by_chapter": by_chapter,
+        "pairs_used": len(to_process),
+        "qi_items": qi_items,
+        "rqi_items": rqi_items,
+        "doc_stats": doc_stats[:200],
+        "doc_audits": doc_audits[:300],
+        "sanity_ok": sanity_ok,
+        "sanity_audit": sanity_audit,
     }
 
 
-def assemble_chapter_report(chapters: List[Dict[str, Any]], qi_pack: List[Dict[str, Any]], qc_pack: List[Dict[str, Any]]) -> Dict[str, Any]:
-    ch_label = {c["chapter_code"]: c.get("chapter_label", c["chapter_code"]) for c in chapters}
+def build_outputs_for_phase(phase_res: Dict[str, Any], chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
+    qi_items = phase_res["qi_items"]
+    rqi_by_id = {r["rqi_id"]: r for r in phase_res["rqi_items"]}
 
-    qc_by_chapter: Dict[str, List[str]] = {}
+    # Orphans are defined at QC mapping step
+    qc_pack, qc_map = build_qc_from_qi(qi_items, chapters)
+
+    # Enforce mapping completeness: each Qi must converge to a QC (axiome test)
+    qi_pack = []
+    qi_posable = 0
+    orphan_ids = []
+
+    for q in qi_items:
+        rqi_id = q.get("rqi_id") or ""
+        rtxt = rqi_by_id.get(rqi_id, {}).get("text", "")
+        qc_id = qc_map.get(q["qi_id"], "")
+        is_orphan = not qc_id
+
+        if q.get("has_rqi"):
+            qi_posable += 1
+        if is_orphan:
+            orphan_ids.append(q["qi_id"])
+
+        # ARI object: include op_trace + normalized steps
+        ari_obj = {
+            "template": "ARI_SMAXIA_V3_DETERMINISTIC",
+            "op_trace": q.get("op_trace", []),
+            "normalized_steps": q.get("ari_norm", []),
+            "m_q": len(q.get("ari_norm", [])),
+            "evidence": {"has_rqi": bool(rtxt), "rqi_chars": len(rtxt), "qi_chars": len(q.get("text",""))},
+        }
+
+        # FRT object: evidence-driven scaffold (no hallucinated content)
+        frt_obj = {
+            "template": "FRT_SMAXIA_V3_EVIDENCE_DRIVEN",
+            "rule": "FRT_SOURCE_RULE",
+            "source": "RQi_clean" if rtxt else "MISSING_RQi",
+            "sections": [
+                {"id": "OBJ", "name": "OBJECTIF", "evidence": "from Qi intent"},
+                {"id": "DAT", "name": "DONNÉES/CONTRAINTES", "evidence": "from Qi + RQi"},
+                {"id": "MTH", "name": "MÉTHODE", "evidence": "from ARI normalized steps"},
+                {"id": "EXE", "name": "EXÉCUTION", "evidence": "from RQi (trace)"},
+                {"id": "RES", "name": "RÉSULTAT", "evidence": "from RQi"},
+                {"id": "VAL", "name": "VALIDATION", "evidence": "from RQi checks"},
+            ],
+            "anchors": {
+                "qi_excerpt": (q.get("text","")[:300] + "…") if len(q.get("text","")) > 300 else q.get("text",""),
+                "rqi_excerpt": (rtxt[:400] + "…") if len(rtxt) > 400 else rtxt,
+            },
+        }
+
+        qi_pack.append(
+            {
+                "qi_id": q["qi_id"],
+                "pair_id": q["pair_id"],
+                "k": q["k"],
+                "chapter_code": q.get("chapter_code", "UNMAPPED"),
+                "qi": q["text"],
+                "rqi": rtxt,
+                "has_rqi": bool(rtxt),
+                "qc_id": qc_id,
+                "is_orphan": is_orphan,
+                "triggers": q.get("triggers", []),
+                "ari": ari_obj,
+                "frt": frt_obj,
+            }
+        )
+
+    # Compute F1 within each chapter on QC pack
+    # Need delta_c from pack chapter
+    delta_by_ch = {c["chapter_code"]: float(c.get("delta_c", 1.0) or 1.0) for c in chapters}
+
+    # We define for each QC:
+    # - m(q): median m_q of Qi in cluster (normalized steps length)
+    # - Tj: from triggers_hint (deterministic weights)
+    # - psi_raw, then Psi_q normalized intra-chapter
+    qi_by_id = {x["qi_id"]: x for x in qi_pack}
+    qc_by_ch: Dict[str, List[Dict[str, Any]]] = {}
     for qc in qc_pack:
-        qc_by_chapter.setdefault(qc["chapter_code"], []).append(qc["qc_id"])
+        cc = qc["chapter_code"]
+        qc_by_ch.setdefault(cc, []).append(qc)
 
-    qi_by_chapter: Dict[str, List[str]] = {}
-    covered_by_chapter: Dict[str, List[str]] = {}
+        # gather m_q from member Qi
+        m_list = []
+        for qi_id in qc.get("qi_ids", []):
+            qi = qi_by_id.get(qi_id)
+            if qi and qi.get("has_rqi"):
+                m_list.append(int(qi.get("ari", {}).get("m_q", 0) or 0))
+        m_q = int(sorted(m_list)[len(m_list)//2]) if m_list else 1
 
+        # triggers weights
+        Tj = compute_trigger_weights(qc.get("triggers_hint", []))
+        delta_c = float(delta_by_ch.get(cc, 1.0))
+        psi = f1_raw(delta_c=delta_c, epsilon=F1_EPSILON, Tj=Tj, m_q=m_q)
+
+        qc["m_q"] = m_q
+        qc["Tj"] = Tj
+        qc["delta_c"] = delta_c
+        qc["psi_raw"] = psi
+        qc["f1_audit"] = {
+            "delta_c": delta_c,
+            "epsilon": F1_EPSILON,
+            "m_q": m_q,
+            "Tj": Tj,
+            "psi_raw": psi,
+        }
+
+        # n_q_historical (for test): use posable_in_cluster
+        qc["n_q_historical"] = int(qc.get("posable_in_cluster", qc.get("cluster_size", 1)) or 1)
+
+    # Normalize Psi_q per chapter
+    for cc, qcs in qc_by_ch.items():
+        f1_normalize_in_chapter(qcs)
+
+    # Chapter report
+    ch_label = {c["chapter_code"]: c.get("chapter_label", c["chapter_code"]) for c in chapters}
     qc_by_id = {q["qc_id"]: q for q in qc_pack}
 
+    qi_by_chapter: Dict[str, List[str]] = {}
+    qi_covered_by_chapter: Dict[str, List[str]] = {}
+    qc_count_by_chapter: Dict[str, int] = {}
+
+    for qc in qc_pack:
+        qc_count_by_chapter[qc["chapter_code"]] = qc_count_by_chapter.get(qc["chapter_code"], 0) + 1
+
     for qi in qi_pack:
-        qc_id = qi.get("qc_id") or ""
-        cc = qc_by_id.get(qc_id, {}).get("chapter_code", "UNMAPPED") if qc_id else "UNMAPPED"
+        qc_id = qi.get("qc_id", "")
+        cc = qc_by_id[qc_id]["chapter_code"] if qc_id and qc_id in qc_by_id else qi.get("chapter_code","UNMAPPED")
         qi_by_chapter.setdefault(cc, []).append(qi["qi_id"])
         if qi.get("has_rqi") and not qi.get("is_orphan"):
-            covered_by_chapter.setdefault(cc, []).append(qi["qi_id"])
+            qi_covered_by_chapter.setdefault(cc, []).append(qi["qi_id"])
 
-    entries = []
-    for cc in sorted(set(list(qi_by_chapter.keys()) + list(qc_by_chapter.keys()))):
+    chapter_entries = []
+    for cc in sorted(set(qi_by_chapter.keys()) | set(qc_count_by_chapter.keys())):
         qi_total = len(qi_by_chapter.get(cc, []))
-        qi_cov = len(covered_by_chapter.get(cc, []))
-        qc_count = len(qc_by_chapter.get(cc, []))
+        qi_cov = len(qi_covered_by_chapter.get(cc, []))
+        qc_count = int(qc_count_by_chapter.get(cc, 0))
         cov_pct = round((qi_cov / qi_total) * 100, 2) if qi_total else 0.0
-        entries.append({
-            "chapter_code": cc,
-            "chapter_label": ch_label.get(cc, cc),
-            "qi_total": qi_total,
-            "covered_qi_count": qi_cov,
-            "coverage_pct": cov_pct,
-            "qc_count": qc_count,
-        })
+        chapter_entries.append(
+            {
+                "chapter_code": cc,
+                "chapter_label": ch_label.get(cc, cc),
+                "qi_total": qi_total,
+                "covered_qi_count": qi_cov,
+                "coverage_pct": cov_pct,
+                "qc_count": qc_count,
+            }
+        )
 
-    return {
+    chapter_report = {
         "version": APP_VERSION,
         "timestamp": _utc_ts(),
         "pack_id": st.session_state.pack_id,
-        "chapters": sorted(entries, key=lambda x: -x["qi_total"]),
+        "chapters": sorted(chapter_entries, key=lambda x: (-x["qi_total"], x["chapter_code"])),
     }
 
-
-def run_phase(library: List[Dict[str, Any]], volume: int, pack: Dict[str, Any]) -> Dict[str, Any]:
-    chapters = pack_chapters(pack)
-    exploitable = [it for it in library if it.get("corrige?") and it.get("corrige_url")]
-    if not exploitable:
-        raise RuntimeError("Aucun corrigé exploitable")
-
-    to_process = exploitable[:max(1, min(int(volume), len(exploitable)))]
-    log(f"[RUN] Phase processing={len(to_process)} pairs")
-
-    qi_pack, doc_stats, sanity_docs = build_qi_pack_from_pairs(to_process)
-
-    if not qi_pack:
-        raise RuntimeError("Aucune Qi extraite")
-
-    qc_pack, qc_map, qc_map_debug = build_qc_pack_and_map(qi_pack, chapters)
-
-    # attach qc_id
-    orphans = 0
-    posable = 0
-    for qi in qi_pack:
-        qc_id = qc_map.get(qi["qi_id"], "")
-        qi["qc_id"] = qc_id
-        qi["is_orphan"] = (not qc_id)
-        if qi["is_orphan"]:
-            orphans += 1
-        if qi["has_rqi"]:
-            posable += 1
-
-    # F1/F2 on QC
-    f12 = apply_F1_F2_selection(qi_pack, qc_pack)
-
-    # attach F1/F2 audit to Qi (per its QC)
-    for qi in qi_pack:
-        qcid = qi.get("qc_id") or ""
-        if qcid and qcid in f12["qc_F1"]:
-            qi["F1_audit"] = f12["qc_F1"][qcid]
-            qi["F2_audit"] = f12["qc_F2"].get(qcid)
-
-    chapter_report = assemble_chapter_report(chapters, qi_pack, qc_pack)
-
-    # sanity global: fail only if too many docs unstable
-    sanity_ok = (len(sanity_docs) == 0) or (len(sanity_docs) <= max(1, int(0.25 * len(to_process))))
+    audit = {
+        "qi_total": len(qi_pack),
+        "qi_posable": qi_posable,
+        "rqi_total": sum(1 for q in qi_pack if q.get("rqi")),
+        "qc_total": len(qc_pack),
+        "qi_orphans": len(orphan_ids),
+        "orphan_ids_sample": orphan_ids[:25],
+        "sanity_ok": bool(phase_res.get("sanity_ok")),
+        "sanity_audit": phase_res.get("sanity_audit"),
+        "pairs_used": phase_res.get("pairs_used"),
+        "doc_stats": phase_res.get("doc_stats"),
+        "doc_audits_sample": phase_res.get("doc_audits"),
+    }
 
     return {
         "qi_pack": qi_pack,
         "qc_pack": qc_pack,
         "chapter_report": chapter_report,
-        "phase_audit": {
-            "pairs": len(to_process),
-            "qi_total": len(qi_pack),
-            "rqi_total": sum(1 for q in qi_pack if q.get("rqi")),
-            "qi_posable": posable,
-            "qc_total": len(qc_pack),
-            "qi_orphans": orphans,
-            "sanity_ok": sanity_ok,
-            "sanity_docs": sanity_docs[:50],
-            "doc_stats": doc_stats[:80],
-            "qc_chapter_debug": qc_map_debug,
-            "F1F2_meta": {
-                "EPSILON_F1": EPSILON_F1,
-                "ALPHA_F2": ALPHA_F2,
-                "SIGMA_MODE": SIGMA_MODE,
-            },
-        },
-        "qc_set": sorted({q["qc_id"] for q in qc_pack}),
+        "audit": audit,
     }
 
 
-def run_granulo_test_AB(library: List[Dict[str, Any]], phaseA: int, phaseB: int, pack: Dict[str, Any]) -> Dict[str, Any]:
+def run_granulo_test_iso(library: List[Dict[str, Any]], phase_a: int, phase_b: int, chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Preuve de saturation:
-    - Phase A => Set_A
-    - Phase B => Set_B
-    SEALED si Set_B - Set_A == ∅ + contraintes.
+    Two phases: A then B.
+    SEALED only if SetB - SetA == empty AND IA2-like gates pass.
     """
-    A = run_phase(library, phaseA, pack)
-    B = run_phase(library, phaseB, pack)
+    # Phase A
+    a_res = run_phase(library, phase_a, chapters)
+    a_out = build_outputs_for_phase(a_res, chapters)
+    setA = sorted({q["qc_id"] for q in a_out["qc_pack"]})
 
-    setA = set(A["qc_set"])
-    setB = set(B["qc_set"])
+    # Phase B
+    b_res = run_phase(library, phase_b, chapters)
+    b_out = build_outputs_for_phase(b_res, chapters)
+    setB = sorted({q["qc_id"] for q in b_out["qc_pack"]})
 
-    delta = sorted(list(setB - setA))
-    saturation_ok = (len(delta) == 0)
+    setB_minus_setA = sorted(list(set(setB) - set(setA)))
+    saturation_ok = (len(setB_minus_setA) == 0)
 
-    # Sealed constraints (ISO-PROD TEST)
-    orphans = int(B["phase_audit"]["qi_orphans"])
-    posable = int(B["phase_audit"]["qi_posable"])
-    sanity_ok = bool(B["phase_audit"]["sanity_ok"])
-    qc_total = int(B["phase_audit"]["qc_total"])
+    # Progressive selection report (per chapter) using Phase B QC
+    qc_by_ch: Dict[str, List[Dict[str, Any]]] = {}
+    for qc in b_out["qc_pack"]:
+        qc_by_ch.setdefault(qc["chapter_code"], []).append(qc)
+
+    selection = []
+    N_total = int(b_out["audit"]["qi_posable"] or b_out["audit"]["qi_total"] or 1)
+
+    for cc, qcs in sorted(qc_by_ch.items(), key=lambda x: x[0]):
+        selected = progressive_select(qcs, N_total=N_total, top_k=12)
+        selection.append(
+            {
+                "chapter_code": cc,
+                "selected_qc_ids": [x["qc_id"] for x in selected],
+                "top_items": [
+                    {
+                        "qc_id": x["qc_id"],
+                        "score": x.get("_f2_score"),
+                        "Psi_q": x.get("Psi_q"),
+                        "cluster_size": x.get("cluster_size"),
+                        "posable_in_cluster": x.get("posable_in_cluster"),
+                        "op_codes": x.get("op_codes"),
+                        "f2_audit": x.get("_f2_audit"),
+                    }
+                    for x in selected
+                ],
+            }
+        )
+
+    selection_report = {
+        "version": APP_VERSION,
+        "timestamp": _utc_ts(),
+        "phaseA_pairs": phase_a,
+        "phaseB_pairs": phase_b,
+        "N_total": N_total,
+        "chapters": selection,
+    }
+
+    # SEALED gate
+    orphans = int(b_out["audit"]["qi_orphans"])
+    posable = int(b_out["audit"]["qi_posable"])
+    sanity_ok = bool(b_out["audit"]["sanity_ok"])
+    qc_total = int(b_out["audit"]["qc_total"])
 
     sealed = bool(saturation_ok and sanity_ok and orphans == 0 and posable > 0 and qc_total > 0)
 
     audit = {
-        "phaseA_pairs": phaseA,
-        "phaseB_pairs": phaseB,
-        "Set_A": sorted(list(setA))[:2000],
-        "Set_B": sorted(list(setB))[:2000],
-        "Set_B_minus_A": delta[:2000],
+        "phaseA": a_out["audit"],
+        "phaseB": b_out["audit"],
         "saturation_ok": saturation_ok,
-        "sanity_ok": sanity_ok,
-        "orphans": orphans,
-        "posable": posable,
-        "qc_total": qc_total,
+        "setA_size": len(setA),
+        "setB_size": len(setB),
+        "setB_minus_setA_size": len(setB_minus_setA),
         "sealed": sealed,
     }
 
     return {
-        "A": A,
-        "B": B,
+        "phaseA": a_out,
+        "phaseB": b_out,
+        "setA": setA,
+        "setB": setB,
+        "setB_minus_setA": setB_minus_setA,
+        "selection_report": selection_report,
         "audit": audit,
     }
 
@@ -1464,36 +1448,43 @@ def main():
     ss_init()
 
     st.markdown(f"# SMAXIA GTE Console {APP_VERSION} — ISO-PROD TEST")
-    st.caption("UI + Moteur en mono-fichier. Pack FILE signé. F1/F2 auditables. Saturation Set_B−Set_A.")
+    st.caption("UI + Moteur mono-fichier. Pack FILE signé. Preuve F1/F2 + saturation Set_B-Set_A.")
 
-    # ---------------- SIDEBAR ----------------
+    # Sidebar: Activation + Selection scope
     with st.sidebar:
         st.markdown("## ÉTAPE 1 — ACTIVATION (Pack FILE signé)")
-
-        country = st.selectbox("Pays", [DEFAULT_COUNTRY])
+        country = st.selectbox("Pays", [DEFAULT_COUNTRY], index=0)
         st.session_state.country = country
 
-        uploaded_pack = st.file_uploader("Upload Pack JSON (optionnel)", type=["json"])
-        uploaded_pack_bytes = uploaded_pack.read() if uploaded_pack else None
+        st.markdown("### Upload Pack JSON (optionnel)")
+        up = st.file_uploader("Pack JSON", type=["json"])
+        uploaded_pack = None
+        if up is not None:
+            try:
+                uploaded_pack = json.loads(up.read().decode("utf-8"))
+            except Exception as e:
+                st.error(f"Pack invalide: {e}")
+                uploaded_pack = None
 
+        st.markdown("### Autoriser Pack Genesis (TEST)")
         allow_genesis = st.checkbox("Autoriser Pack Genesis (TEST)", value=True)
-        genesis_n = st.number_input("Genesis: nombre de chapitres", min_value=4, max_value=40, value=12, step=1)
+        genesis_n = st.number_input("Genesis: nombre de chapitres", 4, 12, 12)
 
         if st.button("ACTIVER", use_container_width=True):
             try:
-                activate_pack(country, allow_genesis, int(genesis_n), uploaded_pack_bytes)
+                pack = load_academic_pack(country, allow_genesis=allow_genesis, genesis_n_chapters=int(genesis_n), uploaded_pack=uploaded_pack)
+                st.session_state.pack_active = pack
+                st.session_state.pack_id = str(pack.get("pack_id") or "")
+                st.session_state.pack_path = pack.get("_pack_file_path")
+                st.session_state.pack_sig_sha256 = pack.get("_pack_sig_sha256")
                 st.success("Pack actif")
             except Exception as e:
                 st.session_state.pack_active = None
-                st.session_state.pack_id = None
-                st.session_state.pack_source = None
-                st.session_state.pack_path = None
-                st.session_state.pack_sig_sha256 = None
                 st.error(f"Erreur: {e}")
 
         if st.session_state.pack_active:
             st.success(f"Pack: {st.session_state.pack_id}")
-            st.caption(f"Source: {st.session_state.pack_source}")
+            st.caption(f"Source: {st.session_state.pack_active.get('_source', 'FILE')}")
             st.caption(f"Signature SHA256: {st.session_state.pack_sig_sha256}")
             st.caption(f"Path: {st.session_state.pack_path}")
         else:
@@ -1501,154 +1492,166 @@ def main():
 
         st.markdown("---")
         st.markdown("## ÉTAPE 2 — SÉLECTION (scope)")
-
         level = st.radio("Niveau", ["Seconde", "Première", "Terminale"], index=2)
         st.session_state.level = {"Seconde": "SECONDE", "Première": "PREMIERE", "Terminale": "TERMINALE"}[level]
 
-        subject = st.selectbox("Matière (test)", ["MATH"], index=0)
-        st.session_state.subject = subject
+        st.markdown("Matière (test)")
+        _ = st.selectbox("Matière", ["MATH"], index=0)
 
         st.markdown("### Chapitres (pack-driven)")
         if st.session_state.pack_active:
             chs = pack_chapters(st.session_state.pack_active)
             st.caption(f"{len(chs)} chapitres")
-            for c in chs[:25]:
+            for c in chs:
                 st.write(f"• {c['chapter_code']}")
-        else:
-            st.caption("—")
 
-    # ---------------- MAIN TABS ----------------
     tab1, tab2, tab3 = st.tabs(["Import", "RUN", "Exports"])
 
     lib = st.session_state.library
     corr_ok = sum(1 for x in lib if x.get("corrige?") and x.get("corrige_url"))
 
-    # -------- Import --------
+    # --- IMPORT ---
     with tab1:
         st.markdown("## Import / Bibliothèque")
-        metric_row(len(lib), corr_ok, st.session_state.run_stats.get("qi", 0),
-                   st.session_state.run_stats.get("qi_posable", 0),
-                   st.session_state.run_stats.get("qc", 0), st.session_state.sealed)
+        metric_row(
+            len(lib),
+            corr_ok,
+            st.session_state.run_stats.get("qi", 0),
+            st.session_state.run_stats.get("qi_posable", 0),
+            st.session_state.run_stats.get("qc", 0),
+            st.session_state.sealed,
+        )
 
         st.markdown("### Bibliothèque")
         df_table(lib)
 
         st.markdown("---")
-        st.markdown("### HARVEST AUTO (APMEP)")
+        st.markdown("## HARVEST AUTO (APMEP)")
         c1, c2 = st.columns(2)
         years_back = c1.number_input("Années", 1, 15, 10)
-        volume_max = c2.number_input("Volume max (pairs)", 5, 200, 30)
+        volume_max = c2.number_input("Volume max (pairs)", 5, 200, 50)
 
         if st.button("HARVEST", use_container_width=True):
             if not st.session_state.pack_active:
                 st.error("Activez le pack d'abord")
             else:
                 try:
-                    manifest = harvest_apmep(st.session_state.level, st.session_state.subject, int(years_back), int(volume_max))
+                    manifest = harvest_apmep(st.session_state.level, "MATH", int(years_back), int(volume_max))
                     st.session_state.harvest_manifest = manifest
                     st.session_state.library = manifest["library"]
 
-                    # reset run
+                    # reset run state
                     st.session_state.sealed = False
                     st.session_state.qi_pack = None
                     st.session_state.qc_pack = None
                     st.session_state.chapter_report = None
+                    st.session_state.selection_report = None
                     st.session_state.last_run_audit = None
-                    st.session_state.run_stats = {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0}
+                    st.session_state.run_stats = {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0, "orphans": 0, "sanity_ok": False}
 
                     st.success(f"HARVEST OK: {manifest['items_total']} pairs (corrigés={manifest['items_corrige_ok']})")
                 except Exception as e:
                     st.error(f"HARVEST échoué: {e}")
 
         st.markdown("---")
-        st.markdown("### Upload manuel (Sujets/Corrigés)")
-        cA, cB = st.columns(2)
-        su = cA.file_uploader("PDF Sujet", type=["pdf"], key="upl_sujet")
-        co = cB.file_uploader("PDF Corrigé", type=["pdf"], key="upl_corrige")
-
-        if st.button("Ajouter à la bibliothèque", use_container_width=True):
-            if not (su and co):
-                st.error("Veuillez fournir Sujet + Corrigé")
+        st.markdown("## Upload manuel (Sujets/Corrigés)")
+        cL, cR = st.columns(2)
+        up_s = cL.file_uploader("PDF Sujet", type=["pdf"], key="up_s")
+        up_c = cR.file_uploader("PDF Corrigé", type=["pdf"], key="up_c")
+        if st.button("Ajouter à la bibliothèque"):
+            if not up_s:
+                st.error("PDF Sujet manquant")
             else:
-                su_b = su.read()
-                co_b = co.read()
-                su_url = f"local://sujet_{stable_id(su.name, sha256_bytes(su_b))}.pdf"
-                co_url = f"local://corrige_{stable_id(co.name, sha256_bytes(co_b))}.pdf"
-                st.session_state._uploads[su_url] = su_b
-                st.session_state._uploads[co_url] = co_b
+                sid = stable_id(up_s.name, _utc_ts())
+                su_url = f"local://sujet/{sid}"
+                st.session_state._uploads[su_url] = up_s.read()
 
-                item = {
-                    "pair_id": f"PAIR_MANUAL_{stable_id(su.name, co.name, _utc_ts())}",
-                    "scope": f"{st.session_state.level}|{st.session_state.subject}",
-                    "source": "MANUAL_UPLOAD",
-                    "year": datetime.utcnow().year,
-                    "sujet": su.name,
-                    "corrige?": True,
-                    "corrige_name": co.name,
-                    "reason": "",
+                corr_ok_flag = False
+                co_url = ""
+                co_name = ""
+                if up_c:
+                    co_url = f"local://corrige/{sid}"
+                    st.session_state._uploads[co_url] = up_c.read()
+                    corr_ok_flag = True
+                    co_name = up_c.name
+
+                row = {
+                    "pair_id": f"PAIR_LOCAL_{sid}",
+                    "scope": f"{st.session_state.level}|MATH",
+                    "source": "UPLOAD",
+                    "year": 0,
+                    "sujet": up_s.name,
+                    "corrige?": corr_ok_flag,
+                    "corrige_name": co_name,
+                    "reason": "" if corr_ok_flag else "corrigé absent",
                     "sujet_url": su_url,
                     "corrige_url": co_url,
                 }
-                st.session_state.library = [item] + st.session_state.library
-                st.success("Pair ajouté")
+                st.session_state.library = [row] + st.session_state.library
+                st.success("Ajouté")
 
-    # -------- RUN --------
+    # --- RUN ---
     with tab2:
         st.markdown("## RUN (preuve F1/F2 + saturation)")
+        lib2 = st.session_state.library
+        corr_ok2 = sum(1 for x in lib2 if x.get("corrige?") and x.get("corrige_url"))
 
         if not st.session_state.pack_active:
             st.error("Pack inactif")
-        elif not st.session_state.library:
+        elif not lib2:
             st.warning("Bibliothèque vide")
+        elif corr_ok2 <= 0:
+            st.error("Aucun corrigé exploitable")
         else:
-            lib2 = st.session_state.library
-            corr_ok2 = sum(1 for x in lib2 if x.get("corrige?") and x.get("corrige_url"))
-            if corr_ok2 <= 0:
-                st.error("Aucun corrigé exploitable")
-            else:
-                max_vol = max(2, min(200, corr_ok2))
-                c1, c2 = st.columns(2)
-                phaseA = c1.slider("Phase A (pairs)", 2, max_vol, min(10, max_vol))
-                phaseB = c2.slider("Phase B (pairs)", 2, max_vol, min(20, max_vol))
+            chapters = pack_chapters(st.session_state.pack_active)
 
-                if phaseB < phaseA:
-                    st.warning("Phase B doit être >= Phase A")
+            max_vol = max(1, min(200, corr_ok2))
+            c1, c2 = st.columns(2)
+            phase_a = c1.slider("Phase A (pairs)", 1, max_vol, min(10, max_vol))
+            phase_b = c2.slider("Phase B (pairs)", 1, max_vol, min(20, max_vol))
 
-                if st.button("LANCER", use_container_width=True):
-                    try:
-                        log(f"=== RUN {APP_VERSION} A={phaseA} B={phaseB} ===")
-                        res = run_granulo_test_AB(lib2, int(phaseA), int(phaseB), st.session_state.pack_active)
+            if st.button("LANCER", use_container_width=True):
+                try:
+                    log(f"=== RUN {APP_VERSION} ===")
+                    res = run_granulo_test_iso(lib2, phase_a, phase_b, chapters)
 
-                        # take Phase B as visible packs
-                        B = res["B"]
-                        st.session_state.qi_pack = B["qi_pack"]
-                        st.session_state.qc_pack = B["qc_pack"]
-                        st.session_state.chapter_report = B["chapter_report"]
-                        st.session_state.last_run_audit = res["audit"]
-                        st.session_state.sealed = bool(res["audit"]["sealed"])
+                    # Keep phaseB as main packs for explorer/exports
+                    st.session_state.qi_pack = res["phaseB"]["qi_pack"]
+                    st.session_state.qc_pack = res["phaseB"]["qc_pack"]
+                    st.session_state.chapter_report = res["phaseB"]["chapter_report"]
+                    st.session_state.selection_report = res["selection_report"]
+                    st.session_state.last_run_audit = res["audit"]
 
-                        st.session_state.run_stats = {
-                            "qi": B["phase_audit"]["qi_total"],
-                            "rqi": B["phase_audit"]["rqi_total"],
-                            "qc": B["phase_audit"]["qc_total"],
-                            "qi_posable": B["phase_audit"]["qi_posable"],
-                        }
+                    sealed = bool(res["audit"]["sealed"])
+                    st.session_state.sealed = sealed
 
-                        if st.session_state.sealed:
-                            st.success("SEALED = YES")
-                        else:
-                            st.warning(
-                                f"SEALED = NO | saturation_ok={res['audit']['saturation_ok']} | sanity_ok={res['audit']['sanity_ok']} | "
-                                f"orphans={res['audit']['orphans']} | posable={res['audit']['posable']}"
-                            )
+                    st.session_state.run_stats = {
+                        "qi": res["audit"]["phaseB"]["qi_total"],
+                        "rqi": res["audit"]["phaseB"]["rqi_total"],
+                        "qc": res["audit"]["phaseB"]["qc_total"],
+                        "qi_posable": res["audit"]["phaseB"]["qi_posable"],
+                        "orphans": res["audit"]["phaseB"]["qi_orphans"],
+                        "sanity_ok": bool(res["audit"]["phaseB"]["sanity_ok"]),
+                    }
 
-                    except Exception as e:
-                        st.error(f"RUN échoué: {e}")
+                    st.info(
+                        f"SEALED = {'YES' if sealed else 'NO'} | "
+                        f"saturation_ok={res['audit']['saturation_ok']} | "
+                        f"sanity_ok={res['audit']['phaseB']['sanity_ok']} | "
+                        f"orphans={res['audit']['phaseB']['qi_orphans']} | "
+                        f"posable={res['audit']['phaseB']['qi_posable']}"
+                    )
+
+                    if not res["audit"]["phaseB"]["sanity_ok"]:
+                        st.error("SANITY FAIL détecté (qualitatif)")
+
+                except Exception as e:
+                    st.error(f"RUN échoué: {e}")
 
         st.markdown("### Logs")
         st.text_area("", logs_text(), height=320)
 
-    # -------- Exports + Explorer --------
+    # --- EXPORTS + EXPLORER ---
     with tab3:
         st.markdown("## Exports")
         metric_row(
@@ -1670,23 +1673,30 @@ def main():
             st.download_button("qc_pack.json", json.dumps(st.session_state.qc_pack, ensure_ascii=False, indent=2), "qc_pack.json")
         if st.session_state.chapter_report:
             st.download_button("chapter_report.json", json.dumps(st.session_state.chapter_report, ensure_ascii=False, indent=2), "chapter_report.json")
+        if st.session_state.selection_report:
+            st.download_button("selection_report.json", json.dumps(st.session_state.selection_report, ensure_ascii=False, indent=2), "selection_report.json")
         if st.session_state.last_run_audit:
-            st.download_button("run_audit.json", json.dumps(st.session_state.last_run_audit, ensure_ascii=False, indent=2), "run_audit.json")
+            st.download_button("audit.json", json.dumps(st.session_state.last_run_audit, ensure_ascii=False, indent=2), "audit.json")
+
+        # saturation sets if exist
+        if st.session_state.last_run_audit:
+            # rebuild from audit structure? (kept in logs for UI; not stored sets here)
+            pass
 
         st.markdown("---")
         st.markdown("## Explorateur QC → Qi → (RQi, Triggers, F1, ARI, FRT)")
 
         if st.session_state.qc_pack and st.session_state.qi_pack:
-            qc_pack = st.session_state.qc_pack
-            qi_pack = st.session_state.qi_pack
-
-            ch_options = ["ALL"] + sorted({qc["chapter_code"] for qc in qc_pack})
+            ch_options = ["ALL"] + sorted({qc["chapter_code"] for qc in st.session_state.qc_pack})
             sel_ch = st.selectbox("Chapitre", ch_options)
 
-            qcs = qc_pack if sel_ch == "ALL" else [q for q in qc_pack if q["chapter_code"] == sel_ch]
+            qcs = st.session_state.qc_pack if sel_ch == "ALL" else [q for q in st.session_state.qc_pack if q["chapter_code"] == sel_ch]
+
             if qcs:
+                # sort by cluster_size desc
+                qcs = sorted(qcs, key=lambda x: (-int(x.get("cluster_size",0)), x.get("qc_id","")))
                 qc_labels = [
-                    f"{q['qc_id']} | {q['chapter_code']} | n={q['cluster_size']} | score={q.get('chapter_score',0)}"
+                    f"{q['qc_id']} | {q['chapter_code']} | n={q['cluster_size']} | Ψ={round(float(q.get('Psi_q',0.0)),3)}"
                     for q in qcs
                 ]
                 sel_idx = st.selectbox("QC", range(len(qc_labels)), format_func=lambda i: qc_labels[i])
@@ -1694,40 +1704,40 @@ def main():
 
                 st.markdown(f"### QC: {qc['qc']}")
                 st.caption(f"qc_id={qc['qc_id']} | chapter={qc['chapter_code']} | cluster_size={qc['cluster_size']}")
+                st.write(f"op_codes={qc.get('op_codes', [])}")
+                st.write(f"triggers_hint={qc.get('triggers_hint', [])}")
 
-                qi_by_id = {q["qi_id"]: q for q in qi_pack}
+                st.markdown("#### F1 (audit)")
+                st.json(qc.get("f1_audit", {}))
 
-                st.markdown("### Qi associées")
-                for qi_id in qc["qi_ids"][:80]:
+                qi_by_id = {q["qi_id"]: q for q in st.session_state.qi_pack}
+
+                st.markdown("#### Qi associées (max 40)")
+                for qi_id in qc.get("qi_ids", [])[:40]:
                     q = qi_by_id.get(qi_id)
                     if not q:
                         continue
 
                     with st.expander(f"{qi_id} | has_rqi={q.get('has_rqi')} | orphan={q.get('is_orphan')}"):
-                        st.markdown("**Qi**")
-                        st.write(q.get("qi", ""))
+                        st.markdown("**Qi (énoncé)**")
+                        st.write(q["qi"][:1200])
 
-                        st.markdown("**RQi**")
-                        st.write(q.get("rqi", "") if q.get("rqi") else "— Pas de RQi alignée —")
+                        st.markdown("**RQi (correction)**")
+                        st.write(q["rqi"][:1200] if q.get("rqi") else "— Pas de RQi alignée —")
 
                         st.markdown("**Triggers**")
                         st.write(q.get("triggers", []))
 
-                        st.markdown("**F1 (audit)**")
-                        st.json(q.get("F1_audit", {}))
-
-                        st.markdown("**ARI (proxy IA1)**")
+                        st.markdown("**ARI**")
                         st.json(q.get("ari", {}))
 
-                        st.markdown("**FRT (proxy)**")
+                        st.markdown("**FRT**")
                         st.json(q.get("frt", {}))
 
         st.markdown("---")
-        st.markdown("## Audit")
+        st.markdown("## Audit (dernier RUN)")
         if st.session_state.last_run_audit:
             st.json(st.session_state.last_run_audit)
-        else:
-            st.info("Aucun audit (lancez RUN).")
 
 
 if __name__ == "__main__":
