@@ -1,12 +1,16 @@
 # =============================================================================
-# SMAXIA GTE Console V31.10.16 — ISO-PROD (CORRECTIONS DEFINITIVES + ANTI-FAKE)
+# SMAXIA GTE Console V31.10.18 — ISO-PROD (ZÉRO HARDCODE RÉEL)
 # =============================================================================
-# CORRECTIONS vs V31.10.15:
-# 1) Alignement Qi↔RQi: SUPPRESSION du fallback séquentiel (anti “fake POSABLE”)
-# 2) Zéro orphelin SANS TRICHE: création de QC même si posable_in_cluster=0
-#    → QC marquées qc_state="UNPOSABLE" (mappage Qi→QC garanti)
-# 3) Audit d’alignement: stockage mode + score pour chaque Qi (preuve)
-# 4) UI inchangée (tabs/boutons/exports identiques) — NO REGRESSION INTENTIONNELLE
+# FUSION:
+# - V31.10.17: Corrections saturation, clustering stable par primary_op
+# - Manus V32: Architecture Pack-Driven, F1/F2 conformes
+# - GPT Audit: Externalisation complète des hardcodes
+#
+# PRINCIPE ZÉRO HARDCODE:
+# - AUCUNE donnée métier (chapitres, keywords, patterns) dans le code
+# - TOUT est piloté par le Country Academic Pack (CAP)
+# - Le Pack est OBLIGATOIRE (upload JSON ou fichier externe)
+# - Mode Genesis = Pack JSON minimal généré, PAS de données hardcodées
 # =============================================================================
 
 from __future__ import annotations
@@ -16,7 +20,6 @@ import os
 import re
 import json
 import glob
-import math
 import hashlib
 import unicodedata
 from datetime import datetime
@@ -27,59 +30,49 @@ import streamlit as st
 
 try:
     import pdfplumber
-except Exception:
+except ImportError:
     pdfplumber = None
 
 try:
     from pypdf import PdfReader
-except Exception:
+except ImportError:
     PdfReader = None
 
 try:
     from bs4 import BeautifulSoup
-except Exception:
+except ImportError:
     BeautifulSoup = None
 
 
-# -----------------------------------------------------------------------------
-# SETTINGS
-# -----------------------------------------------------------------------------
-APP_VERSION = "V31.10.16"
+# =============================================================================
+# KERNEL CONSTANTS (INVARIANTS TECHNIQUES - PAS DE DONNÉES MÉTIER)
+# =============================================================================
+APP_VERSION = "V31.10.18"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 REQ_TIMEOUT = 30
 MAX_PDF_MB = 35
 
-DEFAULT_COUNTRY = "FR"
-DEFAULT_LEVEL = "TERMINALE"
-DEFAULT_SUBJECTS = ["MATH"]
-
-APMEP_ROOT_BY_LEVEL = {
-    "TERMINALE": "https://www.apmep.fr/Annales-du-Bac-Terminale",
-    "PREMIERE": "https://www.apmep.fr/Annales-du-Bac-Premiere",
-    "SECONDE": "https://www.apmep.fr/Annales-du-Bac-Seconde",
-}
-
-# F1/F2 constants
+# Constantes mathématiques F1/F2 (invariants selon Kernel V10.6.1)
 F1_EPSILON = 1e-6
 F2_ALPHA = 1.0
 F2_TREC = 1.0
 
 
-# -----------------------------------------------------------------------------
-# SESSION
-# -----------------------------------------------------------------------------
+# =============================================================================
+# SESSION & LOGS
+# =============================================================================
 def _utc_ts() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
 def ss_init():
+    """Initialise l'état de session Streamlit - AUCUNE valeur métier par défaut."""
     st.session_state.setdefault("pack_active", None)
     st.session_state.setdefault("pack_id", None)
-    st.session_state.setdefault("pack_path", None)
     st.session_state.setdefault("pack_sig_sha256", None)
-    st.session_state.setdefault("country", DEFAULT_COUNTRY)
-    st.session_state.setdefault("level", DEFAULT_LEVEL)
-    st.session_state.setdefault("subjects", DEFAULT_SUBJECTS[:])
+    st.session_state.setdefault("country", None)  # Pas de défaut FR
+    st.session_state.setdefault("level", None)     # Pas de défaut TERMINALE
+    st.session_state.setdefault("subject", None)   # Pas de défaut MATH
     st.session_state.setdefault("library", [])
     st.session_state.setdefault("harvest_manifest", None)
     st.session_state.setdefault("qi_pack", None)
@@ -88,12 +81,10 @@ def ss_init():
     st.session_state.setdefault("selection_report", None)
     st.session_state.setdefault("sealed", False)
     st.session_state.setdefault("logs", [])
-    st.session_state.setdefault(
-        "run_stats",
-        {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0, "orphans": 0, "sanity_ok": False},
-    )
+    st.session_state.setdefault("run_stats", {
+        "qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0, "orphans": 0, "sanity_ok": False
+    })
     st.session_state.setdefault("last_run_audit", None)
-    st.session_state.setdefault("_uploads", {})
     st.session_state.setdefault("_http_pdf_cache", {})
 
 
@@ -105,9 +96,9 @@ def logs_text() -> str:
     return "\n".join(st.session_state.logs[-8000:])
 
 
-# -----------------------------------------------------------------------------
-# TEXT UTILS
-# -----------------------------------------------------------------------------
+# =============================================================================
+# TEXT UTILS (KERNEL INVARIANT - AUCUNE DONNÉE MÉTIER)
+# =============================================================================
 def norm_text(s: str) -> str:
     s = (s or "").replace("\u00a0", " ")
     s = unicodedata.normalize("NFKD", s)
@@ -138,57 +129,205 @@ def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+# =============================================================================
+# COUNTRY ACADEMIC PACK (CAP) - TOUT VIENT DU PACK
+# =============================================================================
+def validate_pack_structure(pack: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Valide la structure minimale d'un Pack."""
+    errors = []
+    
+    # Champs obligatoires
+    required = ["pack_id", "country_code", "harvest_sources", "chapter_taxonomy"]
+    for field in required:
+        if field not in pack:
+            errors.append(f"Champ obligatoire manquant: {field}")
+    
+    # Validation harvest_sources
+    sources = pack.get("harvest_sources", [])
+    if not sources:
+        errors.append("harvest_sources vide ou manquant")
+    else:
+        for i, src in enumerate(sources):
+            if "base_url" not in src:
+                errors.append(f"harvest_sources[{i}]: base_url manquant")
+            if "levels" not in src:
+                errors.append(f"harvest_sources[{i}]: levels manquant")
+    
+    # Validation chapter_taxonomy
+    taxonomy = pack.get("chapter_taxonomy", {})
+    if not taxonomy:
+        errors.append("chapter_taxonomy vide")
+    
+    # Validation text_processing (optionnel mais recommandé)
+    text_proc = pack.get("text_processing", {})
+    if not text_proc.get("common_words"):
+        log("[PACK] Warning: text_processing.common_words absent")
+    if not text_proc.get("intent_verbs"):
+        log("[PACK] Warning: text_processing.intent_verbs absent")
+    
+    # Validation ari_config (obligatoire pour ARI)
+    if "ari_config" not in pack:
+        errors.append("ari_config manquant (requis pour extraction ARI)")
+    else:
+        ari = pack["ari_config"]
+        if not ari.get("op_patterns"):
+            errors.append("ari_config.op_patterns manquant")
+        if not ari.get("primary_ops_order"):
+            errors.append("ari_config.primary_ops_order manquant")
+    
+    return len(errors) == 0, errors
 
 
-# -----------------------------------------------------------------------------
-# PDF TEXT EXTRACTION — ROBUSTE
-# -----------------------------------------------------------------------------
-def _fix_missing_spaces(text: str) -> str:
-    """
-    Répare le texte PDF où les espaces sont manquants.
-    Détecte les patterns comme "motmot" → "mot mot"
-    """
+def load_pack_from_file(path: str) -> Dict[str, Any]:
+    """Charge un Pack depuis un fichier JSON."""
+    with open(path, "r", encoding="utf-8") as f:
+        pack = json.load(f)
+    pack["_source"] = "FILE"
+    pack["_file_path"] = os.path.abspath(path)
+    pack["_pack_sig_sha256"] = sha256_bytes(json.dumps(pack, sort_keys=True).encode())
+    return pack
+
+
+def load_pack_from_upload(uploaded_bytes: bytes) -> Dict[str, Any]:
+    """Charge un Pack depuis un upload."""
+    pack = json.loads(uploaded_bytes.decode("utf-8"))
+    pack["_source"] = "UPLOAD"
+    pack["_pack_sig_sha256"] = sha256_bytes(json.dumps(pack, sort_keys=True).encode())
+    return pack
+
+
+def find_pack_files(search_paths: List[str] = None) -> List[str]:
+    """Recherche des fichiers Pack JSON."""
+    if search_paths is None:
+        search_paths = [
+            os.getcwd(),
+            os.path.join(os.getcwd(), "packs"),
+            os.path.join(os.getcwd(), "academic_packs"),
+            "/tmp",
+        ]
+    
+    found = []
+    for base in search_paths:
+        if os.path.isdir(base):
+            for f in glob.glob(os.path.join(base, "CAP_*.json")):
+                if os.path.isfile(f):
+                    found.append(f)
+    return sorted(set(found))
+
+
+def activate_pack(pack: Dict[str, Any]) -> bool:
+    """Active un Pack après validation."""
+    valid, errors = validate_pack_structure(pack)
+    
+    if not valid:
+        for e in errors:
+            log(f"[PACK] ERREUR: {e}")
+        return False
+    
+    st.session_state.pack_active = pack
+    st.session_state.pack_id = pack.get("pack_id", "UNKNOWN")
+    st.session_state.pack_sig_sha256 = pack.get("_pack_sig_sha256", "")
+    st.session_state.country = pack.get("country_code", "")
+    
+    # Extraire les niveaux et matières disponibles
+    taxonomy = pack.get("chapter_taxonomy", {})
+    subjects = list(taxonomy.keys())
+    if subjects:
+        st.session_state.subject = subjects[0]
+        levels = list(taxonomy[subjects[0]].keys())
+        if levels:
+            st.session_state.level = levels[0]
+    
+    log(f"[PACK] Activé: {st.session_state.pack_id} | Source: {pack.get('_source')}")
+    return True
+
+
+# =============================================================================
+# PACK ACCESSORS (TOUT VIENT DU PACK)
+# =============================================================================
+def pack_get_chapters(pack: Dict[str, Any], subject: str, level: str) -> List[Dict[str, Any]]:
+    """Récupère les chapitres depuis le Pack."""
+    taxonomy = pack.get("chapter_taxonomy", {})
+    return taxonomy.get(subject, {}).get(level, [])
+
+
+def pack_get_harvest_source(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Récupère la première source de harvest."""
+    sources = pack.get("harvest_sources", [])
+    return sources[0] if sources else None
+
+
+def pack_get_text_processing(pack: Dict[str, Any]) -> Dict[str, Any]:
+    """Récupère la config de traitement texte."""
+    return pack.get("text_processing", {})
+
+
+def pack_get_ari_config(pack: Dict[str, Any]) -> Dict[str, Any]:
+    """Récupère la config ARI (patterns, ordre des ops)."""
+    return pack.get("ari_config", {})
+
+
+def pack_get_f1f2_params(pack: Dict[str, Any]) -> Dict[str, float]:
+    """Récupère les paramètres F1/F2 (avec fallback sur constantes Kernel)."""
+    params = pack.get("f1_f2_params", {})
+    return {
+        "epsilon": float(params.get("epsilon", F1_EPSILON)),
+        "alpha": float(params.get("alpha", F2_ALPHA)),
+        "t_rec": float(params.get("t_rec_default", F2_TREC)),
+    }
+
+
+# =============================================================================
+# PDF TEXT EXTRACTION (PACK-DRIVEN)
+# =============================================================================
+def _fix_missing_spaces(text: str, text_proc: Dict[str, Any]) -> str:
+    """Réparation des espaces manquants, pilotée par le Pack."""
     if not text:
         return ""
-
-    # Pattern: minuscule suivie de majuscule sans espace
-    text = re.sub(
-        r"([a-zéèêëàâäùûüôöîïç])([A-ZÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])", r"\1 \2", text
-    )
-
-    # Pattern: chiffre collé à lettre
-    text = re.sub(
-        r"(\d)([a-zA-ZéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])", r"\1 \2", text
-    )
-    text = re.sub(
-        r"([a-zA-ZéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])(\d)", r"\1 \2", text
-    )
-
-    # Pattern: ponctuation collée au mot suivant
-    text = re.sub(
-        r"([.!?;:,])([A-Za-zéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])", r"\1 \2", text
-    )
-
-    # Pattern: mots français collés (heuristique basique)
-    def split_long_words(match):
+    
+    # Appliquer les patterns depuis le Pack
+    for item in text_proc.get("glued_patterns", []):
+        try:
+            pattern = item.get("pattern", "")
+            replacement = item.get("replacement", "")
+            if pattern:
+                text = re.sub(pattern, replacement, text)
+        except re.error:
+            pass
+    
+    # Heuristique avec dictionnaire de mots du Pack
+    common_words = set(text_proc.get("common_words", []))
+    if not common_words:
+        return re.sub(r"\s+", " ", text).strip()
+    
+    def split_glued_word(match):
         word = match.group(0)
-        if len(word) > 25:
-            word = re.sub(
-                r"(que|qui|dont|ou|et|de|la|le|les|un|une|des|en|à|par|pour|sur|avec|dans|est|sont|soit|donc|car|mais|alors|ainsi|comme)",
-                r" \1 ",
-                word,
-            )
-            word = re.sub(r"\s+", " ", word).strip()
+        if len(word) < 8:
+            return word
+        
+        result = []
+        i = 0
+        while i < len(word):
+            found = False
+            for length in range(min(12, len(word) - i), 2, -1):
+                candidate = word[i:i+length].lower()
+                if candidate in common_words:
+                    if result:
+                        result.append(" ")
+                    result.append(word[i:i+length])
+                    i += length
+                    found = True
+                    break
+            if not found:
+                result.append(word[i])
+                i += 1
+        
+        reconstructed = "".join(result)
+        if " " in reconstructed and len(reconstructed) > len(word):
+            return reconstructed
         return word
-
-    text = re.sub(r"[a-zéèêëàâäùûüôöîïç]{25,}", split_long_words, text)
-
+    
+    text = re.sub(r"[a-zA-ZéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ]{15,}", split_glued_word, text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -201,16 +340,9 @@ def _dehyphenate(text: str) -> str:
     return text
 
 
-def _looks_like_page_number(line: str) -> bool:
-    s = norm_text(line)
-    return bool(re.fullmatch(r"\d{1,3}", s) or re.fullmatch(r"page\s*\d{1,3}", s))
-
-
 def _extract_pages_pdfplumber(pdf_bytes: bytes, max_pages: int = 120) -> List[str]:
-    """Extraction via pdfplumber avec reconstruction du texte."""
     if not pdfplumber:
         return []
-
     pages = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -222,15 +354,12 @@ def _extract_pages_pdfplumber(pdf_bytes: bytes, max_pages: int = 120) -> List[st
                     pages.append("")
     except Exception:
         pass
-
     return pages
 
 
 def _extract_pages_pypdf(pdf_bytes: bytes, max_pages: int = 120) -> List[str]:
-    """Extraction via pypdf comme fallback."""
     if not PdfReader:
         return []
-
     pages = []
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -242,237 +371,89 @@ def _extract_pages_pypdf(pdf_bytes: bytes, max_pages: int = 120) -> List[str]:
                 pages.append("")
     except Exception:
         pass
-
     return pages
 
 
-def clean_pdf_text(pages: List[str]) -> str:
-    """Nettoie et reconstruit le texte extrait des pages PDF."""
+def clean_pdf_text(pages: List[str], text_proc: Dict[str, Any]) -> str:
+    """Nettoie le texte PDF avec config du Pack."""
     if not pages:
         return ""
-
+    
     page_lines = []
     for p in pages:
         p = (p or "").replace("\r", "\n")
         p = _dehyphenate(p)
-        p = _fix_missing_spaces(p)
+        p = _fix_missing_spaces(p, text_proc)
         lines = [ln.strip() for ln in p.split("\n") if ln.strip()]
         page_lines.append(lines)
-
+    
     # Détection headers/footers répétés
     top_counts, bot_counts = {}, {}
     n_pages = len(page_lines)
-
+    
     for lines in page_lines:
-        for ln in lines[:3]:
-            key = norm_text(ln)[:100]
-            if key and len(key) > 5:
-                top_counts[key] = top_counts.get(key, 0) + 1
-        for ln in lines[-3:]:
-            key = norm_text(ln)[:100]
-            if key and len(key) > 5:
-                bot_counts[key] = bot_counts.get(key, 0) + 1
-
-    threshold = max(2, int(0.4 * n_pages))
-    header_keys = {k for k, c in top_counts.items() if c >= threshold}
-    footer_keys = {k for k, c in bot_counts.items() if c >= threshold}
-
-    cleaned_pages = []
+        if lines:
+            top_counts[lines[0]] = top_counts.get(lines[0], 0) + 1
+        if len(lines) > 1:
+            bot_counts[lines[-1]] = bot_counts.get(lines[-1], 0) + 1
+    
+    threshold = max(2, n_pages // 3)
+    skip_top = {k for k, v in top_counts.items() if v >= threshold}
+    skip_bot = {k for k, v in bot_counts.items() if v >= threshold}
+    
+    out_lines = []
     for lines in page_lines:
-        keep = []
-        for ln in lines:
-            k = norm_text(ln)[:100]
-            if k in header_keys or k in footer_keys:
+        for i, ln in enumerate(lines):
+            if i == 0 and ln in skip_top:
                 continue
-            if _looks_like_page_number(ln):
+            if i == len(lines) - 1 and ln in skip_bot:
                 continue
-            if len(ln.strip()) < 3:
+            # Numéros de page (pattern universel)
+            if re.fullmatch(r"\d{1,3}", ln.strip()):
                 continue
-            keep.append(ln)
-        cleaned_pages.append("\n".join(keep))
-
-    text = "\n\n".join([p for p in cleaned_pages if p.strip()])
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+            out_lines.append(ln)
+        out_lines.append("")
+    
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out_lines)).strip()
 
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """
-    Extraction robuste: essaie pdfplumber, puis pypdf, avec reconstruction.
-    """
+def extract_text_from_pdf(pdf_bytes: bytes, text_proc: Dict[str, Any]) -> str:
+    """Extrait le texte d'un PDF."""
     pages = _extract_pages_pdfplumber(pdf_bytes)
-    text = clean_pdf_text(pages)
-
-    if text:
-        space_ratio = text.count(" ") / max(1, len(text))
-        if space_ratio >= 0.08:
-            return text
-        log(f"[PDF] pdfplumber space_ratio={space_ratio:.2%} (faible), essai pypdf")
-
-    pages2 = _extract_pages_pypdf(pdf_bytes)
-    text2 = clean_pdf_text(pages2)
-
-    if text2:
-        space_ratio2 = text2.count(" ") / max(1, len(text2))
-        if space_ratio2 > (text.count(" ") / max(1, len(text)) if text else 0):
-            log(f"[PDF] pypdf meilleur space_ratio={space_ratio2:.2%}")
-            return text2
-
-    return text if text else text2
+    if not pages:
+        pages = _extract_pages_pypdf(pdf_bytes)
+    return clean_pdf_text(pages, text_proc)
 
 
-# -----------------------------------------------------------------------------
-# HTTP + PDF CACHE
-# -----------------------------------------------------------------------------
+# =============================================================================
+# HTTP & PDF FETCH
+# =============================================================================
 def _http_get(url: str) -> requests.Response:
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=REQ_TIMEOUT)
-    r.raise_for_status()
-    return r
-
-
-def download_pdf_bytes(url: str) -> bytes:
-    r = _http_get(url)
-    if len(r.content) / (1024 * 1024) > MAX_PDF_MB:
-        raise ValueError("PDF trop volumineux")
-    return r.content
+    res = requests.get(url, headers={"User-Agent": UA}, timeout=REQ_TIMEOUT)
+    res.raise_for_status()
+    return res
 
 
 def fetch_pdf_bytes(url: str) -> bytes:
-    if url.startswith("local://"):
-        data = st.session_state.get("_uploads", {}).get(url)
-        if not data:
-            raise RuntimeError(f"Upload local introuvable: {url}")
-        return data
+    """Télécharge un PDF avec cache."""
     cache = st.session_state.get("_http_pdf_cache", {})
     if url in cache:
         return cache[url]
-    b = download_pdf_bytes(url)
-    cache[url] = b
-    st.session_state._http_pdf_cache = cache
-    return b
+    
+    res = _http_get(url)
+    pdf_bytes = res.content
+    
+    if len(pdf_bytes) > MAX_PDF_MB * 1024 * 1024:
+        raise ValueError(f"PDF trop volumineux: {len(pdf_bytes) / (1024*1024):.1f} MB")
+    
+    cache[url] = pdf_bytes
+    st.session_state["_http_pdf_cache"] = cache
+    return pdf_bytes
 
 
-# -----------------------------------------------------------------------------
-# PACK GENESIS
-# -----------------------------------------------------------------------------
-def _pack_genesis_fr_math(n_chapters: int) -> Dict[str, Any]:
-    themes = [
-        ("CH_001_ANALYSE", ["limite", "continuite", "derivee", "derivation", "variation", "convexite", "integrale", "primitive", "fonction"]),
-        ("CH_002_PROBABILITES", ["probabilite", "loi", "binomiale", "normale", "esperance", "variance", "variable", "aleatoire", "evenement"]),
-        ("CH_003_SUITES", ["suite", "recurrence", "convergence", "arithmetique", "geometrique", "terme"]),
-        ("CH_004_COMPLEXES", ["complexe", "affixe", "module", "argument", "imaginaire", "conjugue"]),
-        ("CH_005_GEOMETRIE", ["vecteur", "plan", "espace", "droite", "orthogonal", "scalaire", "repere", "coordonnees"]),
-        ("CH_006_ALGORITHMES", ["algo", "algorithme", "python", "boucle", "programme", "instruction"]),
-        ("CH_007_EQUATIONS", ["equation", "systeme", "inequation", "discriminant", "racine", "solution", "resoudre"]),
-        ("CH_008_FONCTIONS", ["fonction", "courbe", "image", "antecedent", "composition", "graphe"]),
-        ("CH_009_TRIGO", ["sinus", "cosinus", "tangente", "trigonometrie", "radian", "angle", "cos", "sin"]),
-        ("CH_010_LOGEXP", ["logarithme", "ln", "exp", "exponentielle", "log"]),
-        ("CH_011_VECTMATR", ["matrice", "determinant", "vecteur", "base", "dimension"]),
-        ("CH_012_STAT", ["statistique", "moyenne", "ecart", "mediane", "quartile", "frequence"]),
-    ]
-    themes = themes[: max(1, min(n_chapters, len(themes)))]
-
-    return {
-        "pack_id": "CAP_FR_GENESIS_V1",
-        "country_code": "FR",
-        "country_label": "France",
-        "version": "1.0.0",
-        "_source": "GENERATED_FILE",
-        "chapters": [
-            {"chapter_code": code, "chapter_label": code.replace("_", " "), "keywords": kws, "delta_c": 1.0}
-            for (code, kws) in themes
-        ],
-    }
-
-
-def _candidate_pack_paths(country: str) -> List[str]:
-    candidates = [
-        os.path.join(os.getcwd(), "academic_packs", f"CAP_{country}_BAC_2024_V1.json"),
-        os.path.join(os.getcwd(), "packs", f"CAP_{country}_BAC_2024_V1.json"),
-        os.path.join(os.getcwd(), f"CAP_{country}_BAC_2024_V1.json"),
-    ]
-    candidates += glob.glob(os.path.join(os.getcwd(), "**", f"CAP_{country}_*.json"), recursive=True)
-    out, seen = [], set()
-    for p in candidates:
-        ap = os.path.abspath(p)
-        if ap not in seen and os.path.isfile(ap):
-            seen.add(ap)
-            out.append(ap)
-    return out
-
-
-def _safe_read_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _write_tmp_pack(pack: Dict[str, Any]) -> str:
-    raw = json.dumps(pack, ensure_ascii=False, indent=2).encode("utf-8")
-    sid = stable_id(sha256_bytes(raw), _utc_ts())
-    path = f"/tmp/smaxia_pack_{pack.get('pack_id','PACK')}_{sid}.json"
-    with open(path, "wb") as f:
-        f.write(raw)
-    return path
-
-
-def load_academic_pack(country: str, allow_genesis: bool, genesis_n_chapters: int, uploaded_pack: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if uploaded_pack:
-        tmp_path = _write_tmp_pack(uploaded_pack)
-        sig = sha256_file(tmp_path)
-        uploaded_pack["_source"] = "UPLOADED_FILE"
-        uploaded_pack["_pack_file_path"] = tmp_path
-        uploaded_pack["_pack_sig_sha256"] = sig
-        log(f"[PACK] Loaded UPLOADED_FILE pack_id={uploaded_pack.get('pack_id')} sha256={sig}")
-        return uploaded_pack
-
-    paths = _candidate_pack_paths(country)
-    log(f"[PACK] Searching for country={country} | candidates={len(paths)}")
-
-    for path in paths[:30]:
-        try:
-            pack = _safe_read_json(path)
-            pack_id = str(pack.get("pack_id") or pack.get("id") or "").strip()
-            chapters = pack.get("chapters") or []
-            if pack_id and isinstance(chapters, list) and len(chapters) > 0:
-                pack["_pack_file_path"] = os.path.abspath(path)
-                pack["_source"] = "FILE"
-                pack["_pack_sig_sha256"] = sha256_file(pack["_pack_file_path"])
-                log(f"[PACK] Loaded FILE: {pack_id} sha256={pack['_pack_sig_sha256']}")
-                return pack
-        except Exception as e:
-            log(f"[PACK] Failed: {path} | {e}")
-
-    if allow_genesis:
-        pack = _pack_genesis_fr_math(int(genesis_n_chapters))
-        tmp_path = _write_tmp_pack(pack)
-        sig = sha256_file(tmp_path)
-        pack["_pack_file_path"] = tmp_path
-        pack["_pack_sig_sha256"] = sig
-        log(f"[PACK] Activated GENERATED_FILE (Genesis) path={tmp_path} sha256={sig}")
-        return pack
-
-    raise RuntimeError(f"Aucun pack FILE trouvé pour {country} et Genesis interdit")
-
-
-def pack_chapters(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
-    ch = pack.get("chapters") or []
-    out = []
-    for item in ch:
-        if isinstance(item, dict):
-            code = str(item.get("chapter_code") or item.get("code") or "").strip()
-            label = str(item.get("chapter_label") or item.get("label") or code).strip()
-            if code:
-                out.append({
-                    "chapter_code": code,
-                    "chapter_label": label,
-                    "keywords": item.get("keywords", []),
-                    "delta_c": float(item.get("delta_c", 1.0) or 1.0),
-                })
-    return out
-
-
-# -----------------------------------------------------------------------------
-# HARVEST APMEP — STRICT MATCHING
-# -----------------------------------------------------------------------------
+# =============================================================================
+# HARVEST (100% PACK-DRIVEN)
+# =============================================================================
 def _soup(html: str):
     if BeautifulSoup is None:
         raise RuntimeError("bs4 non installé")
@@ -483,282 +464,252 @@ def _abs_url(base: str, href: str) -> str:
     return href if href.startswith("http") else requests.compat.urljoin(base, href)
 
 
-def _is_meta_pdf(url: str, label: str) -> bool:
-    s = norm_text(url + " " + (label or ""))
-    return any(w in s for w in ["index", "sommaire", "liste", "annexe", "grille", "formulaire"])
-
-
-def _is_corrige_label(url: str, label: str) -> bool:
-    s = norm_text(os.path.basename(url) + " " + (label or ""))
-    return "corrig" in s or "correction" in s or "solution" in s
-
-
-def _extract_geo_date(name: str) -> Tuple[str, str]:
-    s = norm_text(name).replace(".pdf", "")
-
-    zones = [
-        "metro", "metropole", "amerique", "nord", "sud", "asie", "polynesie",
-        "etranger", "centre", "antilles", "guyane", "caledonie", "nouvelle", "liban",
-    ]
-
-    geo = ""
-    for z in zones:
-        if z in s:
-            geo = z
-            break
-
-    date_match = re.search(r"j[12][\s_]*\d{1,2}[\s_]*\d{1,2}", s)
-    date_part = date_match.group(0) if date_match else ""
-
-    return (geo, date_part)
-
-
-def _match_score_strict(sujet_name: str, corrige_name: str) -> float:
-    s_geo, s_date = _extract_geo_date(sujet_name)
-    c_geo, c_date = _extract_geo_date(corrige_name)
-
-    score = 0.0
-
-    if s_geo and c_geo:
-        if s_geo == c_geo:
-            score += 0.5
-        else:
-            return 0.0
-
-    if s_date and c_date:
-        if s_date == c_date:
-            score += 0.3
-        elif s_date[:2] == c_date[:2]:
-            score += 0.15
-
-    s_tok = set(tokenize(sujet_name))
-    c_tok = set(tokenize(corrige_name))
-    if s_tok and c_tok:
-        jaccard_score = len(s_tok & c_tok) / len(s_tok | c_tok)
-        score += 0.2 * jaccard_score
-
-    return min(1.0, score)
-
-
-def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) -> Dict[str, Any]:
-    if level not in APMEP_ROOT_BY_LEVEL:
-        raise ValueError(f"Niveau non supporté: {level}")
-
-    root = APMEP_ROOT_BY_LEVEL[level]
-    log(f"[HARVEST] scope={level}|{subject} root={root}")
-
+def harvest_from_pack(pack: Dict[str, Any], level: str, subject: str, 
+                      years_back: int, volume_max: int) -> Dict[str, Any]:
+    """
+    Harvest 100% piloté par le Pack.
+    Tous les patterns, URLs, zones géo viennent du Pack.
+    """
+    source = pack_get_harvest_source(pack)
+    if not source:
+        raise ValueError("Aucune source de harvest dans le Pack")
+    
+    base_url = source.get("base_url", "")
+    level_path = source.get("levels", {}).get(level)
+    if not level_path:
+        raise ValueError(f"Niveau '{level}' non configuré dans le Pack")
+    
+    root = f"{base_url}{level_path}"
+    log(f"[HARVEST] root={root}")
+    
+    # Tous les patterns viennent du Pack
+    year_pattern = source.get("year_pattern", r"(20\d{2})")
+    meta_exclude = source.get("meta_exclude", [])
+    corrige_patterns = source.get("pdf_patterns", {}).get("corrige", [])
+    geo_zones = source.get("geographic_zones", [])
+    
     html = _http_get(root).text
     sp = _soup(html)
-
+    
+    # Trouver les liens années
     year_links = []
     for a in sp.find_all("a"):
         href = a.get("href") or ""
-        m = re.search(r"Annee-(20\d{2})", href)
+        m = re.search(year_pattern, href)
         if m:
             year_links.append((int(m.group(1)), _abs_url(root, href)))
-
+    
     year_links = sorted(set(year_links), key=lambda x: -x[0])
     if not year_links:
         raise RuntimeError("Aucune page Année trouvée")
-
+    
     current_year = year_links[0][0]
     min_year = current_year - max(1, years_back) + 1
     selected = [(y, u) for (y, u) in year_links if y >= min_year]
-    log(f"[HARVEST] years={len(selected)} (min={min_year})")
-
+    log(f"[HARVEST] années={len(selected)} (min={min_year})")
+    
     pairs = []
     corrige_ok = 0
-
+    
     for (y, url) in selected:
         if len(pairs) >= volume_max:
             break
-
         try:
             y_html = _http_get(url).text
             y_sp = _soup(y_html)
-
             pdf_links = []
+            
             for a in y_sp.find_all("a"):
                 href = (a.get("href") or "").strip()
                 if not href.lower().endswith(".pdf"):
                     continue
                 absu = _abs_url(url, href)
                 label = (a.get_text() or "").strip()
-                if _is_meta_pdf(absu, label):
+                
+                # Exclure meta PDFs selon le Pack
+                s = norm_text(absu + " " + label)
+                if any(w in s for w in meta_exclude):
                     continue
+                
+                # Détecter corrigé selon patterns du Pack
+                is_corrige = any(p in s for p in corrige_patterns)
+                
                 pdf_links.append({
                     "url": absu,
                     "name": os.path.basename(absu),
                     "label": label,
-                    "is_corrige": _is_corrige_label(absu, label),
+                    "is_corrige": is_corrige,
                 })
-
+            
             if not pdf_links:
                 continue
-
-            subjects = [p for p in pdf_links if not p["is_corrige"]]
+            
+            sujets = [p for p in pdf_links if not p["is_corrige"]]
             corriges = [p for p in pdf_links if p["is_corrige"]]
-
             used_corr = set()
-
-            for s in subjects:
+            
+            for suj in sujets:
                 if len(pairs) >= volume_max:
                     break
-
+                
+                # Matching sujet-corrigé
                 best = (None, 0.0)
-                for c in corriges:
-                    if c["url"] in used_corr:
+                for corr in corriges:
+                    if corr["url"] in used_corr:
                         continue
-                    score = _match_score_strict(s["name"], c["name"])
+                    
+                    # Score basé sur zones géo du Pack
+                    s_name = norm_text(suj["name"])
+                    c_name = norm_text(corr["name"])
+                    
+                    score = 0.0
+                    s_geo = next((z for z in geo_zones if z in s_name), "")
+                    c_geo = next((z for z in geo_zones if z in c_name), "")
+                    
+                    if s_geo and c_geo:
+                        if s_geo == c_geo:
+                            score += 0.5
+                        else:
+                            continue  # Zones différentes = pas de match
+                    
+                    # Jaccard sur noms
+                    s_tok = set(tokenize(suj["name"]))
+                    c_tok = set(tokenize(corr["name"]))
+                    if s_tok and c_tok:
+                        score += 0.3 * len(s_tok & c_tok) / len(s_tok | c_tok)
+                    
                     if score > best[1]:
-                        best = (c, score)
-
-                corrige = best[0] if best[1] >= 0.4 else None
+                        best = (corr, score)
+                
+                corrige = best[0] if best[1] >= 0.3 else None
                 if corrige:
                     used_corr.add(corrige["url"])
-
-                pair_id = f"PAIR_{level}|{subject}_{y}_{stable_id(s['name'], str(corrige['name'] if corrige else ''))}"
+                
+                pair_id = f"PAIR_{level}_{subject}_{y}_{stable_id(suj['name'])}"
                 item = {
                     "pair_id": pair_id,
                     "scope": f"{level}|{subject}",
-                    "source": f"APMEP {y}",
+                    "source": f"{source.get('source_id', 'SRC')} {y}",
                     "year": y,
-                    "sujet": s["name"],
+                    "sujet": suj["name"],
                     "corrige?": bool(corrige),
                     "corrige_name": corrige["name"] if corrige else "",
                     "match_score": round(best[1], 2) if corrige else 0.0,
-                    "reason": "" if corrige else "corrigé absent ou non matchable",
-                    "sujet_url": s["url"],
+                    "sujet_url": suj["url"],
                     "corrige_url": corrige["url"] if corrige else "",
                 }
-
+                
                 if not any(x["sujet_url"] == item["sujet_url"] for x in pairs):
                     pairs.append(item)
                     if item["corrige?"]:
                         corrige_ok += 1
-
-            log(f"[HARVEST] year={y} pdfs={len(pdf_links)} sujets={len(subjects)} corriges={len(corriges)} pairs_ok={corrige_ok}")
-
+            
+            log(f"[HARVEST] year={y} pdfs={len(pdf_links)} pairs={len([p for p in pairs if p['year']==y])}")
+        
         except Exception as e:
-            log(f"[HARVEST] year={y} FAILED: {e}")
-
+            log(f"[HARVEST] year={y} ERREUR: {e}")
+    
     return {
         "version": APP_VERSION,
         "timestamp": _utc_ts(),
-        "country": st.session_state.country,
+        "pack_id": pack.get("pack_id"),
+        "country": pack.get("country_code"),
         "level": level,
-        "subjects": [subject],
+        "subject": subject,
         "items_total": len(pairs),
         "items_corrige_ok": corrige_ok,
         "library": pairs,
     }
 
 
-# -----------------------------------------------------------------------------
-# Qi / RQi EXTRACTION — AMÉLORÉE
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Qi/RQi EXTRACTION (PACK-DRIVEN)
+# =============================================================================
+# Patterns de segmentation (universels, pas spécifiques à une langue)
+_EXERCICE_RE = re.compile(r"(?i)(?:^|\n)\s*(?:EXERCICE|Exercise|Ex\.?)\s*(\d+|[IVX]+)", re.MULTILINE)
+_PARTIE_RE = re.compile(r"(?i)(?:^|\n)\s*(?:PARTIE|Part)\s*([A-Z]|\d+)", re.MULTILINE)
+_QUESTION_RE = re.compile(r"(?m)^\s*(\d{1,2}|[a-h]|[ivx]{1,4})\s*[\)\.\-:]\s+")
 _MATH_SYMBOL_RE = re.compile(r"[=<>≤≥∈∀∃∑∏∫√≈≠→↦±×÷]")
-_Q_MARKER_RE = re.compile(r"(?m)^\s*(\d{1,3}|[a-h]|[ivxIVX]{1,8})\s*[\)\.\-:]\s+")
-
-_INTENT_RE = re.compile(
-    r"\b("
-    r"montrer|demontrer|prouver|justifier|determiner|calculer|resoudre|etudier|"
-    r"donner|exprimer|simplifier|trouver|verifier|en\s*deduire|conclure|"
-    r"etablir|calculer|tracer|representer|construire|completer|"
-    r"show|prove|justify|determine|compute|solve|study|find|verify|deduce"
-    r")\b",
-    flags=re.IGNORECASE,
-)
 
 
-def _merge_wrapped_lines(text: str) -> str:
-    lines = [ln.rstrip() for ln in (text or "").split("\n")]
-    out, buf = [], ""
-    for ln in lines:
-        if not ln.strip():
-            if buf:
-                out.append(buf.strip())
-                buf = ""
-            out.append("")
-            continue
-        if not buf:
-            buf = ln.strip()
-            continue
-        if not re.search(r"[.:;!?]$", buf):
-            buf = (buf + " " + ln.strip()).strip()
-        else:
-            out.append(buf.strip())
-            buf = ln.strip()
-    if buf:
-        out.append(buf.strip())
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out))
-
-
-def _looks_like_question_unit(s: str) -> bool:
-    if not s or len(s.strip()) < 30:
-        return False
-    t = s.strip()
-
-    has_intent = bool(_INTENT_RE.search(t)) or ("?" in t)
-    has_math = bool(_MATH_SYMBOL_RE.search(t)) or bool(re.search(r"\b\d+\b", t))
-
-    return bool(has_intent or (has_math and len(t) > 50))
+def _build_intent_re(intent_verbs: List[str]) -> Optional[re.Pattern]:
+    """Construit la regex d'intention depuis le Pack."""
+    if not intent_verbs:
+        return None
+    pattern = r"\b(" + "|".join(re.escape(v) for v in intent_verbs) + r")\b"
+    return re.compile(pattern, flags=re.IGNORECASE)
 
 
 def _chunk_candidates(text: str) -> List[str]:
+    """Segmentation en chunks candidats."""
     t = (text or "").replace("\r", "\n")
-    t = _dehyphenate(t)
-    t = _merge_wrapped_lines(t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     if not t:
         return []
-
-    starts = {0}
-    for m in _Q_MARKER_RE.finditer(t):
-        starts.add(m.start())
-
-    idxs = sorted(starts)
+    
+    cut_points = {0}
+    
+    for m in _EXERCICE_RE.finditer(t):
+        cut_points.add(m.start())
+    for m in _PARTIE_RE.finditer(t):
+        cut_points.add(m.start())
+    for m in _QUESTION_RE.finditer(t):
+        cut_points.add(m.start())
+    for m in re.finditer(r"\n\n+", t):
+        cut_points.add(m.end())
+    
+    idxs = sorted(cut_points)
     chunks = []
+    
     for a, b in zip(idxs, idxs[1:] + [len(t)]):
         c = t[a:b].strip()
         c = re.sub(r"\s+", " ", c).strip()
-        if c:
+        if c and len(c) > 20:
             chunks.append(c)
-
-    if len(chunks) <= 3:
-        paras = re.split(r"\n\n+", t)
-        for p in paras:
-            p = re.sub(r"\s+", " ", p).strip()
-            if p and p not in chunks:
-                chunks.append(p)
-
+    
     return chunks
 
 
-def split_questions(text: str, max_items: int = 200) -> Tuple[List[str], Dict[str, Any]]:
-    raw_chunks = _chunk_candidates(text)
+def _looks_like_question(s: str, intent_re: Optional[re.Pattern]) -> bool:
+    """Détermine si un chunk ressemble à une question."""
+    if not s or len(s.strip()) < 25:
+        return False
+    t = s.strip()
+    
+    has_intent = bool(intent_re and intent_re.search(t)) or ("?" in t)
+    has_math = bool(_MATH_SYMBOL_RE.search(t)) or bool(re.search(r"\b\d+\b", t))
+    
+    return bool(has_intent or (has_math and len(t) > 40))
 
+
+def split_questions(text: str, text_proc: Dict[str, Any], max_items: int = 200) -> Tuple[List[str], Dict[str, Any]]:
+    """Segmente le texte en questions."""
+    intent_verbs = text_proc.get("intent_verbs", [])
+    intent_re = _build_intent_re(intent_verbs)
+    
+    raw_chunks = _chunk_candidates(text)
+    
     keep = []
     reject = []
     seen = set()
-
+    
     for c in raw_chunks:
         key = stable_id(norm_text(c)[:400])
         if key in seen:
             continue
         seen.add(key)
-
+        
         if len(c) > 2500:
             c = c[:2500] + "…"
-
-        if _looks_like_question_unit(c):
+        
+        if _looks_like_question(c, intent_re):
             keep.append(c)
         else:
             reject.append(c)
-
+        
         if len(keep) >= max_items:
             break
-
+    
     audit = {
         "raw_chunks": len(raw_chunks),
         "kept": len(keep),
@@ -768,252 +719,279 @@ def split_questions(text: str, max_items: int = 200) -> Tuple[List[str], Dict[st
     return keep, audit
 
 
-# -----------------------------------------------------------------------------
-# ALIGN Qi↔RQi — ANTI-FAKE (V31.10.16)
-# -----------------------------------------------------------------------------
-def align_qi_rqi(qs: List[str], rs: List[str]) -> Tuple[List[Optional[int]], List[Dict[str, Any]]]:
-    """
-    Alignement Qi↔RQi amélioré avec seuils adaptatifs.
-    IMPORTANT V31.10.16: AUCUN fallback séquentiel (anti fake-posables).
-    Retour:
-      - out: index RQi ou None
-      - audits: liste d'audit par Qi (mode/score/fenêtre)
-    """
-    if not qs or not rs:
-        return [None for _ in qs], [{"mode": "NO_RS", "score": 0.0, "j": None, "window": ""} for _ in qs]
-
-    qtok = [tokenize(q) for q in qs]
-    rtok = [tokenize(r) for r in rs]
-    out: List[Optional[int]] = [None] * len(qs)
-    audits: List[Dict[str, Any]] = [{"mode": "INIT", "score": 0.0, "j": None, "window": ""} for _ in qs]
+# =============================================================================
+# ALIGN Qi↔RQi (KERNEL)
+# =============================================================================
+def align_qi_rqi(questions: List[str], responses: List[str]) -> Tuple[List[Optional[int]], List[Dict[str, Any]]]:
+    """Aligne Qi avec RQi par similarité Jaccard."""
+    link: List[Optional[int]] = [None] * len(questions)
+    audits: List[Dict[str, Any]] = []
+    
+    if not questions or not responses:
+        return link, audits
+    
+    q_tokens = [tokenize(q) for q in questions]
+    r_tokens = [tokenize(r) for r in responses]
     used_r = set()
-
-    # Pass 1: fenêtre locale, seuil bas
-    for i in range(len(qs)):
+    
+    # Pass 1: fenêtre locale
+    for i, q_tok in enumerate(q_tokens):
         best_j, best_s = None, 0.0
-        lo, hi = max(0, i - 5), min(len(rs), i + 6)
+        lo, hi = max(0, i - 5), min(len(responses), i + 6)
+        
         for j in range(lo, hi):
             if j in used_r:
                 continue
-            s = jaccard(qtok[i], rtok[j])
+            s = jaccard(q_tok, r_tokens[j])
             if s > best_s:
                 best_s, best_j = s, j
+        
         if best_j is not None and best_s >= 0.06:
-            out[i] = best_j
+            link[i] = best_j
             used_r.add(best_j)
-            audits[i] = {"mode": "LOCAL", "score": float(best_s), "j": int(best_j), "window": f"{lo}:{hi}"}
-
-    # Pass 2: global pour non-matchés
-    for i in range(len(qs)):
-        if out[i] is not None:
+            audits.append({"qi_k": i+1, "mode": "LOCAL", "score": round(best_s, 3), "rqi_k": best_j+1})
+        else:
+            audits.append({"qi_k": i+1, "mode": "PENDING", "score": round(best_s, 3), "rqi_k": None})
+    
+    # Pass 2: global
+    for i in range(len(questions)):
+        if link[i] is not None:
             continue
+        
         best_j, best_s = None, 0.0
-        for j in range(len(rs)):
+        for j in range(len(responses)):
             if j in used_r:
                 continue
-            s = jaccard(qtok[i], rtok[j])
+            s = jaccard(q_tokens[i], r_tokens[j])
             if s > best_s:
                 best_s, best_j = s, j
+        
         if best_j is not None and best_s >= 0.08:
-            out[i] = best_j
+            link[i] = best_j
             used_r.add(best_j)
-            audits[i] = {"mode": "GLOBAL", "score": float(best_s), "j": int(best_j), "window": "ALL"}
+            audits[i] = {"qi_k": i+1, "mode": "GLOBAL", "score": round(best_s, 3), "rqi_k": best_j+1}
         else:
-            audits[i] = {"mode": "NONE", "score": float(best_s), "j": (int(best_j) if best_j is not None else None), "window": "ALL"}
-
-    return out, audits
-
-
-# -----------------------------------------------------------------------------
-# IA1 Proxy (déterministe) — trace d'opérations depuis RQi
-# -----------------------------------------------------------------------------
-_OP_RULES: List[Tuple[str, str, str]] = [
-    (r"\bderiv", "OP_DERIVE", "Calculer une dérivée / variation"),
-    (r"\blimit", "OP_LIMIT", "Calculer / encadrer une limite"),
-    (r"\bintegr|primitive", "OP_INTEGRATE", "Calculer une intégrale / primitive"),
-    (r"\brecur|recurrence|induction", "OP_INDUCTION", "Raisonnement par récurrence"),
-    (r"\bdiscriminant|\bdelta\b", "OP_DISCRIMINANT", "Calculer un discriminant / racines"),
-    (r"\bequation|inequation|systeme", "OP_SOLVE_EQUATION", "Résoudre équation / système"),
-    (r"\bproba|probabil", "OP_PROBABILITY", "Calcul de probabilité"),
-    (r"\b(binomial|normale|loi)\b", "OP_DISTRIBUTION", "Manipuler une loi de probabilité"),
-    (r"\besperance|variance|ecart", "OP_MOMENTS", "Calculer espérance / variance"),
-    (r"\bcomplexe|affixe|module|argument", "OP_COMPLEX", "Manipuler des nombres complexes"),
-    (r"\bvecteur|orthogon|scalaire", "OP_VECTOR_GEOM", "Géométrie vectorielle / orthogonalité"),
-    (r"\btrigo|sinus|cosinus|tangente", "OP_TRIGO", "Manipuler identités trigonométriques"),
-    (r"\blog|ln|exp|exponent", "OP_LOGEXP", "Manipuler log/exp"),
-    (r"\btableau\b.*\bvariat|\bvariat\b.*\btableau", "OP_VARIATION_TABLE", "Construire tableau de variations"),
-    (r"\bencadr|major|minim|borne", "OP_BOUND", "Encadrer / majorer / minorer"),
-    (r"\bmontrer|demontrer|prouver|justifier", "OP_PROVE", "Justifier / démontrer"),
-]
+            audits[i] = {"qi_k": i+1, "mode": "NONE", "score": round(best_s, 3), "rqi_k": None}
+    
+    return link, audits
 
 
-def extract_op_trace(rqi_text: str, qi_text: str) -> List[Dict[str, Any]]:
-    t = norm_text(rqi_text or "") + " " + norm_text(qi_text or "")
-    steps = []
-    used = set()
-    for (pat, op, desc) in _OP_RULES:
-        if re.search(pat, t, flags=re.IGNORECASE):
-            if op not in used:
-                used.add(op)
-                steps.append({"op": op, "desc": desc})
+# =============================================================================
+# ARI EXTRACTION (100% PACK-DRIVEN)
+# =============================================================================
+def extract_op_trace(question: str, response: str, ari_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Extrait la trace ARI depuis le Pack.
+    Les patterns viennent ENTIÈREMENT du Pack.
+    """
+    op_patterns = ari_config.get("op_patterns", [])
+    if not op_patterns:
+        return [{"op": "OP_STANDARD", "confidence": 0.5}]
+    
+    combined = norm_text(f"{question} {response}")
+    ops = []
+    seen = set()
+    
+    for item in op_patterns:
+        pattern = item.get("pattern", "")
+        op_code = item.get("op", "")
+        if not pattern or not op_code:
+            continue
+        
+        try:
+            if re.search(pattern, combined, re.IGNORECASE):
+                if op_code not in seen:
+                    ops.append({"op": op_code, "confidence": 0.8})
+                    seen.add(op_code)
+        except re.error:
+            pass
+    
+    if not ops:
+        ops.append({"op": "OP_STANDARD", "confidence": 0.5})
+    
+    return ops
 
-    if not steps:
-        steps = [{"op": "OP_STANDARD", "desc": "Méthode standard"}]
 
-    return steps[:12]
+def get_primary_op(op_trace: List[Dict[str, Any]], ari_config: Dict[str, Any]) -> str:
+    """
+    Détermine l'opérateur principal selon l'ordre du Pack.
+    """
+    primary_order = ari_config.get("primary_ops_order", [])
+    if not primary_order:
+        return op_trace[0]["op"] if op_trace else "OP_STANDARD"
+    
+    ops_in_trace = {x["op"] for x in op_trace}
+    for op in primary_order:
+        if op in ops_in_trace:
+            return op
+    
+    return op_trace[0]["op"] if op_trace else "OP_STANDARD"
 
 
 def normalize_ari_steps(op_trace: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    seen = set()
-    for stp in op_trace or []:
-        op = stp.get("op") or ""
-        if op and op not in seen:
-            seen.add(op)
-            out.append(stp)
-    return out
+    """Normalise les étapes ARI."""
+    return [{"op": x["op"], "step": i + 1} for i, x in enumerate(op_trace)]
 
 
-# -----------------------------------------------------------------------------
-# TRIGGERS
-# -----------------------------------------------------------------------------
-def build_triggers(qi_text: str, op_trace: List[Dict[str, Any]]) -> List[str]:
-    t = qi_text or ""
-    out = []
-
-    if "?" in t:
-        out.append("TRG_QMARK")
-    if _MATH_SYMBOL_RE.search(t):
-        out.append("TRG_MATHSYM")
-    if re.search(r"\b\d+\b", t):
-        out.append("TRG_NUMBER")
-
-    for stp in op_trace or []:
-        op = stp.get("op")
-        if op:
-            out.append("TRG_" + op)
-
-    seen, res = set(), []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            res.append(x)
-    return res[:12] if res else ["TRG_GENERIC"]
+# =============================================================================
+# TRIGGERS (PACK-DRIVEN)
+# =============================================================================
+def build_triggers(question: str, op_trace: List[Dict[str, Any]], text_proc: Dict[str, Any]) -> List[str]:
+    """
+    Construit les triggers - keywords viennent du Pack.
+    """
+    triggers = []
+    
+    # Triggers basés sur les opérateurs ARI
+    for op_item in op_trace:
+        triggers.append(f"ARI:{op_item['op']}")
+    
+    # Triggers basés sur les keywords du Pack
+    trigger_keywords = text_proc.get("trigger_keywords", [])
+    if trigger_keywords:
+        q_norm = norm_text(question)
+        for kw in trigger_keywords:
+            if kw in q_norm:
+                triggers.append(f"KW:{kw.upper()}")
+    
+    return list(set(triggers))[:15]
 
 
-# -----------------------------------------------------------------------------
-# CHAPTER MAPPING
-# -----------------------------------------------------------------------------
-def map_qi_to_chapter(qi_text: str, chapters: List[Dict[str, Any]]) -> str:
+# =============================================================================
+# CHAPTER MAPPING (PACK-DRIVEN)
+# =============================================================================
+def map_qi_to_chapter(question: str, chapters: List[Dict[str, Any]]) -> str:
+    """Mappe une Qi à un chapitre selon les keywords du Pack."""
     if not chapters:
         return "UNMAPPED"
-    qi_toks = set(tokenize(qi_text))
-    best = ("UNMAPPED", 0.0)
+    
+    q_norm = norm_text(question)
+    best_chapter = "UNMAPPED"
+    best_score = 0
+    
     for ch in chapters:
-        kws = ch.get("keywords") or []
-        if not kws:
-            continue
-        ch_toks = set(tokenize(" ".join([str(x) for x in kws])))
-        if not ch_toks:
-            continue
-        score = len(qi_toks & ch_toks) / max(1, len(ch_toks))
-        if score > best[1]:
-            best = (str(ch["chapter_code"]), score)
-    return best[0] if best[1] >= 0.05 else "UNMAPPED"
+        keywords = ch.get("keywords", [])
+        score = sum(1 for kw in keywords if kw in q_norm)
+        if score > best_score:
+            best_score = score
+            best_chapter = ch.get("code", "UNMAPPED")
+    
+    return best_chapter if best_score > 0 else "UNMAPPED"
 
 
-# -----------------------------------------------------------------------------
-# QC BUILDING — ZÉRO ORPHELIN SANS TRICHE (V31.10.16)
-# -----------------------------------------------------------------------------
-def qc_method_label(op_codes: List[str]) -> str:
-    if not op_codes:
-        return "Comment résoudre une question par méthode standard ?"
-    core = " → ".join(op_codes[:3])
-    return f"Comment résoudre en appliquant: {core} ?"
+# =============================================================================
+# QC GENERATION (KERNEL - STABLE CLUSTERING)
+# =============================================================================
+def qc_method_label(primary_op: str, secondary_ops: List[str], ari_config: Dict[str, Any]) -> str:
+    """Génère le libellé QC depuis le Pack."""
+    op_labels = ari_config.get("op_labels", {})
+    
+    main_label = op_labels.get(primary_op, primary_op.replace("OP_", "").title())
+    
+    if secondary_ops:
+        sec_labels = [op_labels.get(op, op.replace("OP_", "")) for op in secondary_ops[:2]]
+        return f"{main_label} avec {', '.join(sec_labels)}"
+    
+    return main_label
 
 
 def sigma_similarity(qc_a: Dict[str, Any], qc_b: Dict[str, Any]) -> float:
-    a_ops = qc_a.get("op_codes", [])
-    b_ops = qc_b.get("op_codes", [])
+    """Similarité entre deux QC (Jaccard sur ops)."""
+    a_ops = set(qc_a.get("all_ops", []))
+    b_ops = set(qc_b.get("all_ops", []))
     if a_ops and b_ops:
-        s_ops = jaccard(list(a_ops), list(b_ops))
-    else:
-        s_ops = 0.0
-    s_txt = jaccard(tokenize(qc_a.get("qc", "")), tokenize(qc_b.get("qc", "")))
-    return max(s_ops, 0.7 * s_txt)
+        return len(a_ops & b_ops) / len(a_ops | b_ops)
+    return 0.0
 
 
-def build_qc_from_qi(
-    qi_pack: List[Dict[str, Any]],
-    chapters: List[Dict[str, Any]],
-    min_posable_global: int,
-) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+def build_qc_from_qi(qi_pack: List[Dict[str, Any]], chapters: List[Dict[str, Any]], 
+                     ari_config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
-    Build QC avec seuil adaptatif:
-      - min_cluster_posable = 1 si peu de posable global
-    V31.10.16:
-      - NE JAMAIS laisser un bucket sans QC (zéro orphelin)
-      - si posable_in_cluster=0 => qc_state="UNPOSABLE" (QC non posable mais mappage garanti)
+    Construit les QC - clustering stable par (chapter, primary_op).
     """
-    total_posable = sum(1 for q in qi_pack if q.get("has_rqi"))
-    min_cluster_posable = 1 if total_posable < 10 else 2
-    log(f"[QC] total_posable={total_posable} → min_cluster_posable={min_cluster_posable}")
-
-    buckets: Dict[Tuple[str, Tuple[str, ...]], List[Dict[str, Any]]] = {}
+    # Bucketing
+    buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    
     for qi in qi_pack:
         cc = qi.get("chapter_code", "UNMAPPED")
-        op_codes = tuple(qi.get("ari_norm_ops", []))
-        buckets.setdefault((cc, op_codes), []).append(qi)
-
+        primary_op = qi.get("primary_op", "OP_STANDARD")
+        key = (cc, primary_op)
+        buckets.setdefault(key, []).append(qi)
+    
+    log(f"[QC] Buckets: {len(buckets)}")
+    
     qc_pack: List[Dict[str, Any]] = []
     qc_map: Dict[str, str] = {}
-
-    for idx, ((cc, op_codes), items) in enumerate(sorted(buckets.items()), start=1):
+    
+    # Compter buckets par chapitre
+    chapter_bucket_counts: Dict[str, int] = {}
+    for (cc, _) in buckets.keys():
+        chapter_bucket_counts[cc] = chapter_bucket_counts.get(cc, 0) + 1
+    
+    for (cc, primary_op), items in sorted(buckets.items()):
         posable = [x for x in items if x.get("has_rqi")]
-
-        # On produit toujours une QC; on marque l'état selon posable.
-        qc_state = "POSABLE" if len(posable) >= 1 else "UNPOSABLE"
-
-        # Seuil adaptatif (pour classification “POSABLE” robuste), mais production QC toujours.
-        # Si posable>0 mais < min_cluster_posable: QC reste POSABLE mais faible.
-        # Si posable==0: QC UNPOSABLE.
-        qc_text = qc_method_label(list(op_codes))
-        qc_id = f"QC_{stable_id(cc, qc_text, str(op_codes))}"
-
+        cluster_size = len(items)
+        posable_count = len(posable)
+        
+        # Créer QC si: cluster >= 2 OU unique dans chapitre OU >= 1 posable
+        is_singleton = cluster_size < 2
+        is_only_in_chapter = chapter_bucket_counts.get(cc, 0) <= 1
+        
+        if is_singleton and not is_only_in_chapter and posable_count == 0:
+            continue
+        
+        # Collecter ops secondaires
+        all_ops_set = set()
+        for it in items:
+            for op in it.get("ari_ops", []):
+                all_ops_set.add(op)
+        secondary_ops = [op for op in all_ops_set if op != primary_op]
+        
+        qc_text = qc_method_label(primary_op, secondary_ops, ari_config)
+        qc_id = f"QC_{stable_id(cc, primary_op)}"
+        
+        # État QC
+        if posable_count >= 2:
+            qc_state = "POSABLE"
+        elif posable_count == 1:
+            qc_state = "POSABLE_WEAK"
+        else:
+            qc_state = "UNPOSABLE"
+        
+        # Triggers agrégés
         trig_counts: Dict[str, int] = {}
         for it in items:
             for t in it.get("triggers", []):
                 trig_counts[t] = trig_counts.get(t, 0) + 1
         trig_sorted = [k for (k, _) in sorted(trig_counts.items(), key=lambda x: (-x[1], x[0]))][:10]
-
+        
         qc_obj = {
             "qc_id": qc_id,
             "qc": qc_text,
             "chapter_code": cc,
-            "cluster_size": len(items),
-            "posable_in_cluster": len(posable),
-            "qc_state": qc_state,  # NEW
+            "primary_op": primary_op,
+            "all_ops": list(all_ops_set),
+            "cluster_size": cluster_size,
+            "posable_in_cluster": posable_count,
+            "qc_state": qc_state,
             "qi_ids": [x["qi_id"] for x in items],
-            "op_codes": list(op_codes),
             "triggers_hint": trig_sorted,
-            "cluster_gate": {
-                "min_cluster_posable": int(min_cluster_posable),
-                "posable_ok": bool(len(posable) >= min_cluster_posable),
-            },
         }
         qc_pack.append(qc_obj)
-
-        # Mappage garanti Qi→QC
+        
         for it in items:
             qc_map[it["qi_id"]] = qc_id
-
+    
+    log(f"[QC] Créées: {len(qc_pack)} | Qi mappées: {len(qc_map)}")
+    
     return qc_pack, qc_map
 
 
-# -----------------------------------------------------------------------------
-# F1 / F2
-# -----------------------------------------------------------------------------
+# =============================================================================
+# F1/F2 FORMULAS (KERNEL CONFORMANT)
+# =============================================================================
 def compute_trigger_weights(triggers: List[str]) -> Dict[str, float]:
+    """Calcule les poids des triggers."""
     uniq = list(dict.fromkeys(triggers or []))
     n = len(uniq)
     if n == 0:
@@ -1023,16 +1001,20 @@ def compute_trigger_weights(triggers: List[str]) -> Dict[str, float]:
 
 
 def f1_raw(delta_c: float, epsilon: float, Tj: Dict[str, float], m_q: int) -> float:
+    """
+    Formule F1: ψ_q = δ_c × (ε + Σ w_i)²
+    """
     if not Tj:
         s = 0.0
     else:
         items = sorted(Tj.items(), key=lambda x: x[0])
-        top = items[: max(0, int(m_q))]
+        top = items[:max(0, int(m_q))]
         s = sum(v for _, v in top)
     return float(delta_c) * float((epsilon + s) ** 2)
 
 
 def f1_normalize_in_chapter(qc_list: List[Dict[str, Any]]) -> None:
+    """Normalise F1 par chapitre: Ψ_q = ψ_q / max(ψ_q)"""
     if not qc_list:
         return
     raws = [float(q.get("psi_raw", 0.0) or 0.0) for q in qc_list]
@@ -1043,80 +1025,86 @@ def f1_normalize_in_chapter(qc_list: List[Dict[str, Any]]) -> None:
         q["Psi_q"] = float(Psi)
 
 
-def f2_score(qc: Dict[str, Any], selected: List[Dict[str, Any]], n_q_historical: int, N_total: int, alpha: float, t_rec: float) -> Tuple[float, Dict[str, Any]]:
+def f2_score(qc: Dict[str, Any], selected: List[Dict[str, Any]], 
+             n_q_historical: int, N_total: int, alpha: float, t_rec: float) -> Tuple[float, Dict[str, Any]]:
+    """
+    Formule F2: Score(q) = (n_q,hist/N_total) × (1 + α/t_rec) × Ψ_q × Π((1-σ)×100)
+    """
     Psi_q = float(qc.get("Psi_q", 0.0) or 0.0)
     base = (float(n_q_historical) / float(max(1, N_total))) * (1.0 + float(alpha) / float(max(1e-9, t_rec))) * Psi_q
-
+    
     prod = 1.0
     sigmas = []
     for p in selected:
         s = sigma_similarity(qc, p)
         sigmas.append(s)
         prod *= (1.0 - s) * 100.0
-
+    
     score = base * prod
-    audit = {
-        "n_q_historical": n_q_historical,
-        "N_total": N_total,
-        "Psi_q": Psi_q,
-        "sigma_list": sigmas[:20],
-    }
+    audit = {"n_q_historical": n_q_historical, "N_total": N_total, "Psi_q": Psi_q, "sigmas": sigmas[:10]}
     return float(score), audit
 
 
-def progressive_select(qc_list: List[Dict[str, Any]], N_total: int, top_k: int = 12) -> List[Dict[str, Any]]:
+def progressive_select(qc_list: List[Dict[str, Any]], N_total: int, 
+                       f1f2_params: Dict[str, float], top_k: int = 12) -> List[Dict[str, Any]]:
+    """Sélection progressive F2."""
     selected: List[Dict[str, Any]] = []
-    remaining = sorted(qc_list, key=lambda x: x.get("qc_id", ""))
-
+    remaining = [q for q in qc_list if q.get("qc_state") in ("POSABLE", "POSABLE_WEAK")]
+    remaining = sorted(remaining, key=lambda x: x.get("qc_id", ""))
+    
+    alpha = f1f2_params.get("alpha", F2_ALPHA)
+    t_rec = f1f2_params.get("t_rec", F2_TREC)
+    
     for _ in range(min(top_k, len(remaining))):
         best = None
         for qc in remaining:
-            # si UNPOSABLE => n_q_hist = 0 (score nul), donc naturellement non sélectionnée
             n_q_hist = int(qc.get("n_q_historical", qc.get("cluster_size", 1)) or 0)
-            sc, audit = f2_score(qc, selected, n_q_hist, N_total, F2_ALPHA, F2_TREC)
+            sc, audit = f2_score(qc, selected, n_q_hist, N_total, alpha, t_rec)
             qc["_f2_score"] = sc
             qc["_f2_audit"] = audit
             if best is None or sc > best["_f2_score"]:
                 best = qc
-
+        
         if best is None:
             break
         selected.append(best)
         remaining = [x for x in remaining if x.get("qc_id") != best.get("qc_id")]
-
+    
     return selected
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # SANITY GATE
-# -----------------------------------------------------------------------------
+# =============================================================================
 def sanity_eval(doc_audits: List[Dict[str, Any]], qi_items: List[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
+    """Évalue la qualité des données."""
     total_raw = sum(int(d.get("raw_chunks", 0) or 0) for d in doc_audits)
     total_kept = sum(int(d.get("kept", 0) or 0) for d in doc_audits)
     total_rej = sum(int(d.get("rejected", 0) or 0) for d in doc_audits)
-
+    
+    # Détection duplications
     seen = set()
     dups = 0
     for q in qi_items:
-        k = stable_id(norm_text(q.get("text", ""))[:300])
+        k = stable_id(norm_text(q.get("qi", ""))[:300])
         if k in seen:
             dups += 1
         else:
             seen.add(k)
-
+    
     dup_ratio = dups / max(1, len(qi_items))
     rej_ratio = total_rej / max(1, total_raw) if total_raw else 0.0
-
+    
     ok = True
     reasons = []
-
+    
     if rej_ratio > 0.85 and total_raw > 100:
         ok = False
         reasons.append(f"reject_ratio_extreme({round(rej_ratio*100,2)}%)")
     if dup_ratio > 0.35:
         ok = False
         reasons.append(f"dup_ratio_high({round(dup_ratio*100,2)}%)")
-
+    
     audit = {
         "total_raw_chunks": total_raw,
         "total_kept": total_kept,
@@ -1128,293 +1116,201 @@ def sanity_eval(doc_audits: List[Dict[str, Any]], qi_items: List[Dict[str, Any]]
     return ok, audit
 
 
-# -----------------------------------------------------------------------------
-# RUN
-# -----------------------------------------------------------------------------
-def run_phase(library: List[Dict[str, Any]], volume_pairs: int, chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
+# =============================================================================
+# RUN PIPELINE
+# =============================================================================
+def run_phase(library: List[Dict[str, Any]], volume_pairs: int, pack: Dict[str, Any]) -> Dict[str, Any]:
+    """Exécute une phase du pipeline."""
+    text_proc = pack_get_text_processing(pack)
+    ari_config = pack_get_ari_config(pack)
+    
+    subject = st.session_state.get("subject", "")
+    level = st.session_state.get("level", "")
+    chapters = pack_get_chapters(pack, subject, level)
+    
     exploitable = [it for it in library if it.get("corrige?") and it.get("corrige_url")]
-    to_process = exploitable[: max(1, min(int(volume_pairs), len(exploitable)))]
-    log(f"[RUN] phase processing pairs={len(to_process)}")
-
+    to_process = exploitable[:max(1, min(int(volume_pairs), len(exploitable)))]
+    log(f"[RUN] Processing {len(to_process)} pairs")
+    
     qi_items: List[Dict[str, Any]] = []
-    rqi_items: List[Dict[str, Any]] = []
     doc_audits: List[Dict[str, Any]] = []
-    doc_stats: List[Dict[str, Any]] = []
-
-    align_audits_all: List[Dict[str, Any]] = []
-
+    
     for pair in to_process:
         pid = pair["pair_id"]
         try:
             su_pdf = fetch_pdf_bytes(pair["sujet_url"])
             co_pdf = fetch_pdf_bytes(pair["corrige_url"])
         except Exception as e:
-            log(f"[DL] FAILED {pid}: {e}")
+            log(f"[DL] ERREUR {pid}: {e}")
             continue
-
-        su_text = extract_text_from_pdf_bytes(su_pdf)
-        co_text = extract_text_from_pdf_bytes(co_pdf)
-
+        
+        su_text = extract_text_from_pdf(su_pdf, text_proc)
+        co_text = extract_text_from_pdf(co_pdf, text_proc)
+        
         if not su_text or not co_text:
-            log(f"[PDF] EMPTY {pid}")
+            log(f"[PDF] VIDE {pid}")
             continue
-
-        qs, qs_audit = split_questions(su_text, max_items=150)
-        rs, rs_audit = split_questions(co_text, max_items=200)
-
+        
+        qs, qs_audit = split_questions(su_text, text_proc, max_items=150)
+        rs, rs_audit = split_questions(co_text, text_proc, max_items=200)
+        
         doc_audits.append({"pair_id": pid, "role": "SUJET", **qs_audit})
         doc_audits.append({"pair_id": pid, "role": "CORRIGE", **rs_audit})
-
-        link, link_audits = align_qi_rqi(qs, rs)
-        matched_count = sum(1 for x in link if x is not None)
-        log(f"[ALIGN] {pid}: {len(qs)} Qi, {len(rs)} RQi, matched={matched_count}")
-
-        doc_stats.append({"pair_id": pid, "qi": len(qs), "rqi": len(rs), "matched": matched_count})
-        for i, ad in enumerate(link_audits[:500]):
-            align_audits_all.append({"pair_id": pid, "qi_k": i + 1, **ad})
-
+        
+        link, _ = align_qi_rqi(qs, rs)
+        matched = sum(1 for x in link if x is not None)
+        log(f"[ALIGN] {pid}: {len(qs)} Qi, {len(rs)} RQi, matched={matched}")
+        
         for i, q in enumerate(qs):
             if not q.strip():
                 continue
             j = link[i] if i < len(link) else None
             r = rs[j] if (j is not None and 0 <= j < len(rs)) else ""
-
+            
             qi_id = f"QI_{stable_id(pid, str(i), norm_text(q)[:180])}"
-            rqi_id = f"RQI_{stable_id(pid, str(j), norm_text(r)[:180])}" if r else ""
-
-            op_trace = extract_op_trace(r, q)
+            
+            op_trace = extract_op_trace(q, r, ari_config)
             ari_norm = normalize_ari_steps(op_trace)
-            ari_ops = [x.get("op") for x in ari_norm if x.get("op")]
-
-            triggers = build_triggers(q, op_trace)
+            ari_ops = [x["op"] for x in op_trace]
+            primary_op = get_primary_op(op_trace, ari_config)
+            
+            triggers = build_triggers(q, op_trace, text_proc)
             chapter_code = map_qi_to_chapter(q, chapters)
-
+            
             qi_items.append({
                 "qi_id": qi_id,
                 "pair_id": pid,
                 "k": i + 1,
-                "text": q,
-                "rqi_id": rqi_id,
-                "chapter_code": chapter_code,
+                "qi": q,
+                "rqi": r,
                 "has_rqi": bool(r),
-                "align_audit": link_audits[i] if i < len(link_audits) else {"mode": "NA", "score": 0.0, "j": None, "window": ""},
-                "op_trace": op_trace,
-                "ari_norm": ari_norm,
-                "ari_norm_ops": ari_ops,
+                "chapter_code": chapter_code,
+                "primary_op": primary_op,
+                "ari_ops": ari_ops,
+                "ari": {"steps": ari_norm},
                 "triggers": triggers,
             })
-            if r:
-                rqi_items.append({"rqi_id": rqi_id, "pair_id": pid, "k": i + 1, "text": r})
-
+    
+    # Sanity check
     sanity_ok, sanity_audit = sanity_eval(doc_audits, qi_items)
-
-    return {
-        "pairs_used": len(to_process),
-        "qi_items": qi_items,
-        "rqi_items": rqi_items,
-        "doc_stats": doc_stats[:200],
-        "doc_audits": doc_audits[:300],
-        "align_audits": align_audits_all[:2000],
+    
+    # Build QC
+    qc_pack, qc_map = build_qc_from_qi(qi_items, chapters, ari_config)
+    
+    # Calculer F1
+    f1f2_params = pack_get_f1f2_params(pack)
+    epsilon = f1f2_params["epsilon"]
+    
+    for qc in qc_pack:
+        ch_code = qc.get("chapter_code", "UNMAPPED")
+        ch_info = next((c for c in chapters if c.get("code") == ch_code), {})
+        delta_c = float(ch_info.get("delta_c", 1.0))
+        
+        all_triggers = []
+        for qi_id in qc.get("qi_ids", []):
+            qi = next((q for q in qi_items if q["qi_id"] == qi_id), None)
+            if qi:
+                all_triggers.extend(qi.get("triggers", []))
+        
+        Tj = compute_trigger_weights(all_triggers)
+        m_q = len(Tj)
+        psi_raw = f1_raw(delta_c, epsilon, Tj, m_q)
+        qc["psi_raw"] = psi_raw
+        qc["n_q_historical"] = qc.get("cluster_size", 1)
+    
+    # Normaliser F1 par chapitre
+    by_chapter: Dict[str, List[Dict[str, Any]]] = {}
+    for qc in qc_pack:
+        cc = qc.get("chapter_code", "UNMAPPED")
+        by_chapter.setdefault(cc, []).append(qc)
+    
+    for cc, qcs in by_chapter.items():
+        f1_normalize_in_chapter(qcs)
+    
+    # Marquer orphelins
+    mapped_qi_ids = set(qc_map.keys())
+    orphans = 0
+    for qi in qi_items:
+        if qi["qi_id"] not in mapped_qi_ids:
+            qi["is_orphan"] = True
+            orphans += 1
+        else:
+            qi["is_orphan"] = False
+            qi["qc_id"] = qc_map.get(qi["qi_id"])
+    
+    # Stats
+    qi_total = len(qi_items)
+    rqi_total = sum(1 for q in qi_items if q.get("has_rqi"))
+    qi_posable = sum(1 for q in qi_items if q.get("has_rqi") and not q.get("is_orphan"))
+    qc_total = len(qc_pack)
+    qc_posable = sum(1 for qc in qc_pack if qc.get("qc_state") in ("POSABLE", "POSABLE_WEAK"))
+    qc_unposable = sum(1 for qc in qc_pack if qc.get("qc_state") == "UNPOSABLE")
+    
+    audit = {
+        "qi_total": qi_total,
+        "rqi_total": rqi_total,
+        "qi_posable": qi_posable,
+        "qi_orphans": orphans,
+        "qc_total": qc_total,
+        "qc_posable": qc_posable,
+        "qc_unposable": qc_unposable,
         "sanity_ok": sanity_ok,
         "sanity_audit": sanity_audit,
     }
-
-
-def build_outputs_for_phase(phase_res: Dict[str, Any], chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
-    qi_items = phase_res["qi_items"]
-    rqi_by_id = {r["rqi_id"]: r for r in phase_res["rqi_items"]}
-
-    total_posable = sum(1 for q in qi_items if q.get("has_rqi"))
-    qc_pack, qc_map = build_qc_from_qi(qi_items, chapters, min_posable_global=total_posable)
-
-    qi_pack = []
-    qi_posable = 0
-    orphan_ids = []
-
-    for q in qi_items:
-        rqi_id = q.get("rqi_id") or ""
-        rtxt = rqi_by_id.get(rqi_id, {}).get("text", "")
-
-        qc_id = qc_map.get(q["qi_id"], "")
-        # V31.10.16: qc_map est garanti; si jamais absent => orphelin réel (bug)
-        is_orphan = not qc_id
-
-        if q.get("has_rqi"):
-            qi_posable += 1
-        if is_orphan:
-            orphan_ids.append(q["qi_id"])
-
-        ari_obj = {
-            "template": "ARI_SMAXIA_V3",
-            "op_trace": q.get("op_trace", []),
-            "normalized_steps": q.get("ari_norm", []),
-            "m_q": len(q.get("ari_norm", [])),
-            "evidence": {
-                "has_rqi": bool(rtxt),
-                "rqi_chars": len(rtxt),
-                "qi_chars": len(q.get("text", "")),
-                "align": q.get("align_audit", {}),
-            },
-        }
-
-        frt_obj = {
-            "template": "FRT_SMAXIA_V3",
-            "source": "RQi" if rtxt else "MISSING_RQi",
-            "sections": ["OBJ", "DAT", "MTH", "EXE", "RES", "VAL"],
-        }
-
-        qi_pack.append({
-            "qi_id": q["qi_id"],
-            "pair_id": q["pair_id"],
-            "k": q["k"],
-            "chapter_code": q.get("chapter_code", "UNMAPPED"),
-            "qi": q["text"],
-            "rqi": rtxt,
-            "has_rqi": bool(rtxt),
-            "qc_id": qc_id,
-            "is_orphan": is_orphan,
-            "triggers": q.get("triggers", []),
-            "ari": ari_obj,
-            "frt": frt_obj,
-        })
-
-    # F1 computation
-    delta_by_ch = {c["chapter_code"]: float(c.get("delta_c", 1.0) or 1.0) for c in chapters}
-    qi_by_id = {x["qi_id"]: x for x in qi_pack}
-    qc_by_ch: Dict[str, List[Dict[str, Any]]] = {}
-
-    for qc in qc_pack:
-        cc = qc["chapter_code"]
-        qc_by_ch.setdefault(cc, []).append(qc)
-
-        m_list = []
-        for qi_id in qc.get("qi_ids", []):
-            qi = qi_by_id.get(qi_id)
-            if qi and qi.get("has_rqi"):
-                m_list.append(int(qi.get("ari", {}).get("m_q", 0) or 0))
-        m_q = int(sorted(m_list)[len(m_list)//2]) if m_list else 1
-
-        Tj = compute_trigger_weights(qc.get("triggers_hint", []))
-        delta_c = float(delta_by_ch.get(cc, 1.0))
-        psi = f1_raw(delta_c=delta_c, epsilon=F1_EPSILON, Tj=Tj, m_q=m_q)
-
-        qc["m_q"] = m_q
-        qc["Tj"] = Tj
-        qc["delta_c"] = delta_c
-        qc["psi_raw"] = psi
-        qc["f1_audit"] = {"delta_c": delta_c, "epsilon": F1_EPSILON, "m_q": m_q, "psi_raw": psi}
-
-        # IMPORTANT: UNPOSABLE => n_q_historical = 0 (score F2 nul)
-        qc["n_q_historical"] = int(qc.get("posable_in_cluster", 0) or 0)
-
-    for cc, qcs in qc_by_ch.items():
-        f1_normalize_in_chapter(qcs)
-
-    # Chapter report
-    ch_label = {c["chapter_code"]: c.get("chapter_label", c["chapter_code"]) for c in chapters}
-    qc_by_id = {q["qc_id"]: q for q in qc_pack}
-
-    qi_by_chapter: Dict[str, List[str]] = {}
-    qi_covered_by_chapter: Dict[str, List[str]] = {}
-    qc_count_by_chapter: Dict[str, int] = {}
-
-    for qc in qc_pack:
-        qc_count_by_chapter[qc["chapter_code"]] = qc_count_by_chapter.get(qc["chapter_code"], 0) + 1
-
-    for qi in qi_pack:
-        qc_id = qi.get("qc_id", "")
-        cc = qc_by_id[qc_id]["chapter_code"] if qc_id and qc_id in qc_by_id else qi.get("chapter_code", "UNMAPPED")
-        qi_by_chapter.setdefault(cc, []).append(qi["qi_id"])
-        if qi.get("has_rqi") and not qi.get("is_orphan"):
-            qi_covered_by_chapter.setdefault(cc, []).append(qi["qi_id"])
-
-    chapter_entries = []
-    for cc in sorted(set(qi_by_chapter.keys()) | set(qc_count_by_chapter.keys())):
-        qi_total = len(qi_by_chapter.get(cc, []))
-        qi_cov = len(qi_covered_by_chapter.get(cc, []))
-        qc_count = int(qc_count_by_chapter.get(cc, 0))
-        cov_pct = round((qi_cov / qi_total) * 100, 2) if qi_total else 0.0
-        chapter_entries.append({
-            "chapter_code": cc,
-            "chapter_label": ch_label.get(cc, cc),
-            "qi_total": qi_total,
-            "covered_qi_count": qi_cov,
-            "coverage_pct": cov_pct,
-            "qc_count": qc_count,
-        })
-
-    chapter_report = {
-        "version": APP_VERSION,
-        "timestamp": _utc_ts(),
-        "pack_id": st.session_state.pack_id,
-        "chapters": sorted(chapter_entries, key=lambda x: (-x["qi_total"], x["chapter_code"])),
-    }
-
-    audit = {
-        "qi_total": len(qi_pack),
-        "qi_posable": qi_posable,
-        "rqi_total": sum(1 for q in qi_pack if q.get("rqi")),
-        "qc_total": len(qc_pack),
-        "qc_posable": sum(1 for q in qc_pack if q.get("qc_state") == "POSABLE"),
-        "qc_unposable": sum(1 for q in qc_pack if q.get("qc_state") == "UNPOSABLE"),
-        "qi_orphans": len(orphan_ids),
-        "orphan_ids_sample": orphan_ids[:25],
-        "sanity_ok": bool(phase_res.get("sanity_ok")),
-        "sanity_audit": phase_res.get("sanity_audit"),
-        "pairs_used": phase_res.get("pairs_used"),
-        "doc_stats": phase_res.get("doc_stats"),
-        "doc_audits_sample": phase_res.get("doc_audits"),
-        "align_audits_sample": phase_res.get("align_audits"),
-    }
-
+    
     return {
-        "qi_pack": qi_pack,
+        "qi_pack": qi_items,
         "qc_pack": qc_pack,
-        "chapter_report": chapter_report,
+        "qc_map": qc_map,
         "audit": audit,
     }
 
 
-def run_granulo_test_iso(library: List[Dict[str, Any]], phase_a: int, phase_b: int, chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Phase A
-    a_res = run_phase(library, phase_a, chapters)
-    a_out = build_outputs_for_phase(a_res, chapters)
-    setA = sorted({q["qc_id"] for q in a_out["qc_pack"]})
-
-    # Phase B
-    b_res = run_phase(library, phase_b, chapters)
-    b_out = build_outputs_for_phase(b_res, chapters)
-    setB = sorted({q["qc_id"] for q in b_out["qc_pack"]})
-
-    setB_minus_setA = sorted(list(set(setB) - set(setA)))
-    saturation_ok = (len(setB_minus_setA) == 0)
-
-    # Selection report
-    qc_by_ch: Dict[str, List[Dict[str, Any]]] = {}
-    for qc in b_out["qc_pack"]:
-        qc_by_ch.setdefault(qc["chapter_code"], []).append(qc)
-
+def run_saturation_test(library: List[Dict[str, Any]], phase_a: int, phase_b: int, 
+                        pack: Dict[str, Any]) -> Dict[str, Any]:
+    """Test de saturation ISO-PROD."""
+    log(f"[SATURATION] Phase A: {phase_a}, Phase B: {phase_b}")
+    
+    a_out = run_phase(library, phase_a, pack)
+    b_out = run_phase(library, phase_b, pack)
+    
+    setA = {qc["qc_id"] for qc in a_out["qc_pack"]}
+    setB = {qc["qc_id"] for qc in b_out["qc_pack"]}
+    setB_minus_setA = sorted(setB - setA)
+    
+    saturation_ok = len(setB_minus_setA) == 0
+    
+    # Sélection F2
+    f1f2_params = pack_get_f1f2_params(pack)
+    N_total = b_out["audit"]["qi_posable"]
+    
+    subject = st.session_state.get("subject", "")
+    level = st.session_state.get("level", "")
+    chapters = pack_get_chapters(pack, subject, level)
+    
     selection = []
-    N_total = int(b_out["audit"]["qi_posable"] or b_out["audit"]["qi_total"] or 1)
-
-    for cc, qcs in sorted(qc_by_ch.items()):
-        selected = progressive_select(qcs, N_total=N_total, top_k=12)
+    by_chapter: Dict[str, List[Dict[str, Any]]] = {}
+    for qc in b_out["qc_pack"]:
+        by_chapter.setdefault(qc["chapter_code"], []).append(qc)
+    
+    for cc, qcs in by_chapter.items():
+        selected = progressive_select(qcs, N_total, f1f2_params, top_k=12)
+        ch_info = next((c for c in chapters if c.get("code") == cc), {"label": cc})
         selection.append({
             "chapter_code": cc,
-            "selected_qc_ids": [x["qc_id"] for x in selected],
-            "top_items": [
+            "chapter_label": ch_info.get("label", cc),
+            "selected_qc": [
                 {
-                    "qc_id": x["qc_id"],
-                    "score": x.get("_f2_score"),
+                    "qc_id": x.get("qc_id"),
+                    "qc": x.get("qc"),
                     "Psi_q": x.get("Psi_q"),
-                    "cluster_size": x.get("cluster_size"),
-                    "posable_in_cluster": x.get("posable_in_cluster"),
-                    "qc_state": x.get("qc_state"),
+                    "f2_score": x.get("_f2_score"),
+                    "primary_op": x.get("primary_op"),
                 }
                 for x in selected
             ],
         })
-
+    
     selection_report = {
         "version": APP_VERSION,
         "timestamp": _utc_ts(),
@@ -1423,18 +1319,16 @@ def run_granulo_test_iso(library: List[Dict[str, Any]], phase_a: int, phase_b: i
         "N_total": N_total,
         "chapters": selection,
     }
-
+    
     # SEALED gate
-    orphans = int(b_out["audit"]["qi_orphans"])
-    posable = int(b_out["audit"]["qi_posable"])
-    sanity_ok = bool(b_out["audit"]["sanity_ok"])
-    qc_total = int(b_out["audit"]["qc_total"])
-    qc_posable = int(b_out["audit"]["qc_posable"])
-
-    # V31.10.16: orphans==0 est désormais atteignable sans triche (QC UNPOSABLE)
-    # SEALED exige toujours des POSABLE réels + QC posables > 0
+    orphans = b_out["audit"]["qi_orphans"]
+    posable = b_out["audit"]["qi_posable"]
+    sanity_ok = b_out["audit"]["sanity_ok"]
+    qc_total = b_out["audit"]["qc_total"]
+    qc_posable = b_out["audit"]["qc_posable"]
+    
     sealed = bool(saturation_ok and sanity_ok and orphans == 0 and posable > 0 and qc_total > 0 and qc_posable > 0)
-
+    
     audit = {
         "phaseA": a_out["audit"],
         "phaseB": b_out["audit"],
@@ -1442,23 +1336,23 @@ def run_granulo_test_iso(library: List[Dict[str, Any]], phase_a: int, phase_b: i
         "setA_size": len(setA),
         "setB_size": len(setB),
         "setB_minus_setA_size": len(setB_minus_setA),
+        "setB_minus_setA": setB_minus_setA[:20],
         "sealed": sealed,
     }
-
+    
     return {
         "phaseA": a_out,
         "phaseB": b_out,
         "setA": setA,
         "setB": setB,
-        "setB_minus_setA": setB_minus_setA,
         "selection_report": selection_report,
         "audit": audit,
     }
 
 
-# -----------------------------------------------------------------------------
-# UI
-# -----------------------------------------------------------------------------
+# =============================================================================
+# UI STREAMLIT
+# =============================================================================
 def metric_row(items, corr_ok, qi, qi_posable, qc, sealed):
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Pairs", items)
@@ -1472,149 +1366,187 @@ def metric_row(items, corr_ok, qi, qi_posable, qc, sealed):
 def main():
     st.set_page_config(page_title=f"SMAXIA GTE {APP_VERSION}", layout="wide")
     ss_init()
-
-    st.markdown(f"# SMAXIA GTE Console {APP_VERSION} — ISO-PROD")
-    st.caption("Corrections V31.10.16: anti-fake POSABLE, QC UNPOSABLE (zéro orphelin), audit alignement")
-
+    
+    st.markdown(f"# SMAXIA GTE Console {APP_VERSION}")
+    st.caption("ISO-PROD | Zéro Hardcode | Pack-Driven | F1/F2 Conformes")
+    
+    # === SIDEBAR ===
     with st.sidebar:
-        st.markdown("## ACTIVATION")
-        country = st.selectbox("Pays", [DEFAULT_COUNTRY])
-        st.session_state.country = country
-
-        up = st.file_uploader("Pack JSON (optionnel)", type=["json"])
-        uploaded_pack = None
-        if up:
-            try:
-                uploaded_pack = json.loads(up.read().decode("utf-8"))
-            except Exception as e:
-                st.error(f"Pack invalide: {e}")
-
-        allow_genesis = st.checkbox("Autoriser Pack Genesis (TEST)", value=True)
-        genesis_n = st.number_input("Genesis chapitres", 4, 12, 12)
-
-        if st.button("ACTIVER", use_container_width=True):
-            try:
-                pack = load_academic_pack(country, allow_genesis, int(genesis_n), uploaded_pack)
-                st.session_state.pack_active = pack
-                st.session_state.pack_id = str(pack.get("pack_id") or "")
-                st.session_state.pack_path = pack.get("_pack_file_path")
-                st.session_state.pack_sig_sha256 = pack.get("_pack_sig_sha256")
-                st.success("Pack actif")
-            except Exception as e:
-                st.error(f"Erreur: {e}")
-
+        st.markdown("## 1. ACTIVATION PACK")
+        st.info("⚠️ Un Pack JSON est OBLIGATOIRE. Aucune donnée métier n'est dans le code.")
+        
+        # Upload Pack
+        up = st.file_uploader("Charger Pack JSON", type=["json"])
+        
+        # Ou rechercher fichiers existants
+        pack_files = find_pack_files()
+        if pack_files:
+            st.markdown("**Ou sélectionner un fichier existant:**")
+            selected_file = st.selectbox("Packs disponibles", [""] + pack_files)
+        else:
+            selected_file = ""
+        
+        if st.button("ACTIVER PACK", use_container_width=True):
+            pack = None
+            if up:
+                try:
+                    pack = load_pack_from_upload(up.read())
+                    log("[PACK] Chargé depuis upload")
+                except Exception as e:
+                    st.error(f"Erreur upload: {e}")
+            elif selected_file:
+                try:
+                    pack = load_pack_from_file(selected_file)
+                    log(f"[PACK] Chargé depuis {selected_file}")
+                except Exception as e:
+                    st.error(f"Erreur fichier: {e}")
+            else:
+                st.error("Veuillez uploader un Pack JSON ou sélectionner un fichier")
+            
+            if pack:
+                if activate_pack(pack):
+                    st.success(f"✅ Pack activé: {st.session_state.pack_id}")
+                else:
+                    st.error("❌ Pack invalide - voir logs")
+        
+        # Afficher état Pack
         if st.session_state.pack_active:
             st.success(f"✅ {st.session_state.pack_id}")
-            st.caption(f"Source: {st.session_state.pack_active.get('_source')}")
+            st.caption(f"Pays: {st.session_state.country}")
             st.caption(f"SHA256: {st.session_state.pack_sig_sha256[:16]}...")
-
-        st.markdown("---")
-        st.markdown("## SÉLECTION")
-        level = st.radio("Niveau", ["Terminale", "Première", "Seconde"], index=0)
-        st.session_state.level = {"Terminale": "TERMINALE", "Première": "PREMIERE", "Seconde": "SECONDE"}[level]
-
-        if st.session_state.pack_active:
-            st.markdown("### Chapitres")
-            for c in pack_chapters(st.session_state.pack_active)[:8]:
-                st.write(f"• {c['chapter_code']}")
-
+            
+            st.markdown("---")
+            st.markdown("## 2. SÉLECTION")
+            
+            pack = st.session_state.pack_active
+            taxonomy = pack.get("chapter_taxonomy", {})
+            
+            subjects = list(taxonomy.keys())
+            if subjects:
+                subject = st.selectbox("Matière", subjects, index=subjects.index(st.session_state.subject) if st.session_state.subject in subjects else 0)
+                st.session_state.subject = subject
+                
+                levels = list(taxonomy.get(subject, {}).keys())
+                if levels:
+                    level = st.selectbox("Niveau", levels, index=levels.index(st.session_state.level) if st.session_state.level in levels else 0)
+                    st.session_state.level = level
+            
+            # Afficher chapitres
+            chapters = pack_get_chapters(pack, st.session_state.subject, st.session_state.level)
+            if chapters:
+                st.markdown("### Chapitres")
+                for ch in chapters[:8]:
+                    st.write(f"• {ch.get('code', 'N/A')}")
+    
+    # === MAIN TABS ===
     tab1, tab2, tab3 = st.tabs(["Import", "RUN", "Exports"])
-
+    
     lib = st.session_state.library
-    corr_ok = sum(1 for x in lib if x.get("corrige?") and x.get("corrige_url"))
-
+    corr_ok = sum(1 for x in lib if x.get("corrige?"))
+    
     with tab1:
         st.markdown("## Import")
         metric_row(
-            len(lib),
-            corr_ok,
+            len(lib), corr_ok,
             st.session_state.run_stats.get("qi", 0),
             st.session_state.run_stats.get("qi_posable", 0),
             st.session_state.run_stats.get("qc", 0),
             st.session_state.sealed,
         )
-
+        
         if lib:
-            cols = ["pair_id", "year", "sujet", "corrige?", "corrige_name", "match_score"]
+            cols = ["pair_id", "year", "sujet", "corrige?", "match_score"]
             st.dataframe([{k: r.get(k, "") for k in cols} for r in lib[:50]], use_container_width=True, hide_index=True)
-
-        st.markdown("### HARVEST APMEP")
-        c1, c2 = st.columns(2)
-        years_back = c1.number_input("Années", 1, 15, 5)
-        volume_max = c2.number_input("Volume max", 5, 100, 30)
-
-        if st.button("HARVEST", use_container_width=True):
-            if not st.session_state.pack_active:
-                st.error("Pack inactif")
+        
+        st.markdown("### HARVEST")
+        if not st.session_state.pack_active:
+            st.warning("⚠️ Activez un Pack d'abord")
+        else:
+            pack = st.session_state.pack_active
+            source = pack_get_harvest_source(pack)
+            
+            if source:
+                st.info(f"Source: {source.get('source_name', source.get('source_id', 'N/A'))}")
+                c1, c2 = st.columns(2)
+                years_back = c1.number_input("Années", 1, 15, 5)
+                volume_max = c2.number_input("Volume max", 5, 100, 30)
+                
+                if st.button("HARVEST", use_container_width=True):
+                    try:
+                        manifest = harvest_from_pack(
+                            pack, 
+                            st.session_state.level, 
+                            st.session_state.subject,
+                            int(years_back), 
+                            int(volume_max)
+                        )
+                        st.session_state.harvest_manifest = manifest
+                        st.session_state.library = manifest["library"]
+                        st.session_state.sealed = False
+                        st.session_state.qi_pack = None
+                        st.session_state.qc_pack = None
+                        st.session_state.run_stats = {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0, "orphans": 0, "sanity_ok": False}
+                        st.success(f"✅ HARVEST: {manifest['items_total']} pairs (corrigés={manifest['items_corrige_ok']})")
+                    except Exception as e:
+                        st.error(f"❌ HARVEST: {e}")
             else:
-                try:
-                    manifest = harvest_apmep(st.session_state.level, "MATH", int(years_back), int(volume_max))
-                    st.session_state.harvest_manifest = manifest
-                    st.session_state.library = manifest["library"]
-                    st.session_state.sealed = False
-                    st.session_state.qi_pack = None
-                    st.session_state.qc_pack = None
-                    st.session_state.run_stats = {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0, "orphans": 0, "sanity_ok": False}
-                    st.success(f"HARVEST: {manifest['items_total']} pairs (corrigés={manifest['items_corrige_ok']})")
-                except Exception as e:
-                    st.error(f"HARVEST: {e}")
-
+                st.error("Aucune source de harvest dans le Pack")
+    
     with tab2:
         st.markdown("## RUN")
         lib2 = st.session_state.library
-        corr_ok2 = sum(1 for x in lib2 if x.get("corrige?") and x.get("corrige_url"))
-
+        corr_ok2 = sum(1 for x in lib2 if x.get("corrige?"))
+        
         if not st.session_state.pack_active:
             st.error("Pack inactif")
         elif not lib2:
-            st.warning("Bibliothèque vide")
+            st.warning("Bibliothèque vide - faites un HARVEST d'abord")
         elif corr_ok2 <= 0:
             st.error("Aucun corrigé exploitable")
         else:
-            chapters = pack_chapters(st.session_state.pack_active)
+            pack = st.session_state.pack_active
             max_vol = max(1, min(100, corr_ok2))
             c1, c2 = st.columns(2)
             phase_a = c1.slider("Phase A", 1, max_vol, min(5, max_vol))
             phase_b = c2.slider("Phase B", 1, max_vol, min(10, max_vol))
-
-            if st.button("LANCER", use_container_width=True):
+            
+            if st.button("LANCER TEST SATURATION", use_container_width=True):
                 try:
                     log(f"=== RUN {APP_VERSION} ===")
-                    res = run_granulo_test_iso(lib2, phase_a, phase_b, chapters)
-
+                    res = run_saturation_test(lib2, phase_a, phase_b, pack)
+                    
                     st.session_state.qi_pack = res["phaseB"]["qi_pack"]
                     st.session_state.qc_pack = res["phaseB"]["qc_pack"]
-                    st.session_state.chapter_report = res["phaseB"]["chapter_report"]
                     st.session_state.selection_report = res["selection_report"]
                     st.session_state.last_run_audit = res["audit"]
-
-                    sealed = bool(res["audit"]["sealed"])
+                    
+                    sealed = res["audit"]["sealed"]
                     st.session_state.sealed = sealed
-
+                    
                     st.session_state.run_stats = {
                         "qi": res["audit"]["phaseB"]["qi_total"],
                         "rqi": res["audit"]["phaseB"]["rqi_total"],
                         "qc": res["audit"]["phaseB"]["qc_total"],
                         "qi_posable": res["audit"]["phaseB"]["qi_posable"],
                         "orphans": res["audit"]["phaseB"]["qi_orphans"],
-                        "sanity_ok": bool(res["audit"]["phaseB"]["sanity_ok"]),
+                        "sanity_ok": res["audit"]["phaseB"]["sanity_ok"],
                     }
-
+                    
                     status = "✅ SEALED=YES" if sealed else "⚠️ SEALED=NO"
-                    st.info(
-                        f"{status} | sat={res['audit']['saturation_ok']} | sanity={res['audit']['phaseB']['sanity_ok']} "
-                        f"| orphans={res['audit']['phaseB']['qi_orphans']} | posable={res['audit']['phaseB']['qi_posable']} "
-                        f"| QC={res['audit']['phaseB']['qc_total']} (posable={res['audit']['phaseB'].get('qc_posable')}, unposable={res['audit']['phaseB'].get('qc_unposable')})"
-                    )
-
+                    st.info(f"{status} | sat={res['audit']['saturation_ok']} | orphans={res['audit']['phaseB']['qi_orphans']} | posable={res['audit']['phaseB']['qi_posable']} | QC={res['audit']['phaseB']['qc_total']}")
+                    
+                    if not res["audit"]["saturation_ok"]:
+                        st.warning(f"Nouvelles QC: {res['audit']['setB_minus_setA_size']}")
+                        st.json(res["audit"]["setB_minus_setA"][:10])
+                
                 except Exception as e:
-                    st.error(f"RUN: {e}")
+                    st.error(f"❌ RUN: {e}")
                     import traceback
                     st.text(traceback.format_exc())
-
+        
         st.markdown("### Logs")
         st.text_area("", logs_text(), height=300)
-
+    
     with tab3:
         st.markdown("## Exports")
         metric_row(
@@ -1625,58 +1557,55 @@ def main():
             st.session_state.run_stats.get("qc", 0),
             st.session_state.sealed,
         )
-
+        
         hm = st.session_state.harvest_manifest or {"version": APP_VERSION}
         st.download_button("harvest_manifest.json", json.dumps(hm, ensure_ascii=False, indent=2), "harvest_manifest.json")
         st.download_button("logs.txt", logs_text(), "logs.txt")
-
+        
         if st.session_state.qi_pack:
             st.download_button("qi_pack.json", json.dumps(st.session_state.qi_pack, ensure_ascii=False, indent=2), "qi_pack.json")
         if st.session_state.qc_pack:
             st.download_button("qc_pack.json", json.dumps(st.session_state.qc_pack, ensure_ascii=False, indent=2), "qc_pack.json")
-        if st.session_state.chapter_report:
-            st.download_button("chapter_report.json", json.dumps(st.session_state.chapter_report, ensure_ascii=False, indent=2), "chapter_report.json")
         if st.session_state.selection_report:
             st.download_button("selection_report.json", json.dumps(st.session_state.selection_report, ensure_ascii=False, indent=2), "selection_report.json")
         if st.session_state.last_run_audit:
             st.download_button("audit.json", json.dumps(st.session_state.last_run_audit, ensure_ascii=False, indent=2), "audit.json")
-
+        
         st.markdown("---")
         st.markdown("## Explorateur QC → Qi")
-
+        
         if st.session_state.qc_pack and st.session_state.qi_pack:
             ch_opts = ["ALL"] + sorted({qc["chapter_code"] for qc in st.session_state.qc_pack})
             sel_ch = st.selectbox("Chapitre", ch_opts)
-
+            
             qcs = st.session_state.qc_pack if sel_ch == "ALL" else [q for q in st.session_state.qc_pack if q["chapter_code"] == sel_ch]
-
+            
             if qcs:
                 qcs = sorted(qcs, key=lambda x: (-x.get("cluster_size", 0), x.get("qc_id", "")))
                 qc_labels = [
-                    f"{q['qc_id']} | {q['chapter_code']} | n={q['cluster_size']} | pos={q.get('posable_in_cluster',0)} | state={q.get('qc_state','')} | Ψ={round(float(q.get('Psi_q',0)),3)}"
+                    f"{q['qc_id']} | {q['chapter_code']} | {q.get('primary_op','')} | n={q['cluster_size']} | Ψ={round(float(q.get('Psi_q',0)),3)}"
                     for q in qcs
                 ]
                 sel_idx = st.selectbox("QC", range(len(qc_labels)), format_func=lambda i: qc_labels[i])
                 qc = qcs[sel_idx]
-
+                
                 st.markdown(f"### {qc['qc']}")
+                st.write(f"primary_op: {qc.get('primary_op')}")
                 st.write(f"qc_state: {qc.get('qc_state')}")
-                st.write(f"op_codes: {qc.get('op_codes', [])}")
-
+                st.write(f"Psi_q (F1): {qc.get('Psi_q', 0):.4f}")
+                
                 qi_by_id = {q["qi_id"]: q for q in st.session_state.qi_pack}
-
-                for qi_id in qc.get("qi_ids", [])[:20]:
+                
+                for qi_id in qc.get("qi_ids", [])[:15]:
                     q = qi_by_id.get(qi_id)
                     if not q:
                         continue
                     with st.expander(f"{qi_id} | RQi={'✅' if q.get('has_rqi') else '❌'}"):
                         st.markdown("**Qi**")
-                        st.text(q["qi"][:600])
+                        st.text(q["qi"][:500])
                         st.markdown("**RQi**")
-                        st.text(q["rqi"][:600] if q.get("rqi") else "—")
-                        st.markdown("**ARI**")
-                        st.json(q.get("ari", {}))
-
+                        st.text(q["rqi"][:500] if q.get("rqi") else "—")
+        
         st.markdown("### Audit")
         if st.session_state.last_run_audit:
             st.json(st.session_state.last_run_audit)
