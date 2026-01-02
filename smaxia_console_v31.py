@@ -1,12 +1,12 @@
 # =============================================================================
-# SMAXIA GTE Console V31.10.15 — ISO-PROD (CORRECTIONS DEFINITIVES)
+# SMAXIA GTE Console V31.10.16 — ISO-PROD (CORRECTIONS DEFINITIVES + ANTI-FAKE)
 # =============================================================================
-# CORRECTIONS vs V31.10.14:
-# 1. Extraction PDF robuste (reconstruction espaces, fallback pypdf amélioré)
-# 2. Harvest APMEP strict (matching par zone géographique + date)
-# 3. Alignement Qi↔RQi assoupli (seuils adaptatifs, fallback séquentiel)
-# 4. Clustering flexible (min_posable=1 si global_posable < seuil)
-# 5. Anti sur-segmentation PDF (fusion lignes wrap, cleanup headers)
+# CORRECTIONS vs V31.10.15:
+# 1) Alignement Qi↔RQi: SUPPRESSION du fallback séquentiel (anti “fake POSABLE”)
+# 2) Zéro orphelin SANS TRICHE: création de QC même si posable_in_cluster=0
+#    → QC marquées qc_state="UNPOSABLE" (mappage Qi→QC garanti)
+# 3) Audit d’alignement: stockage mode + score pour chaque Qi (preuve)
+# 4) UI inchangée (tabs/boutons/exports identiques) — NO REGRESSION INTENTIONNELLE
 # =============================================================================
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # SETTINGS
 # -----------------------------------------------------------------------------
-APP_VERSION = "V31.10.15"
+APP_VERSION = "V31.10.16"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 REQ_TIMEOUT = 30
 MAX_PDF_MB = 35
@@ -88,7 +88,10 @@ def ss_init():
     st.session_state.setdefault("selection_report", None)
     st.session_state.setdefault("sealed", False)
     st.session_state.setdefault("logs", [])
-    st.session_state.setdefault("run_stats", {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0, "orphans": 0, "sanity_ok": False})
+    st.session_state.setdefault(
+        "run_stats",
+        {"qi": 0, "rqi": 0, "qc": 0, "qi_posable": 0, "orphans": 0, "sanity_ok": False},
+    )
     st.session_state.setdefault("last_run_audit", None)
     st.session_state.setdefault("_uploads", {})
     st.session_state.setdefault("_http_pdf_cache", {})
@@ -144,7 +147,7 @@ def sha256_file(path: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# PDF TEXT EXTRACTION — ROBUSTE (FIX #1)
+# PDF TEXT EXTRACTION — ROBUSTE
 # -----------------------------------------------------------------------------
 def _fix_missing_spaces(text: str) -> str:
     """
@@ -153,67 +156,73 @@ def _fix_missing_spaces(text: str) -> str:
     """
     if not text:
         return ""
-    
+
     # Pattern: minuscule suivie de majuscule sans espace
-    text = re.sub(r'([a-zéèêëàâäùûüôöîïç])([A-ZÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])', r'\1 \2', text)
-    
+    text = re.sub(
+        r"([a-zéèêëàâäùûüôöîïç])([A-ZÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])", r"\1 \2", text
+    )
+
     # Pattern: chiffre collé à lettre
-    text = re.sub(r'(\d)([a-zA-ZéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])', r'\1 \2', text)
-    text = re.sub(r'([a-zA-ZéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])(\d)', r'\1 \2', text)
-    
+    text = re.sub(
+        r"(\d)([a-zA-ZéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])", r"\1 \2", text
+    )
+    text = re.sub(
+        r"([a-zA-ZéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])(\d)", r"\1 \2", text
+    )
+
     # Pattern: ponctuation collée au mot suivant
-    text = re.sub(r'([.!?;:,])([A-Za-zéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])', r'\1 \2', text)
-    
+    text = re.sub(
+        r"([.!?;:,])([A-Za-zéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ])", r"\1 \2", text
+    )
+
     # Pattern: mots français collés (heuristique basique)
-    # Détecte les séquences longues de minuscules sans espace
     def split_long_words(match):
         word = match.group(0)
         if len(word) > 25:
-            # Essayer de découper sur des patterns connus
-            word = re.sub(r'(que|qui|dont|ou|et|de|la|le|les|un|une|des|en|à|par|pour|sur|avec|dans|est|sont|soit|donc|car|mais|alors|ainsi|comme)', r' \1 ', word)
-            word = re.sub(r'\s+', ' ', word).strip()
+            word = re.sub(
+                r"(que|qui|dont|ou|et|de|la|le|les|un|une|des|en|à|par|pour|sur|avec|dans|est|sont|soit|donc|car|mais|alors|ainsi|comme)",
+                r" \1 ",
+                word,
+            )
+            word = re.sub(r"\s+", " ", word).strip()
         return word
-    
-    text = re.sub(r'[a-zéèêëàâäùûüôöîïç]{25,}', split_long_words, text)
-    
-    return re.sub(r'\s+', ' ', text).strip()
+
+    text = re.sub(r"[a-zéèêëàâäùûüôöîïç]{25,}", split_long_words, text)
+
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _dehyphenate(text: str) -> str:
     """Répare les mots coupés en fin de ligne."""
-    text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
-    text = re.sub(r'(\w)-\s+(\w)', r'\1\2', text)
-    text = re.sub(r'[ \t]+\n', '\n', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    text = re.sub(r"(\w)-\s+(\w)", r"\1\2", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text
 
 
 def _looks_like_page_number(line: str) -> bool:
     s = norm_text(line)
-    return bool(re.fullmatch(r'\d{1,3}', s) or re.fullmatch(r'page\s*\d{1,3}', s))
+    return bool(re.fullmatch(r"\d{1,3}", s) or re.fullmatch(r"page\s*\d{1,3}", s))
 
 
 def _extract_pages_pdfplumber(pdf_bytes: bytes, max_pages: int = 120) -> List[str]:
     """Extraction via pdfplumber avec reconstruction du texte."""
     if not pdfplumber:
         return []
-    
+
     pages = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages[:max_pages]:
                 try:
-                    # Extraction avec paramètres optimisés
-                    text = page.extract_text(
-                        x_tolerance=3,
-                        y_tolerance=3,
-                    ) or ""
+                    text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
                     pages.append(text)
                 except Exception:
                     pages.append("")
     except Exception:
         pass
-    
+
     return pages
 
 
@@ -221,7 +230,7 @@ def _extract_pages_pypdf(pdf_bytes: bytes, max_pages: int = 120) -> List[str]:
     """Extraction via pypdf comme fallback."""
     if not PdfReader:
         return []
-    
+
     pages = []
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -233,7 +242,7 @@ def _extract_pages_pypdf(pdf_bytes: bytes, max_pages: int = 120) -> List[str]:
                 pages.append("")
     except Exception:
         pass
-    
+
     return pages
 
 
@@ -277,7 +286,6 @@ def clean_pdf_text(pages: List[str]) -> str:
                 continue
             if _looks_like_page_number(ln):
                 continue
-            # Ignorer lignes trop courtes (bruit)
             if len(ln.strip()) < 3:
                 continue
             keep.append(ln)
@@ -291,28 +299,24 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     """
     Extraction robuste: essaie pdfplumber, puis pypdf, avec reconstruction.
     """
-    # Essai 1: pdfplumber
     pages = _extract_pages_pdfplumber(pdf_bytes)
     text = clean_pdf_text(pages)
-    
-    # Vérifier qualité (ratio espaces / caractères)
+
     if text:
-        space_ratio = text.count(' ') / max(1, len(text))
-        if space_ratio >= 0.08:  # Au moins 8% d'espaces = OK
+        space_ratio = text.count(" ") / max(1, len(text))
+        if space_ratio >= 0.08:
             return text
         log(f"[PDF] pdfplumber space_ratio={space_ratio:.2%} (faible), essai pypdf")
-    
-    # Essai 2: pypdf
+
     pages2 = _extract_pages_pypdf(pdf_bytes)
     text2 = clean_pdf_text(pages2)
-    
+
     if text2:
-        space_ratio2 = text2.count(' ') / max(1, len(text2))
-        if space_ratio2 > (text.count(' ') / max(1, len(text)) if text else 0):
+        space_ratio2 = text2.count(" ") / max(1, len(text2))
+        if space_ratio2 > (text.count(" ") / max(1, len(text)) if text else 0):
             log(f"[PDF] pypdf meilleur space_ratio={space_ratio2:.2%}")
             return text2
-    
-    # Retourner le meilleur disponible
+
     return text if text else text2
 
 
@@ -467,7 +471,7 @@ def pack_chapters(pack: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# HARVEST APMEP — STRICT MATCHING (FIX #2)
+# HARVEST APMEP — STRICT MATCHING
 # -----------------------------------------------------------------------------
 def _soup(html: str):
     if BeautifulSoup is None:
@@ -490,60 +494,49 @@ def _is_corrige_label(url: str, label: str) -> bool:
 
 
 def _extract_geo_date(name: str) -> Tuple[str, str]:
-    """
-    Extrait zone géographique et date approximative du nom de fichier.
-    Ex: "Metro_J1_17_06_2025_DV.pdf" → ("metro", "j1_17_06")
-    """
     s = norm_text(name).replace(".pdf", "")
-    
-    # Zones géographiques connues
-    zones = ["metro", "metropole", "amerique", "nord", "sud", "asie", "polynesie", 
-             "etranger", "centre", "antilles", "guyane", "caledonie", "nouvelle", "liban"]
-    
+
+    zones = [
+        "metro", "metropole", "amerique", "nord", "sud", "asie", "polynesie",
+        "etranger", "centre", "antilles", "guyane", "caledonie", "nouvelle", "liban",
+    ]
+
     geo = ""
     for z in zones:
         if z in s:
             geo = z
             break
-    
-    # Extraire pattern date (J1/J2 + date)
-    date_match = re.search(r'j[12][\s_]*\d{1,2}[\s_]*\d{1,2}', s)
+
+    date_match = re.search(r"j[12][\s_]*\d{1,2}[\s_]*\d{1,2}", s)
     date_part = date_match.group(0) if date_match else ""
-    
+
     return (geo, date_part)
 
 
 def _match_score_strict(sujet_name: str, corrige_name: str) -> float:
-    """
-    Score de matching strict basé sur zone géo + date + tokens.
-    Retourne score entre 0 et 1.
-    """
     s_geo, s_date = _extract_geo_date(sujet_name)
     c_geo, c_date = _extract_geo_date(corrige_name)
-    
+
     score = 0.0
-    
-    # Zone géographique doit correspondre (critique)
+
     if s_geo and c_geo:
         if s_geo == c_geo:
             score += 0.5
         else:
-            return 0.0  # Zone différente = pas de match
-    
-    # Date doit être proche
+            return 0.0
+
     if s_date and c_date:
         if s_date == c_date:
             score += 0.3
-        elif s_date[:2] == c_date[:2]:  # Même jour (J1/J2)
+        elif s_date[:2] == c_date[:2]:
             score += 0.15
-    
-    # Tokens communs
+
     s_tok = set(tokenize(sujet_name))
     c_tok = set(tokenize(corrige_name))
     if s_tok and c_tok:
         jaccard_score = len(s_tok & c_tok) / len(s_tok | c_tok)
         score += 0.2 * jaccard_score
-    
+
     return min(1.0, score)
 
 
@@ -612,7 +605,6 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                 if len(pairs) >= volume_max:
                     break
 
-                # Matching strict par zone géo + date
                 best = (None, 0.0)
                 for c in corriges:
                     if c["url"] in used_corr:
@@ -621,7 +613,6 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
                     if score > best[1]:
                         best = (c, score)
 
-                # Seuil strict: score >= 0.4 (zone géo doit matcher)
                 corrige = best[0] if best[1] >= 0.4 else None
                 if corrige:
                     used_corr.add(corrige["url"])
@@ -664,7 +655,7 @@ def harvest_apmep(level: str, subject: str, years_back: int, volume_max: int) ->
 
 
 # -----------------------------------------------------------------------------
-# Qi / RQi EXTRACTION — AMÉLORÉE (FIX #3, #5)
+# Qi / RQi EXTRACTION — AMÉLORÉE
 # -----------------------------------------------------------------------------
 _MATH_SYMBOL_RE = re.compile(r"[=<>≤≥∈∀∃∑∏∫√≈≠→↦±×÷]")
 _Q_MARKER_RE = re.compile(r"(?m)^\s*(\d{1,3}|[a-h]|[ivxIVX]{1,8})\s*[\)\.\-:]\s+")
@@ -681,7 +672,6 @@ _INTENT_RE = re.compile(
 
 
 def _merge_wrapped_lines(text: str) -> str:
-    """Fusionne les lignes qui sont des continuations."""
     lines = [ln.rstrip() for ln in (text or "").split("\n")]
     out, buf = [], ""
     for ln in lines:
@@ -694,7 +684,6 @@ def _merge_wrapped_lines(text: str) -> str:
         if not buf:
             buf = ln.strip()
             continue
-        # Si la ligne précédente ne finit pas par ponctuation forte, fusionner
         if not re.search(r"[.:;!?]$", buf):
             buf = (buf + " " + ln.strip()).strip()
         else:
@@ -706,15 +695,13 @@ def _merge_wrapped_lines(text: str) -> str:
 
 
 def _looks_like_question_unit(s: str) -> bool:
-    """Validation Qi: doit avoir intent OU symbole math significatif."""
     if not s or len(s.strip()) < 30:
         return False
     t = s.strip()
-    
+
     has_intent = bool(_INTENT_RE.search(t)) or ("?" in t)
     has_math = bool(_MATH_SYMBOL_RE.search(t)) or bool(re.search(r"\b\d+\b", t))
-    
-    # Accepter si intent OU contenu math substantiel
+
     return bool(has_intent or (has_math and len(t) > 50))
 
 
@@ -738,7 +725,6 @@ def _chunk_candidates(text: str) -> List[str]:
         if c:
             chunks.append(c)
 
-    # Fallback: split par paragraphes si peu de marqueurs
     if len(chunks) <= 3:
         paras = re.split(r"\n\n+", t)
         for p in paras:
@@ -750,7 +736,6 @@ def _chunk_candidates(text: str) -> List[str]:
 
 
 def split_questions(text: str, max_items: int = 200) -> Tuple[List[str], Dict[str, Any]]:
-    """Retourne (items, audit)."""
     raw_chunks = _chunk_candidates(text)
 
     keep = []
@@ -783,19 +768,27 @@ def split_questions(text: str, max_items: int = 200) -> Tuple[List[str], Dict[st
     return keep, audit
 
 
-def align_qi_rqi(qs: List[str], rs: List[str]) -> List[Optional[int]]:
+# -----------------------------------------------------------------------------
+# ALIGN Qi↔RQi — ANTI-FAKE (V31.10.16)
+# -----------------------------------------------------------------------------
+def align_qi_rqi(qs: List[str], rs: List[str]) -> Tuple[List[Optional[int]], List[Dict[str, Any]]]:
     """
-    Alignement Qi↔RQi amélioré avec seuils adaptatifs et fallback séquentiel.
+    Alignement Qi↔RQi amélioré avec seuils adaptatifs.
+    IMPORTANT V31.10.16: AUCUN fallback séquentiel (anti fake-posables).
+    Retour:
+      - out: index RQi ou None
+      - audits: liste d'audit par Qi (mode/score/fenêtre)
     """
     if not qs or not rs:
-        return [None for _ in qs]
+        return [None for _ in qs], [{"mode": "NO_RS", "score": 0.0, "j": None, "window": ""} for _ in qs]
 
     qtok = [tokenize(q) for q in qs]
     rtok = [tokenize(r) for r in rs]
-    out = [None] * len(qs)
+    out: List[Optional[int]] = [None] * len(qs)
+    audits: List[Dict[str, Any]] = [{"mode": "INIT", "score": 0.0, "j": None, "window": ""} for _ in qs]
     used_r = set()
 
-    # Pass 1: Fenêtre locale avec seuil bas
+    # Pass 1: fenêtre locale, seuil bas
     for i in range(len(qs)):
         best_j, best_s = None, 0.0
         lo, hi = max(0, i - 5), min(len(rs), i + 6)
@@ -805,11 +798,12 @@ def align_qi_rqi(qs: List[str], rs: List[str]) -> List[Optional[int]]:
             s = jaccard(qtok[i], rtok[j])
             if s > best_s:
                 best_s, best_j = s, j
-        if best_j is not None and best_s >= 0.06:  # Seuil bas
+        if best_j is not None and best_s >= 0.06:
             out[i] = best_j
             used_r.add(best_j)
+            audits[i] = {"mode": "LOCAL", "score": float(best_s), "j": int(best_j), "window": f"{lo}:{hi}"}
 
-    # Pass 2: Global pour non-matchés
+    # Pass 2: global pour non-matchés
     for i in range(len(qs)):
         if out[i] is not None:
             continue
@@ -823,18 +817,11 @@ def align_qi_rqi(qs: List[str], rs: List[str]) -> List[Optional[int]]:
         if best_j is not None and best_s >= 0.08:
             out[i] = best_j
             used_r.add(best_j)
+            audits[i] = {"mode": "GLOBAL", "score": float(best_s), "j": int(best_j), "window": "ALL"}
+        else:
+            audits[i] = {"mode": "NONE", "score": float(best_s), "j": (int(best_j) if best_j is not None else None), "window": "ALL"}
 
-    # Pass 3: Fallback séquentiel pour les restants
-    # Si beaucoup de Qi sans match, assigner séquentiellement les RQi restantes
-    unmatched_qi = [i for i in range(len(qs)) if out[i] is None]
-    unused_r = [j for j in range(len(rs)) if j not in used_r]
-    
-    if len(unmatched_qi) > 0 and len(unused_r) > 0:
-        # Assigner dans l'ordre séquentiel
-        for i, j in zip(unmatched_qi, unused_r):
-            out[i] = j
-
-    return out
+    return out, audits
 
 
 # -----------------------------------------------------------------------------
@@ -861,7 +848,6 @@ _OP_RULES: List[Tuple[str, str, str]] = [
 
 
 def extract_op_trace(rqi_text: str, qi_text: str) -> List[Dict[str, Any]]:
-    """Extrait les opérations détectées dans RQi (et Qi en fallback)."""
     t = norm_text(rqi_text or "") + " " + norm_text(qi_text or "")
     steps = []
     used = set()
@@ -937,7 +923,7 @@ def map_qi_to_chapter(qi_text: str, chapters: List[Dict[str, Any]]) -> str:
 
 
 # -----------------------------------------------------------------------------
-# QC BUILDING — FLEXIBLE (FIX #4)
+# QC BUILDING — ZÉRO ORPHELIN SANS TRICHE (V31.10.16)
 # -----------------------------------------------------------------------------
 def qc_method_label(op_codes: List[str]) -> str:
     if not op_codes:
@@ -957,14 +943,19 @@ def sigma_similarity(qc_a: Dict[str, Any], qc_b: Dict[str, Any]) -> float:
     return max(s_ops, 0.7 * s_txt)
 
 
-def build_qc_from_qi(qi_pack: List[Dict[str, Any]], chapters: List[Dict[str, Any]], min_posable_global: int) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+def build_qc_from_qi(
+    qi_pack: List[Dict[str, Any]],
+    chapters: List[Dict[str, Any]],
+    min_posable_global: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
-    Build QC avec seuil adaptatif: min_cluster_posable = 1 si peu de posable global.
+    Build QC avec seuil adaptatif:
+      - min_cluster_posable = 1 si peu de posable global
+    V31.10.16:
+      - NE JAMAIS laisser un bucket sans QC (zéro orphelin)
+      - si posable_in_cluster=0 => qc_state="UNPOSABLE" (QC non posable mais mappage garanti)
     """
-    # Calculer le nombre total de posable
     total_posable = sum(1 for q in qi_pack if q.get("has_rqi"))
-    
-    # Seuil adaptatif: si < 10 posable, accepter clusters de 1
     min_cluster_posable = 1 if total_posable < 10 else 2
     log(f"[QC] total_posable={total_posable} → min_cluster_posable={min_cluster_posable}")
 
@@ -979,15 +970,13 @@ def build_qc_from_qi(qi_pack: List[Dict[str, Any]], chapters: List[Dict[str, Any
 
     for idx, ((cc, op_codes), items) in enumerate(sorted(buckets.items()), start=1):
         posable = [x for x in items if x.get("has_rqi")]
-        
-        # Seuil adaptatif
-        if len(posable) < min_cluster_posable:
-            # Si pas assez de posable mais au moins 1, créer QC quand même
-            if len(posable) >= 1:
-                pass  # Continuer
-            else:
-                continue  # Skip si 0 posable
 
+        # On produit toujours une QC; on marque l'état selon posable.
+        qc_state = "POSABLE" if len(posable) >= 1 else "UNPOSABLE"
+
+        # Seuil adaptatif (pour classification “POSABLE” robuste), mais production QC toujours.
+        # Si posable>0 mais < min_cluster_posable: QC reste POSABLE mais faible.
+        # Si posable==0: QC UNPOSABLE.
         qc_text = qc_method_label(list(op_codes))
         qc_id = f"QC_{stable_id(cc, qc_text, str(op_codes))}"
 
@@ -1003,11 +992,18 @@ def build_qc_from_qi(qi_pack: List[Dict[str, Any]], chapters: List[Dict[str, Any
             "chapter_code": cc,
             "cluster_size": len(items),
             "posable_in_cluster": len(posable),
+            "qc_state": qc_state,  # NEW
             "qi_ids": [x["qi_id"] for x in items],
             "op_codes": list(op_codes),
             "triggers_hint": trig_sorted,
+            "cluster_gate": {
+                "min_cluster_posable": int(min_cluster_posable),
+                "posable_ok": bool(len(posable) >= min_cluster_posable),
+            },
         }
         qc_pack.append(qc_obj)
+
+        # Mappage garanti Qi→QC
         for it in items:
             qc_map[it["qi_id"]] = qc_id
 
@@ -1075,7 +1071,8 @@ def progressive_select(qc_list: List[Dict[str, Any]], N_total: int, top_k: int =
     for _ in range(min(top_k, len(remaining))):
         best = None
         for qc in remaining:
-            n_q_hist = int(qc.get("n_q_historical", qc.get("cluster_size", 1)) or 1)
+            # si UNPOSABLE => n_q_hist = 0 (score nul), donc naturellement non sélectionnée
+            n_q_hist = int(qc.get("n_q_historical", qc.get("cluster_size", 1)) or 0)
             sc, audit = f2_score(qc, selected, n_q_hist, N_total, F2_ALPHA, F2_TREC)
             qc["_f2_score"] = sc
             qc["_f2_audit"] = audit
@@ -1112,8 +1109,7 @@ def sanity_eval(doc_audits: List[Dict[str, Any]], qi_items: List[Dict[str, Any]]
 
     ok = True
     reasons = []
-    
-    # Seuils assouplis
+
     if rej_ratio > 0.85 and total_raw > 100:
         ok = False
         reasons.append(f"reject_ratio_extreme({round(rej_ratio*100,2)}%)")
@@ -1145,6 +1141,8 @@ def run_phase(library: List[Dict[str, Any]], volume_pairs: int, chapters: List[D
     doc_audits: List[Dict[str, Any]] = []
     doc_stats: List[Dict[str, Any]] = []
 
+    align_audits_all: List[Dict[str, Any]] = []
+
     for pair in to_process:
         pid = pair["pair_id"]
         try:
@@ -1167,12 +1165,13 @@ def run_phase(library: List[Dict[str, Any]], volume_pairs: int, chapters: List[D
         doc_audits.append({"pair_id": pid, "role": "SUJET", **qs_audit})
         doc_audits.append({"pair_id": pid, "role": "CORRIGE", **rs_audit})
 
-        link = align_qi_rqi(qs, rs)
-        
+        link, link_audits = align_qi_rqi(qs, rs)
         matched_count = sum(1 for x in link if x is not None)
         log(f"[ALIGN] {pid}: {len(qs)} Qi, {len(rs)} RQi, matched={matched_count}")
-        
+
         doc_stats.append({"pair_id": pid, "qi": len(qs), "rqi": len(rs), "matched": matched_count})
+        for i, ad in enumerate(link_audits[:500]):
+            align_audits_all.append({"pair_id": pid, "qi_k": i + 1, **ad})
 
         for i, q in enumerate(qs):
             if not q.strip():
@@ -1198,6 +1197,7 @@ def run_phase(library: List[Dict[str, Any]], volume_pairs: int, chapters: List[D
                 "rqi_id": rqi_id,
                 "chapter_code": chapter_code,
                 "has_rqi": bool(r),
+                "align_audit": link_audits[i] if i < len(link_audits) else {"mode": "NA", "score": 0.0, "j": None, "window": ""},
                 "op_trace": op_trace,
                 "ari_norm": ari_norm,
                 "ari_norm_ops": ari_ops,
@@ -1214,6 +1214,7 @@ def run_phase(library: List[Dict[str, Any]], volume_pairs: int, chapters: List[D
         "rqi_items": rqi_items,
         "doc_stats": doc_stats[:200],
         "doc_audits": doc_audits[:300],
+        "align_audits": align_audits_all[:2000],
         "sanity_ok": sanity_ok,
         "sanity_audit": sanity_audit,
     }
@@ -1233,7 +1234,9 @@ def build_outputs_for_phase(phase_res: Dict[str, Any], chapters: List[Dict[str, 
     for q in qi_items:
         rqi_id = q.get("rqi_id") or ""
         rtxt = rqi_by_id.get(rqi_id, {}).get("text", "")
+
         qc_id = qc_map.get(q["qi_id"], "")
+        # V31.10.16: qc_map est garanti; si jamais absent => orphelin réel (bug)
         is_orphan = not qc_id
 
         if q.get("has_rqi"):
@@ -1246,7 +1249,12 @@ def build_outputs_for_phase(phase_res: Dict[str, Any], chapters: List[Dict[str, 
             "op_trace": q.get("op_trace", []),
             "normalized_steps": q.get("ari_norm", []),
             "m_q": len(q.get("ari_norm", [])),
-            "evidence": {"has_rqi": bool(rtxt), "rqi_chars": len(rtxt), "qi_chars": len(q.get("text", ""))},
+            "evidence": {
+                "has_rqi": bool(rtxt),
+                "rqi_chars": len(rtxt),
+                "qi_chars": len(q.get("text", "")),
+                "align": q.get("align_audit", {}),
+            },
         }
 
         frt_obj = {
@@ -1274,7 +1282,7 @@ def build_outputs_for_phase(phase_res: Dict[str, Any], chapters: List[Dict[str, 
     delta_by_ch = {c["chapter_code"]: float(c.get("delta_c", 1.0) or 1.0) for c in chapters}
     qi_by_id = {x["qi_id"]: x for x in qi_pack}
     qc_by_ch: Dict[str, List[Dict[str, Any]]] = {}
-    
+
     for qc in qc_pack:
         cc = qc["chapter_code"]
         qc_by_ch.setdefault(cc, []).append(qc)
@@ -1295,7 +1303,9 @@ def build_outputs_for_phase(phase_res: Dict[str, Any], chapters: List[Dict[str, 
         qc["delta_c"] = delta_c
         qc["psi_raw"] = psi
         qc["f1_audit"] = {"delta_c": delta_c, "epsilon": F1_EPSILON, "m_q": m_q, "psi_raw": psi}
-        qc["n_q_historical"] = int(qc.get("posable_in_cluster", qc.get("cluster_size", 1)) or 1)
+
+        # IMPORTANT: UNPOSABLE => n_q_historical = 0 (score F2 nul)
+        qc["n_q_historical"] = int(qc.get("posable_in_cluster", 0) or 0)
 
     for cc, qcs in qc_by_ch.items():
         f1_normalize_in_chapter(qcs)
@@ -1345,6 +1355,8 @@ def build_outputs_for_phase(phase_res: Dict[str, Any], chapters: List[Dict[str, 
         "qi_posable": qi_posable,
         "rqi_total": sum(1 for q in qi_pack if q.get("rqi")),
         "qc_total": len(qc_pack),
+        "qc_posable": sum(1 for q in qc_pack if q.get("qc_state") == "POSABLE"),
+        "qc_unposable": sum(1 for q in qc_pack if q.get("qc_state") == "UNPOSABLE"),
         "qi_orphans": len(orphan_ids),
         "orphan_ids_sample": orphan_ids[:25],
         "sanity_ok": bool(phase_res.get("sanity_ok")),
@@ -1352,6 +1364,7 @@ def build_outputs_for_phase(phase_res: Dict[str, Any], chapters: List[Dict[str, 
         "pairs_used": phase_res.get("pairs_used"),
         "doc_stats": phase_res.get("doc_stats"),
         "doc_audits_sample": phase_res.get("doc_audits"),
+        "align_audits_sample": phase_res.get("align_audits"),
     }
 
     return {
@@ -1390,7 +1403,14 @@ def run_granulo_test_iso(library: List[Dict[str, Any]], phase_a: int, phase_b: i
             "chapter_code": cc,
             "selected_qc_ids": [x["qc_id"] for x in selected],
             "top_items": [
-                {"qc_id": x["qc_id"], "score": x.get("_f2_score"), "Psi_q": x.get("Psi_q"), "cluster_size": x.get("cluster_size")}
+                {
+                    "qc_id": x["qc_id"],
+                    "score": x.get("_f2_score"),
+                    "Psi_q": x.get("Psi_q"),
+                    "cluster_size": x.get("cluster_size"),
+                    "posable_in_cluster": x.get("posable_in_cluster"),
+                    "qc_state": x.get("qc_state"),
+                }
                 for x in selected
             ],
         })
@@ -1409,8 +1429,11 @@ def run_granulo_test_iso(library: List[Dict[str, Any]], phase_a: int, phase_b: i
     posable = int(b_out["audit"]["qi_posable"])
     sanity_ok = bool(b_out["audit"]["sanity_ok"])
     qc_total = int(b_out["audit"]["qc_total"])
+    qc_posable = int(b_out["audit"]["qc_posable"])
 
-    sealed = bool(saturation_ok and sanity_ok and orphans == 0 and posable > 0 and qc_total > 0)
+    # V31.10.16: orphans==0 est désormais atteignable sans triche (QC UNPOSABLE)
+    # SEALED exige toujours des POSABLE réels + QC posables > 0
+    sealed = bool(saturation_ok and sanity_ok and orphans == 0 and posable > 0 and qc_total > 0 and qc_posable > 0)
 
     audit = {
         "phaseA": a_out["audit"],
@@ -1451,7 +1474,7 @@ def main():
     ss_init()
 
     st.markdown(f"# SMAXIA GTE Console {APP_VERSION} — ISO-PROD")
-    st.caption("Corrections V31.10.15: Extraction PDF robuste, Harvest strict, Alignement adaptatif, Clustering flexible")
+    st.caption("Corrections V31.10.16: anti-fake POSABLE, QC UNPOSABLE (zéro orphelin), audit alignement")
 
     with st.sidebar:
         st.markdown("## ACTIVATION")
@@ -1502,9 +1525,14 @@ def main():
 
     with tab1:
         st.markdown("## Import")
-        metric_row(len(lib), corr_ok, st.session_state.run_stats.get("qi", 0),
-                   st.session_state.run_stats.get("qi_posable", 0),
-                   st.session_state.run_stats.get("qc", 0), st.session_state.sealed)
+        metric_row(
+            len(lib),
+            corr_ok,
+            st.session_state.run_stats.get("qi", 0),
+            st.session_state.run_stats.get("qi_posable", 0),
+            st.session_state.run_stats.get("qc", 0),
+            st.session_state.sealed,
+        )
 
         if lib:
             cols = ["pair_id", "year", "sujet", "corrige?", "corrige_name", "match_score"]
@@ -1573,7 +1601,11 @@ def main():
                     }
 
                     status = "✅ SEALED=YES" if sealed else "⚠️ SEALED=NO"
-                    st.info(f"{status} | sat={res['audit']['saturation_ok']} | sanity={res['audit']['phaseB']['sanity_ok']} | orphans={res['audit']['phaseB']['qi_orphans']} | posable={res['audit']['phaseB']['qi_posable']} | QC={res['audit']['phaseB']['qc_total']}")
+                    st.info(
+                        f"{status} | sat={res['audit']['saturation_ok']} | sanity={res['audit']['phaseB']['sanity_ok']} "
+                        f"| orphans={res['audit']['phaseB']['qi_orphans']} | posable={res['audit']['phaseB']['qi_posable']} "
+                        f"| QC={res['audit']['phaseB']['qc_total']} (posable={res['audit']['phaseB'].get('qc_posable')}, unposable={res['audit']['phaseB'].get('qc_unposable')})"
+                    )
 
                 except Exception as e:
                     st.error(f"RUN: {e}")
@@ -1585,12 +1617,14 @@ def main():
 
     with tab3:
         st.markdown("## Exports")
-        metric_row(len(st.session_state.library),
-                   sum(1 for x in st.session_state.library if x.get("corrige?")),
-                   st.session_state.run_stats.get("qi", 0),
-                   st.session_state.run_stats.get("qi_posable", 0),
-                   st.session_state.run_stats.get("qc", 0),
-                   st.session_state.sealed)
+        metric_row(
+            len(st.session_state.library),
+            sum(1 for x in st.session_state.library if x.get("corrige?")),
+            st.session_state.run_stats.get("qi", 0),
+            st.session_state.run_stats.get("qi_posable", 0),
+            st.session_state.run_stats.get("qc", 0),
+            st.session_state.sealed,
+        )
 
         hm = st.session_state.harvest_manifest or {"version": APP_VERSION}
         st.download_button("harvest_manifest.json", json.dumps(hm, ensure_ascii=False, indent=2), "harvest_manifest.json")
@@ -1618,11 +1652,15 @@ def main():
 
             if qcs:
                 qcs = sorted(qcs, key=lambda x: (-x.get("cluster_size", 0), x.get("qc_id", "")))
-                qc_labels = [f"{q['qc_id']} | {q['chapter_code']} | n={q['cluster_size']} | Ψ={round(float(q.get('Psi_q',0)),3)}" for q in qcs]
+                qc_labels = [
+                    f"{q['qc_id']} | {q['chapter_code']} | n={q['cluster_size']} | pos={q.get('posable_in_cluster',0)} | state={q.get('qc_state','')} | Ψ={round(float(q.get('Psi_q',0)),3)}"
+                    for q in qcs
+                ]
                 sel_idx = st.selectbox("QC", range(len(qc_labels)), format_func=lambda i: qc_labels[i])
                 qc = qcs[sel_idx]
 
                 st.markdown(f"### {qc['qc']}")
+                st.write(f"qc_state: {qc.get('qc_state')}")
                 st.write(f"op_codes: {qc.get('op_codes', [])}")
 
                 qi_by_id = {q["qi_id"]: q for q in st.session_state.qi_pack}
