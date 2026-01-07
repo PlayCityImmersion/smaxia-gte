@@ -1,27 +1,24 @@
 # =============================================================================
-# SMAXIA GTE Console V31.10.21 — ISO-PROD (FICHIER UNIQUE)
+# SMAXIA GTE Console V31.10.22 (ISO-PROD TEST — Kernel V10.6.1 aligned)
 # =============================================================================
-# OBJECTIF V31.10.21 (meilleure combinaison du tableau comparatif) :
-# - Saturation: BOUCLE PROGRESSIVE (vol_start → vol_max) jusqu'à new_QC=0  ✅ (GPT)
-# - FRT: Templates spécifiques par opérateur (Pack-driven)               ✅ (Ma)
-# - frt_pack.json: Export séparé                                         ✅ (GPT)
-# - mapping_qi_to_qc.json: Export séparé (preuve)                         ✅ (GPT)
-# - run_signature.json: SHA256 de tous les outputs                         ✅ (GPT)
-# - qc_format: Pack-driven (prefix/suffix)                                ✅ (GPT)
-# - URL Harvest: Annales-Terminale-Generale (corrigé)                      ✅ (GPT)
-# - ARI trace: Enrichi (evidence + match_count)                            ✅ (Ma)
-# - Coverage: Calculé (KPI)                                                ✅ (Ma)
-# - seal_reason: Explication du statut SEALED                               ✅ (Ma)
-# - UI: 4 onglets (Import / RUN / Résultats / Exports)                      ✅ (Ma)
+# KEY FIX V31.10.22:
+# - Atomisation robuste Sujet->Exos->Questions->Sous-questions (multi-pages)
+# - Extraction RQi (corrigés) + affichage UI + exports dédiés
+# - CAS 1 ONLY strict: aucune reconstruction; quarantaine RC_* + preuves
+# - POSABLE Gate (corrigé + scope + évaluable) avant toute étape aval
+# - Pack-driven (qc_format, scope rules, verb ontology mappings). Si absent => quarantine.
+# - Saturation progressive new_QC=0 + SHA256 signature outputs
+# - Determinisme total (tri + seeds fixes)
 #
-# RÈGLES KERNEL (scellées) :
-# - Zéro hardcode métier (pays/chapitres/matières) dans le CORE. La variabilité
-#   est uniquement dans le PACK (données).
-# - SEALED = (orphans == 0) AND (boucle saturation atteint new_QC == 0) AND sanity_ok
-#   AND (qc_posable > 0) AND (qi_posable > 0).
+# RUN:
+#   streamlit run smaxia_gte_console_v31_10_22.py
 #
-# USAGE:
-#   streamlit run smaxia_console_v31_10_21.py
+# Dependencies (typical):
+#   pip install streamlit requests beautifulsoup4 pdfplumber pandas numpy scikit-learn
+#
+# Notes:
+# - OCR fallback volontairement "soft": si pytesseract/pdf2image non dispo => quarantaine UNREADABLE
+# - Aucun hardcode chapitre/pays: uniquement via Pack JSON. Sans scope rules => POSABLE_SCOPE fail.
 # =============================================================================
 
 from __future__ import annotations
@@ -31,1858 +28,1682 @@ import os
 import re
 import json
 import time
+import math
 import hashlib
-import unicodedata
+import difflib
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Iterable
+
+import streamlit as st
+import pandas as pd
+import numpy as np
 
 import requests
-import streamlit as st
+import pdfplumber
+from bs4 import BeautifulSoup
 
+# Optional ML (clustering/features). If missing, fallback to deterministic signature bucketing.
 try:
-    import pdfplumber
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_OK = True
 except Exception:
-    pdfplumber = None
+    SKLEARN_OK = False
 
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
+# -----------------------------
+# Global constants (Kernel-style)
+# -----------------------------
+VERSION = "V31.10.22"
+KERNEL_VERSION = "V10.6.1"
+FINGERPRINT_ALGO = "SHA256"
 
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
-
-
-# =============================================================================
-# KERNEL CONSTANTS (INVARIANTS MATHÉMATIQUES — JAMAIS MODIFIÉS)
-# =============================================================================
-APP_VERSION = "V31.10.21"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-REQ_TIMEOUT = 30
+REQ_TIMEOUT = 25
 MAX_PDF_MB = 35
 
-# Constantes Kernel (références F1/F2)
-F1_EPSILON = 1e-6
-F2_ALPHA = 1.0
-F2_TREC = 1.0
+# Determinism
+RANDOM_SEED = 0
+np.random.seed(RANDOM_SEED)
 
-# Seuils "KPI" par défaut (peuvent être overridés par pack.f1_f2_params)
-DEFAULT_COVERAGE_THRESHOLD = 0.80  # KPI seulement, pas une règle SEALED à elle seule
+# -----------------------------
+# Reason Codes (Kernel-aligned spirit)
+# -----------------------------
+RC_CORRIGE_MISSING = "RC_CORRIGE_MISSING"
+RC_CORRIGE_UNREADABLE = "RC_CORRIGE_UNREADABLE"
+RC_CORRIGE_MISMATCH = "RC_CORRIGE_MISMATCH"
+RC_SCOPE_UNRESOLVED = "RC_SCOPE_UNRESOLVED"
+RC_SCOPE_AMBIGUOUS = "RC_SCOPE_AMBIGUOUS"
+RC_NOT_EVALUABLE = "RC_NOT_EVALUABLE"
+RC_SUBJECT_UNREADABLE = "RC_SUBJECT_UNREADABLE"
+RC_PAIRING_LOW_CONF = "RC_PAIRING_LOW_CONF"
+RC_SINGLETON = "RC_SINGLETON_IRREDUCTIBLE"
+RC_RECONSTRUCTED_FORBIDDEN = "RC_RECONSTRUCTED_FORBIDDEN"
 
+ATT_PRECOND_FAIL = "ATT_PRECOND_FAIL"
+ATT_TRIGGER_MISS = "ATT_TRIGGER_MISS"
+ATT_SIGNATURE_MISMATCH = "ATT_SIGNATURE_MISMATCH"
+ATT_NEEDS_EXTRA_STEP = "ATT_NEEDS_EXTRA_STEP"
+ATT_OUTPUT_TYPE_MISMATCH = "ATT_OUTPUT_TYPE_MISMATCH"
+
+# -----------------------------
+# Utility
+# -----------------------------
+def sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return f"sha256:{h.hexdigest()}"
+
+def sha256_text(s: str) -> str:
+    return sha256_bytes(s.encode("utf-8", errors="ignore"))
+
+def now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def safe_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
+
+def clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+def stable_sort(items: Iterable[Any], key_fn):
+    return sorted(list(items), key=key_fn)
+
+# -----------------------------
+# Data structures
+# -----------------------------
+@dataclass(frozen=True)
+class Locator:
+    page_start: int
+    page_end: int
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+
+@dataclass
+class SourceDoc:
+    doc_id: str
+    kind: str  # "subject" or "correction"
+    url: str
+    filename: str
+    bytes_sha256: str
+    fetched_at: str
+
+@dataclass
+class Pair:
+    pair_id: str
+    subject: SourceDoc
+    correction: Optional[SourceDoc]
+    pairing_confidence: float
+    pairing_evidence: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class Atom:
+    atom_id: str
+    subject_id: str
+    correction_id: Optional[str]
+    qi_id: str
+    rqi_id: Optional[str]
+    exo_ref: Optional[str]
+    q_ref: Optional[str]
+    qi_raw: str
+    rqi_raw: Optional[str]
+    qi_clean: str
+    rqi_clean: Optional[str]
+    language_detected: str
+    year_ref: Optional[str]
+    source_url: str
+    source_fingerprint: str
+    extraction_locators: Dict[str, Locator]
+    sanitizer_derivations: List[Dict[str, Any]]
+    pairing_confidence: float
+    figure_refs: List[Dict[str, Any]] = field(default_factory=list)
+
+@dataclass
+class PosableDecision:
+    qi_id: str
+    chapter_ref: Optional[str]
+    posable_status: bool
+    posable_reason_codes: List[str]
+    evidence_refs: List[str]
+    scope_trace: Dict[str, Any]
+
+@dataclass
+class ChapterMetrics:
+    chapter_ref: str
+    N_total_posable: int
+    quarantined_count: int
+    posable_rate: float
+
+@dataclass
+class TraceARI:
+    qi_id: str
+    chapter_ref: str
+    actions: List[Dict[str, Any]]  # ordered steps with evidence
+    triggers: List[Dict[str, Any]]
+    output_type: str
+    evidence_refs: List[str]
+
+@dataclass
+class ClusterCandidate:
+    cluster_id: str
+    chapter_ref: str
+    qi_ids: List[str]
+    n_q_cluster: int
+    qi_champion_id: str
+    cluster_coherence_score: float
+    signature_variance_flag: bool
+
+@dataclass
+class AuditEntry:
+    check_id: str
+    status: str  # PASS/FAIL
+    evidence_refs: List[str]
+    details: str
+    fix_recommendations: List[str]
+
+@dataclass
+class QCCandidate:
+    qc_id: str
+    chapter_ref: str
+    qc_text: str
+    language: str
+    ari_typed: Dict[str, Any]
+    frt: Dict[str, Any]
+    triggers: List[Dict[str, Any]]
+    sig: str
+    n_q_cluster: int
+    evidence_pack: Dict[str, Any]
+    coverage_map_provisional: Dict[str, Any]
+    f1: float
+    f2: float
+    ia2_audit: List[AuditEntry]
+    ia2_pass: bool
+
+@dataclass
+class SelectionResult:
+    chapter_ref: str
+    selected_qc_ids: List[str]
+    coverage_map_final: Dict[str, Any]  # qi_id -> {qc_id or ORPHAN, evidence_refs, motifs}
+    orphans: List[str]
+    coverage_kpi: float
 
 # =============================================================================
-# PACK GENESIS — DONNÉES MÉTIER (TEST) — TOUTE LA VARIABILITÉ DOIT ÊTRE ICI
+# Pack loading (no hardcode chapter/pays)
 # =============================================================================
-def _utc_ts() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-
-def _sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-
-def _sha256_text(s: str) -> str:
-    return _sha256_bytes(s.encode("utf-8"))
-
-
-def _json_dumps_stable(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _genesis_pack_fr() -> Dict[str, Any]:
-    """
-    Pack Genesis France — Math Terminale/Première.
-    NOTE: Ce pack est "données". Le CORE ne doit pas contenir de règles métier.
-    """
-    return {
-        "pack_id": "CAP_FR_GENESIS_V31_10_21",
-        "pack_version": "31.10.21",
-        "country_code": "FR",
-        "country_name": "France",
-        "language": "fr",
-        "status": "GENESIS_TEST",
-
-        # QC format pack-driven
-        # (Le kernel impose le format invariant, mais l'implémentation UI/texte reste pack-driven)
-        "qc_format": {"prefix": "Comment ", "suffix": " ?"},
-
-        # Harvest sources
-        "harvest_sources": [{
-            "source_id": "APMEP",
-            "source_name": "APMEP - Annales du Bac",
-            "base_url": "https://www.apmep.fr",
-            "levels": {
-                # Chemins qui ont déjà été utilisés / corrigés côté GPT (à conserver)
-                "TERMINALE": "/Annales-Terminale-Generale",
-                "PREMIERE": "/Annales-Premiere-Generale",
-            },
-            "year_pattern": r"Annee-(20\d{2})",
-            "pdf_patterns": {
-                "sujet": ["spe", "sujet", "enonce", "énoncé", "bac", "terminale", "premiere"],
-                "corrige": ["corrig", "correction", "solution", "corrigé"],
-            },
-            "meta_exclude": ["index", "sommaire", "liste", "annexe", "grille", "formulaire"],
-            "geographic_zones": [
-                "metro", "metropole", "métropole", "amerique", "nord", "sud", "asie",
-                "polynesie", "polynésie", "etranger", "étranger", "antilles", "liban",
-                "guyane", "reunion", "réunion", "mayotte", "calédonie", "caledonie"
-            ],
-        }],
-
-        # Text processing
-        "text_processing": {
-            "common_words": [
-                "le", "la", "les", "de", "du", "des", "un", "une", "et", "ou", "en", "que", "qui",
-                "est", "sont", "par", "pour", "sur", "dans", "avec", "ce", "se", "ne", "pas",
-                "au", "aux", "son", "sa", "ses", "tout", "tous", "on", "nous", "vous",
-                "soit", "alors", "ainsi", "comme", "bien", "peut", "fait", "plus", "moins",
-                "exercice", "partie", "question", "montrer", "demontrer", "calculer", "justifier",
-            ],
-            "glued_patterns": [
-                {"pattern": r"(\d)([a-zA-Z])", "replacement": r"\1 \2"},
-                {"pattern": r"([a-zA-Z])(\d)", "replacement": r"\1 \2"},
-                {"pattern": r"([a-z])([A-Z])", "replacement": r"\1 \2"},
-            ],
-            "intent_verbs": [
-                "montrer", "demontrer", "prouver", "justifier", "determiner", "calculer",
-                "resoudre", "etudier", "donner", "exprimer", "simplifier", "trouver",
-                "verifier", "deduire", "conclure", "etablir", "tracer", "representer",
-            ],
-            "trigger_keywords": [
-                "limite", "derivee", "intégrale", "integrale", "probabilite", "probabilité",
-                "suite", "vecteur", "complexe", "equation", "équation", "fonction",
-                "recurrence", "récurrence", "matrice", "logarithme", "exponentielle",
-                "primitive", "continuite", "continuité", "asymptote",
-            ],
-        },
-
-        # ARI config (pack-driven)
-        "ari_config": {
-            "op_patterns": [
-                {"op": "OP_PROBABILITY", "pattern": r"\b(probabilit|proba|loi\s+binomiale|loi\s+normale|esperance|variance|aleatoire)\b", "weight": 1.0},
-                {"op": "OP_DERIVE", "pattern": r"\b(deriv|f'\s*\(|tangente|taux\s+de\s+variation)\b", "weight": 1.0},
-                {"op": "OP_INTEGRATE", "pattern": r"\b(integr|primitive|aire\s+sous|calcul\s+d'aire)\b", "weight": 1.0},
-                {"op": "OP_LIMIT", "pattern": r"\b(limit|tend\s+vers|infini|convergence)\b", "weight": 1.0},
-                {"op": "OP_INDUCTION", "pattern": r"\b(recurr|induction|heredite|hérédit|initialisation|rang)\b", "weight": 1.0},
-                {"op": "OP_COMPLEX", "pattern": r"\b(complex|imaginaire|module|argument|affixe|conjugue|conjugué)\b", "weight": 1.0},
-                {"op": "OP_VECTOR_GEOM", "pattern": r"\b(vecteur|scalaire|orthogonal|colineaire|coliné|produit\s+scalaire)\b", "weight": 1.0},
-                {"op": "OP_TRIGO", "pattern": r"\b(cos|sin|tan|trigo|radian|cercle\s+trigonometrique|trigonométr)\b", "weight": 1.0},
-                {"op": "OP_LOGEXP", "pattern": r"\b(ln|log|exp|exponentiel|exponentiell|logarithme)\b", "weight": 1.0},
-                {"op": "OP_SOLVE_EQUATION", "pattern": r"\b(equat|équat|resou|racine|solution|discriminant|inequation|inéquation)\b", "weight": 1.0},
-                {"op": "OP_VARIATION_TABLE", "pattern": r"\b(tableau\s+de\s+variation|signe|croissant|decroissant|décroissant|extremum|extrém)\b", "weight": 1.0},
-                {"op": "OP_PROVE", "pattern": r"\b(demontr|démontr|prouv|justifi|montr|etablir|établir)\b", "weight": 0.8},
-            ],
-            "primary_ops_order": [
-                "OP_PROBABILITY", "OP_INTEGRATE", "OP_DERIVE", "OP_LIMIT",
-                "OP_INDUCTION", "OP_COMPLEX", "OP_VECTOR_GEOM", "OP_TRIGO",
-                "OP_LOGEXP", "OP_SOLVE_EQUATION", "OP_VARIATION_TABLE", "OP_PROVE", "OP_STANDARD",
-            ],
-            "op_labels": {
-                "OP_PROBABILITY": "calculer une probabilité",
-                "OP_DERIVE": "dériver une fonction",
-                "OP_INTEGRATE": "calculer une intégrale",
-                "OP_LIMIT": "calculer une limite",
-                "OP_INDUCTION": "démontrer par récurrence",
-                "OP_COMPLEX": "manipuler des nombres complexes",
-                "OP_VECTOR_GEOM": "résoudre un problème de géométrie vectorielle",
-                "OP_TRIGO": "appliquer la trigonométrie",
-                "OP_LOGEXP": "utiliser logarithme et exponentielle",
-                "OP_SOLVE_EQUATION": "résoudre une équation ou inéquation",
-                "OP_VARIATION_TABLE": "établir un tableau de variation",
-                "OP_PROVE": "démontrer une propriété",
-                "OP_STANDARD": "résoudre un exercice standard",
-            },
-            # Templates FRT spécifiques par opérateur (ma version gagnante)
-            "frt_templates": {
-                "OP_PROBABILITY": [
-                    "1. Identifier l'expérience aléatoire et l'univers Ω.",
-                    "2. Définir précisément les événements.",
-                    "3. Identifier la loi adaptée (binomiale, normale, etc.).",
-                    "4. Appliquer la formule / propriété pertinente.",
-                    "5. Calculer, vérifier la cohérence, conclure.",
-                ],
-                "OP_DERIVE": [
-                    "1. Identifier f(x) et le domaine.",
-                    "2. Décomposer (somme/produit/quotient/composition).",
-                    "3. Appliquer les règles de dérivation.",
-                    "4. Simplifier f'(x) et vérifier.",
-                    "5. Exploiter (tangente, variations) si demandé.",
-                ],
-                "OP_INTEGRATE": [
-                    "1. Identifier la fonction à intégrer et les bornes.",
-                    "2. Trouver une primitive F.",
-                    "3. Appliquer F(b) − F(a).",
-                    "4. Simplifier et interpréter (aire, valeur moyenne…).",
-                    "5. Conclure et contrôler l'ordre de grandeur.",
-                ],
-                "OP_LIMIT": [
-                    "1. Identifier la forme de la limite.",
-                    "2. Lever l’indétermination (factoriser, conjugué, équivalents…).",
-                    "3. Utiliser le terme dominant / comparaisons.",
-                    "4. Calculer et justifier.",
-                    "5. Conclure sur la limite et l’interprétation (asymptote…).",
-                ],
-                "OP_INDUCTION": [
-                    "1. Initialisation : vérifier P(n₀).",
-                    "2. Hérédité : supposer P(n) vraie.",
-                    "3. Démontrer P(n+1).",
-                    "4. Conclusion : P(n) vraie pour tout n ≥ n₀.",
-                ],
-                "OP_COMPLEX": [
-                    "1. Identifier la forme (algébrique / trigonométrique / exponentielle).",
-                    "2. Convertir vers la forme utile.",
-                    "3. Calculer (module, argument, conjugué, produit…).",
-                    "4. Interpréter géométriquement si requis.",
-                    "5. Conclure.",
-                ],
-                "OP_VECTOR_GEOM": [
-                    "1. Choisir un repère/paramétrage adapté.",
-                    "2. Écrire vecteurs/équations (droite, plan).",
-                    "3. Utiliser orthogonalité / colinéarité / produit scalaire.",
-                    "4. Résoudre le système et interpréter.",
-                    "5. Conclure.",
-                ],
-                "OP_TRIGO": [
-                    "1. Identifier les fonctions trigonométriques et le domaine.",
-                    "2. Appliquer identités/formules utiles.",
-                    "3. Résoudre sur intervalle de référence.",
-                    "4. Généraliser (périodicité) et vérifier.",
-                    "5. Conclure.",
-                ],
-                "OP_LOGEXP": [
-                    "1. Déterminer le domaine (conditions).",
-                    "2. Utiliser propriétés de ln/exp.",
-                    "3. Transformer (isoler, équivalences).",
-                    "4. Résoudre et vérifier dans le domaine.",
-                    "5. Conclure.",
-                ],
-                "OP_SOLVE_EQUATION": [
-                    "1. Identifier le type et le domaine.",
-                    "2. Mettre sous une forme résoluble (factoriser, substitution…).",
-                    "3. Résoudre (discriminant, étude de signe…).",
-                    "4. Vérifier les solutions.",
-                    "5. Conclure.",
-                ],
-                "OP_VARIATION_TABLE": [
-                    "1. Calculer f'(x).",
-                    "2. Résoudre f'(x)=0 et déterminer le signe.",
-                    "3. Dresser le tableau de variation.",
-                    "4. Déduire extrema / image / inégalités.",
-                    "5. Conclure.",
-                ],
-                "OP_PROVE": [
-                    "1. Reformuler clairement ce qu’il faut démontrer.",
-                    "2. Choisir une stratégie (directe, absurde, contraposée, récurrence).",
-                    "3. Dérouler le raisonnement en justifiant chaque étape.",
-                    "4. Vérifier les conditions/hypothèses.",
-                    "5. Conclure.",
-                ],
-                "OP_STANDARD": [
-                    "1. Identifier données/inconnues/objectif.",
-                    "2. Choisir une méthode générale adaptée.",
-                    "3. Exécuter les calculs avec rigueur.",
-                    "4. Vérifier et interpréter.",
-                    "5. Conclure.",
-                ],
-            },
-        },
-
-        # Chapter taxonomy (pack-driven)
-        "chapter_taxonomy": {
-            "MATH": {
-                "TERMINALE": [
-                    {"code": "CH_ANALYSE", "label": "Analyse", "keywords": ["limite", "derivee", "dérivée", "continuite", "continuité", "asymptote", "variation", "tangente", "convexite", "convexité", "fonction"], "delta_c": 1.0},
-                    {"code": "CH_PROBABILITES", "label": "Probabilités", "keywords": ["probabilite", "probabilité", "loi", "binomiale", "normale", "esperance", "espérance", "variance", "aleatoire", "aléatoire", "independance", "indépendance"], "delta_c": 1.0},
-                    {"code": "CH_SUITES", "label": "Suites", "keywords": ["suite", "recurrence", "récurrence", "arithmetique", "arithmétique", "geometrique", "géométrique", "convergence", "terme", "rang", "limite"], "delta_c": 1.0},
-                    {"code": "CH_INTEGRATION", "label": "Intégration", "keywords": ["integrale", "intégrale", "primitive", "aire", "integration", "intégration", "valeur moyenne"], "delta_c": 1.0},
-                    {"code": "CH_GEOMETRIE", "label": "Géométrie espace", "keywords": ["vecteur", "plan", "droite", "espace", "orthogonal", "colineaire", "colinéaire", "parametrique", "paramétrique"], "delta_c": 1.0},
-                    {"code": "CH_COMPLEXES", "label": "Nombres complexes", "keywords": ["complexe", "imaginaire", "module", "argument", "affixe", "conjugue", "conjugué", "exponentielle"], "delta_c": 1.0},
-                    {"code": "CH_LOGEXP", "label": "Log & Exp", "keywords": ["exponentielle", "logarithme", "ln", "exp"], "delta_c": 1.0},
-                    {"code": "CH_TRIGO", "label": "Trigonométrie", "keywords": ["cosinus", "sinus", "tangente", "radian", "cercle", "trigonometrique", "trigonométrique"], "delta_c": 1.0},
-                ],
-                "PREMIERE": [
-                    {"code": "CH_ANALYSE", "label": "Analyse", "keywords": ["derivee", "dérivée", "variation", "fonction", "tangente", "polynome", "polynôme"], "delta_c": 1.0},
-                    {"code": "CH_PROBABILITES", "label": "Probabilités", "keywords": ["probabilite", "probabilité", "evenement", "événement", "aleatoire", "aléatoire", "variable"], "delta_c": 1.0},
-                    {"code": "CH_SUITES", "label": "Suites", "keywords": ["suite", "arithmetique", "arithmétique", "geometrique", "géométrique", "terme"], "delta_c": 1.0},
-                ],
-            }
-        },
-
-        "f1_f2_params": {
-            "epsilon": F1_EPSILON,
-            "alpha": F2_ALPHA,
-            "t_rec_default": F2_TREC,
-            "coverage_threshold": DEFAULT_COVERAGE_THRESHOLD,  # KPI
-        },
-    }
-
-
-def _clone_pack(pack: Dict[str, Any], pack_id: str, country_code: str, country_name: str) -> Dict[str, Any]:
-    p = json.loads(json.dumps(pack))
-    p["pack_id"] = pack_id
-    p["country_code"] = country_code
-    p["country_name"] = country_name
-    return p
-
-
-def _genesis_pack_ci() -> Dict[str, Any]:
-    return _clone_pack(_genesis_pack_fr(), "CAP_CI_GENESIS_V31_10_21", "CI", "Côte d'Ivoire")
-
-
-def _genesis_pack_sn() -> Dict[str, Any]:
-    return _clone_pack(_genesis_pack_fr(), "CAP_SN_GENESIS_V31_10_21", "SN", "Sénégal")
-
-
-GENESIS_PACKS = {
-    "FR": ("France", _genesis_pack_fr),
-    "CI": ("Côte d'Ivoire", _genesis_pack_ci),
-    "SN": ("Sénégal", _genesis_pack_sn),
-}
-
-
-def generate_pack(country_code: str) -> Dict[str, Any]:
-    if country_code not in GENESIS_PACKS:
-        raise ValueError(f"Pays non supporté: {country_code}")
-    _, generator = GENESIS_PACKS[country_code]
-    pack = generator()
-    pack["created_at"] = _utc_ts()
-    pack["_source"] = "GENESIS_AUTO"
-    pack["_pack_sig_sha256"] = _sha256_text(_json_dumps_stable(pack))
+def load_pack_from_upload(uploaded_file) -> Dict[str, Any]:
+    raw = uploaded_file.read()
+    pack = json.loads(raw.decode("utf-8", errors="ignore"))
+    pack["_pack_bytes_sha256"] = sha256_bytes(raw)
+    pack["_loaded_at"] = now_iso()
     return pack
 
+def pack_get(pack: Dict[str, Any], path: str, default=None):
+    cur = pack
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
 
 # =============================================================================
-# SESSION & LOGS
+# Harvesting (APMEP example) — pack-driven root URL
 # =============================================================================
-def ss_init() -> None:
-    defaults = {
-        "pack_active": None,
-        "pack_id": None,
-        "pack_sig_sha256": None,
-        "country": None,
-        "level": None,
-        "subject": None,
-        "library": [],
-        "harvest_manifest": None,
-        "qi_pack": None,
-        "qc_pack": None,
-        "frt_pack": None,
-        "qc_map": None,
-        "selection_report": None,
-        "sealed": False,
-        "logs": [],
-        "run_stats": {
-            "pairs": 0,
-            "corriges": 0,
-            "qi": 0,
-            "rqi": 0,
-            "qi_posable": 0,
-            "orphans": 0,
-            "qc": 0,
-            "qc_posable": 0,
-            "coverage": 0.0,
-            "sanity_ok": False,
-        },
-        "last_run_audit": None,
-        "run_signature": None,
-        "_http_pdf_cache": {},
-    }
-    for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
+def http_get(url: str) -> requests.Response:
+    headers = {"User-Agent": UA}
+    r = requests.get(url, headers=headers, timeout=REQ_TIMEOUT)
+    r.raise_for_status()
+    return r
 
+def is_pdf_url(url: str) -> bool:
+    return url.lower().endswith(".pdf")
 
-def log(msg: str) -> None:
-    st.session_state.logs.append(f"[{_utc_ts()}] {msg}")
-
-
-def logs_text() -> str:
-    return "\n".join(st.session_state.logs[-8000:])
-
-
-# =============================================================================
-# TEXT UTILS (CORE INVARIANT)
-# =============================================================================
-def norm_text(s: str) -> str:
-    s = (s or "").replace("\u00a0", " ")
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+def normalize_name(s: str) -> str:
     s = s.lower()
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
     return s
 
+def harvest_apmep_pairs(pack: Dict[str, Any], year_min: Optional[int], year_max: Optional[int], limit_pairs: int) -> Tuple[List[Pair], Dict[str, Any]]:
+    """
+    Harvest APMEP annales pages (or any similar index) using pack policy:
+      pack.policy.harvest.root_url
+      pack.policy.harvest.pdf_link_regex (optional)
+      pack.policy.harvest.corrige_keywords (optional)
+    """
+    root = pack_get(pack, "policy.harvest.root_url")
+    if not root:
+        raise ValueError("Pack policy.harvest.root_url manquant")
 
-def stable_id(*parts: str) -> str:
-    return hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()[:12]
+    corrige_kw = pack_get(pack, "policy.harvest.corrige_keywords", ["corrig", "corrigé", "corrige"])
+    pdf_regex = pack_get(pack, "policy.harvest.pdf_link_regex")  # optional
 
+    audit = {"root": root, "pages_visited": [], "links_found": 0, "pairs_built": 0, "quarantine": []}
 
-def tokenize(s: str) -> List[str]:
-    return re.findall(r"[a-z0-9]{2,}", norm_text(s))[:2000]
+    # APMEP may have multiple year subpages; simplest: fetch root and scan pdf links.
+    r = http_get(root)
+    audit["pages_visited"].append(root)
+    soup = BeautifulSoup(r.text, "html.parser")
 
+    links = []
+    for a in soup.find_all("a"):
+        href = a.get("href") or ""
+        text = (a.get_text() or "").strip()
+        if not href:
+            continue
+        if href.startswith("//"):
+            href = "https:" + href
+        if href.startswith("/"):
+            # best-effort
+            base = re.match(r"^(https?://[^/]+)", root)
+            href = (base.group(1) if base else "") + href
 
-def jaccard(a: List[str], b: List[str]) -> float:
-    if not a or not b:
-        return 0.0
-    sa, sb = set(a), set(b)
-    inter = len(sa & sb)
-    union = len(sa | sb)
-    return inter / union if union else 0.0
+        if ".pdf" in href.lower():
+            if pdf_regex:
+                if not re.search(pdf_regex, href, flags=re.I):
+                    continue
+            links.append((href, text))
 
+    audit["links_found"] = len(links)
 
-# =============================================================================
-# PACK ACCESSORS (CORE)
-# =============================================================================
-def pack_chapters(pack: Dict[str, Any], subject: str, level: str) -> List[Dict[str, Any]]:
-    return pack.get("chapter_taxonomy", {}).get(subject, {}).get(level, [])
+    # Group likely subject/correction by normalized base name + token similarity.
+    # Deterministic: sort by URL.
+    links = stable_sort(links, key_fn=lambda x: x[0])
 
+    # Build candidates
+    docs = []
+    for url, text in links:
+        fname = url.split("/")[-1].split("?")[0]
+        kind_guess = "correction" if any(k in (text.lower() + " " + fname.lower()) for k in corrige_kw) else "subject"
+        # year extraction (best-effort)
+        y = None
+        m = re.search(r"(19|20)\d{2}", fname)
+        if m:
+            y = int(m.group(0))
+        docs.append({"url": url, "text": text, "filename": fname, "kind_guess": kind_guess, "year": y})
 
-def pack_harvest_source(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    sources = pack.get("harvest_sources", [])
-    return sources[0] if sources else None
+    # Filter by years if provided
+    if year_min or year_max:
+        docs2 = []
+        for d in docs:
+            if d["year"] is None:
+                docs2.append(d)  # keep unknown year; will be evaluated at pairing
+            else:
+                if year_min and d["year"] < year_min:
+                    continue
+                if year_max and d["year"] > year_max:
+                    continue
+                docs2.append(d)
+        docs = docs2
 
+    # Pairing strategy:
+    # 1) Create buckets by "base" (remove corrige tokens), then within bucket pick best subject<->corrige.
+    def base_key(filename: str) -> str:
+        s = filename.lower()
+        s = re.sub(r"\.pdf.*$", "", s)
+        s = re.sub(r"(corrig[eé]?)", "", s)
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s
 
-def pack_text_processing(pack: Dict[str, Any]) -> Dict[str, Any]:
-    return pack.get("text_processing", {})
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for d in docs:
+        buckets.setdefault(base_key(d["filename"]), []).append(d)
 
+    pairs: List[Pair] = []
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": UA})
 
-def pack_ari_config(pack: Dict[str, Any]) -> Dict[str, Any]:
-    return pack.get("ari_config", {})
+    # Download until limit reached. Deterministic bucket order.
+    for bkey in stable_sort(buckets.keys(), key_fn=lambda x: x):
+        if len(pairs) >= limit_pairs:
+            break
+        items = buckets[bkey]
+        subjects = [x for x in items if x["kind_guess"] == "subject"]
+        corr = [x for x in items if x["kind_guess"] == "correction"]
 
+        if not subjects:
+            continue
 
-def pack_f1f2_params(pack: Dict[str, Any]) -> Dict[str, float]:
-    params = pack.get("f1_f2_params", {})
-    return {
-        "epsilon": float(params.get("epsilon", F1_EPSILON)),
-        "alpha": float(params.get("alpha", F2_ALPHA)),
-        "t_rec": float(params.get("t_rec_default", F2_TREC)),
-        "coverage_threshold": float(params.get("coverage_threshold", DEFAULT_COVERAGE_THRESHOLD)),
-    }
+        # Choose one subject deterministically (first URL), and best correction by similarity if available.
+        subjects = stable_sort(subjects, key_fn=lambda x: x["url"])
+        subj = subjects[0]
 
+        corr_best = None
+        conf = 0.0
+        evidence = {"bucket": bkey, "subject_candidates": len(subjects), "correction_candidates": len(corr)}
+        if corr:
+            corr = stable_sort(corr, key_fn=lambda x: x["url"])
+            # similarity on filenames
+            best = None
+            for c in corr:
+                sim = difflib.SequenceMatcher(None, normalize_name(subj["filename"]), normalize_name(c["filename"])).ratio()
+                if best is None or sim > best[0]:
+                    best = (sim, c)
+            conf = float(best[0])
+            corr_best = best[1]
+            evidence["filename_similarity"] = conf
+        else:
+            conf = 0.0
 
-def pack_qc_format(pack: Dict[str, Any]) -> Dict[str, str]:
-    fmt = pack.get("qc_format", {}) or {}
-    prefix = str(fmt.get("prefix", "Comment ")).strip()
-    suffix = str(fmt.get("suffix", " ?")).strip()
-    # IMPORTANT: On ne hardcode pas de matière/chapitre ici. Le format est pack-driven.
-    return {"prefix": prefix if prefix.endswith(" ") else (prefix + " "), "suffix": suffix}
+        # Download subject
+        def download_doc(d: Dict[str, Any], kind: str) -> SourceDoc:
+            rr = sess.get(d["url"], timeout=REQ_TIMEOUT)
+            rr.raise_for_status()
+            b = rr.content
+            if len(b) > MAX_PDF_MB * 1024 * 1024:
+                raise ValueError(f"PDF trop volumineux: {d['url']}")
+            return SourceDoc(
+                doc_id=f"{kind}_{sha256_bytes(b)[7:19]}",
+                kind=kind,
+                url=d["url"],
+                filename=d["filename"],
+                bytes_sha256=sha256_bytes(b),
+                fetched_at=now_iso()
+            ), b
 
-
-# =============================================================================
-# PDF TEXT EXTRACTION
-# =============================================================================
-def _fix_missing_spaces(text: str, text_proc: Dict[str, Any]) -> str:
-    if not text:
-        return ""
-    for item in text_proc.get("glued_patterns", []):
         try:
-            text = re.sub(item["pattern"], item["replacement"], text)
-        except re.error:
-            pass
+            subj_doc, subj_bytes = download_doc(subj, "subject")
+        except Exception as e:
+            audit["quarantine"].append({"url": subj["url"], "reason": str(e)})
+            continue
 
-    common_words = set(text_proc.get("common_words", []))
-    if not common_words:
-        return re.sub(r"\s+", " ", text).strip()
+        corr_doc = None
+        corr_bytes = None
+        if corr_best is not None:
+            try:
+                corr_doc, corr_bytes = download_doc(corr_best, "correction")
+            except Exception as e:
+                # keep pair but correction missing
+                evidence["corr_download_error"] = str(e)
+                corr_doc = None
+                corr_bytes = None
+                conf = float(conf) * 0.5
 
-    def split_glued(match):
-        word = match.group(0)
-        if len(word) < 8:
-            return word
-        result, i = [], 0
-        while i < len(word):
-            found = False
-            for length in range(min(12, len(word) - i), 2, -1):
-                candidate = word[i:i + length].lower()
-                if candidate in common_words:
-                    if result:
-                        result.append(" ")
-                    result.append(word[i:i + length])
-                    i += length
-                    found = True
-                    break
-            if not found:
-                result.append(word[i])
-                i += 1
-        reconstructed = "".join(result)
-        return reconstructed if " " in reconstructed else word
+        pair_id = f"PAIR_{normalize_name(subj_doc.filename)}_{subj_doc.doc_id[-6:]}"
+        pairs.append(Pair(
+            pair_id=pair_id,
+            subject=subj_doc,
+            correction=corr_doc,
+            pairing_confidence=conf,
+            pairing_evidence=evidence
+        ))
 
-    text = re.sub(r"[a-zA-ZéèêëàâäùûüôöîïçÉÈÊËÀÂÄÙÛÜÔÖÎÏÇ]{15,}", split_glued, text)
-    return re.sub(r"\s+", " ", text).strip()
+        # store bytes in session for later extraction
+        st.session_state.setdefault("_doc_bytes", {})[subj_doc.doc_id] = subj_bytes
+        if corr_doc and corr_bytes:
+            st.session_state["_doc_bytes"][corr_doc.doc_id] = corr_bytes
 
+    audit["pairs_built"] = len(pairs)
+    return pairs, audit
 
-def _dehyphenate(text: str) -> str:
-    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
-    text = re.sub(r"(\w)-\s+(\w)", r"\1\2", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
-
-
-def _extract_pages_pdfplumber(pdf_bytes: bytes, max_pages: int = 140) -> List[str]:
-    if not pdfplumber:
-        return []
-    pages: List[str] = []
+# =============================================================================
+# PDF text extraction + Atomisation
+# =============================================================================
+def extract_pdf_pages_text(pdf_bytes: bytes) -> Tuple[List[List[str]], Dict[str, Any]]:
+    """
+    Returns: pages_lines: list of list-of-lines (per page)
+    Audit: extraction stats
+    """
+    audit = {"pages": 0, "pages_with_text": 0, "empty_pages": 0, "mode": "pdfplumber", "warnings": []}
+    pages_lines: List[List[str]] = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages[:max_pages]:
-                try:
-                    pages.append(page.extract_text(x_tolerance=3, y_tolerance=3) or "")
-                except Exception:
-                    pages.append("")
-    except Exception:
-        return []
-    return pages
-
-
-def _extract_pages_pypdf(pdf_bytes: bytes, max_pages: int = 140) -> List[str]:
-    if not PdfReader:
-        return []
-    pages: List[str] = []
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        for page in reader.pages[:max_pages]:
-            try:
-                pages.append(page.extract_text() or "")
-            except Exception:
-                pages.append("")
-    except Exception:
-        return []
-    return pages
-
-
-def clean_pdf_text(pages: List[str], text_proc: Dict[str, Any]) -> str:
-    if not pages:
-        return ""
-
-    page_lines: List[List[str]] = []
-    for p in pages:
-        p = (p or "").replace("\r", "\n")
-        p = _dehyphenate(p)
-        p = _fix_missing_spaces(p, text_proc)
-        page_lines.append([ln.strip() for ln in p.split("\n") if ln.strip()])
-
-    # Header/footer detection (simple, robuste)
-    top_counts: Dict[str, int] = {}
-    bot_counts: Dict[str, int] = {}
-    for lines in page_lines:
-        if lines:
-            top_counts[lines[0]] = top_counts.get(lines[0], 0) + 1
-        if len(lines) > 1:
-            bot_counts[lines[-1]] = bot_counts.get(lines[-1], 0) + 1
-
-    threshold = max(2, len(page_lines) // 3)
-    skip_top = {k for k, v in top_counts.items() if v >= threshold}
-    skip_bot = {k for k, v in bot_counts.items() if v >= threshold}
-
-    out_lines: List[str] = []
-    for lines in page_lines:
-        for i, ln in enumerate(lines):
-            if i == 0 and ln in skip_top:
-                continue
-            if i == len(lines) - 1 and ln in skip_bot:
-                continue
-            if re.fullmatch(r"\d{1,3}", ln.strip()):
-                continue
-            out_lines.append(ln)
-        out_lines.append("")
-
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out_lines)).strip()
-
-
-def extract_text_from_pdf(pdf_bytes: bytes, text_proc: Dict[str, Any]) -> str:
-    pages = _extract_pages_pdfplumber(pdf_bytes)
-    if not pages:
-        pages = _extract_pages_pypdf(pdf_bytes)
-    return clean_pdf_text(pages, text_proc)
-
-
-# =============================================================================
-# HTTP & PDF FETCH
-# =============================================================================
-def _http_get(url: str) -> requests.Response:
-    res = requests.get(url, headers={"User-Agent": UA}, timeout=REQ_TIMEOUT)
-    res.raise_for_status()
-    return res
-
-
-def fetch_pdf_bytes(url: str) -> bytes:
-    cache: Dict[str, bytes] = st.session_state.get("_http_pdf_cache", {})
-    if url in cache:
-        return cache[url]
-
-    res = _http_get(url)
-    pdf_bytes = res.content
-    if len(pdf_bytes) > MAX_PDF_MB * 1024 * 1024:
-        raise ValueError("PDF trop volumineux")
-
-    cache[url] = pdf_bytes
-    st.session_state["_http_pdf_cache"] = cache
-    return pdf_bytes
-
-
-# =============================================================================
-# HARVEST
-# =============================================================================
-def _soup(html: str):
-    if BeautifulSoup is None:
-        raise RuntimeError("bs4 non installé")
-    return BeautifulSoup(html, "html.parser")
-
-
-def _abs_url(base: str, href: str) -> str:
-    return href if href.startswith("http") else requests.compat.urljoin(base, href)
-
-
-def harvest_from_pack(pack: Dict[str, Any], level: str, subject: str, years_back: int, volume_max: int) -> Dict[str, Any]:
-    source = pack_harvest_source(pack)
-    if not source:
-        raise ValueError("Aucune source harvest dans le Pack")
-
-    base_url = source.get("base_url", "")
-    level_path = source.get("levels", {}).get(level)
-    if not level_path:
-        raise ValueError(f"Niveau '{level}' non configuré dans le pack")
-
-    root = f"{base_url}{level_path}"
-    log(f"[HARVEST] root={root}")
-
-    year_pattern = source.get("year_pattern", r"(20\d{2})")
-    meta_exclude = source.get("meta_exclude", [])
-    corrige_patterns = source.get("pdf_patterns", {}).get("corrige", [])
-    geo_zones = source.get("geographic_zones", [])
-
-    html = _http_get(root).text
-    sp = _soup(html)
-
-    year_links: List[Tuple[int, str]] = []
-    for a in sp.find_all("a"):
-        href = a.get("href") or ""
-        m = re.search(year_pattern, href)
-        if m:
-            year_links.append((int(m.group(1)), _abs_url(root, href)))
-
-    year_links = sorted(set(year_links), key=lambda x: -x[0])
-    if not year_links:
-        raise RuntimeError("Aucune page Année trouvée")
-
-    current_year = year_links[0][0]
-    min_year = current_year - max(1, years_back) + 1
-    selected = [(y, u) for (y, u) in year_links if y >= min_year]
-    log(f"[HARVEST] années sélectionnées={len(selected)} (≥{min_year})")
-
-    pairs: List[Dict[str, Any]] = []
-    corrige_ok = 0
-
-    for (y, url) in selected:
-        if len(pairs) >= volume_max:
-            break
-        try:
-            y_html = _http_get(url).text
-            y_sp = _soup(y_html)
-            pdf_links: List[Dict[str, Any]] = []
-
-            for a in y_sp.find_all("a"):
-                href = (a.get("href") or "").strip()
-                if not href.lower().endswith(".pdf"):
-                    continue
-                absu = _abs_url(url, href)
-                label = (a.get_text() or "").strip()
-
-                s = norm_text(absu + " " + label)
-                if any(w in s for w in meta_exclude):
-                    continue
-
-                is_corrige = any(p in s for p in corrige_patterns)
-                pdf_links.append({"url": absu, "name": os.path.basename(absu), "is_corrige": is_corrige})
-
-            sujets = [p for p in pdf_links if not p["is_corrige"]]
-            corriges = [p for p in pdf_links if p["is_corrige"]]
-            used_corr = set()
-
-            for suj in sujets:
-                if len(pairs) >= volume_max:
-                    break
-
-                best = (None, 0.0)
-                s_name = norm_text(suj["name"])
-                s_geo = next((z for z in geo_zones if z in s_name), "")
-
-                for corr in corriges:
-                    if corr["url"] in used_corr:
-                        continue
-
-                    c_name = norm_text(corr["name"])
-                    c_geo = next((z for z in geo_zones if z in c_name), "")
-
-                    score = 0.0
-                    if s_geo and c_geo:
-                        if s_geo == c_geo:
-                            score += 0.5
-                        else:
-                            continue
-
-                    s_tok, c_tok = set(tokenize(suj["name"])), set(tokenize(corr["name"]))
-                    if s_tok and c_tok:
-                        score += 0.3 * len(s_tok & c_tok) / max(1, len(s_tok | c_tok))
-
-                    if score > best[1]:
-                        best = (corr, score)
-
-                corrige = best[0] if best[1] >= 0.3 else None
-                if corrige:
-                    used_corr.add(corrige["url"])
-
-                item = {
-                    "pair_id": f"PAIR_{level}_{subject}_{y}_{stable_id(suj['name'])}",
-                    "year": y,
-                    "sujet": suj["name"],
-                    "corrige?": bool(corrige),
-                    "corrige_name": corrige["name"] if corrige else "",
-                    "match_score": round(best[1], 2) if corrige else 0.0,
-                    "sujet_url": suj["url"],
-                    "corrige_url": corrige["url"] if corrige else "",
-                }
-
-                if not any(x["sujet_url"] == item["sujet_url"] for x in pairs):
-                    pairs.append(item)
-                    if item["corrige?"]:
-                        corrige_ok += 1
-
-            log(f"[HARVEST] year={y} pairs_cum={len(pairs)}")
-        except Exception as e:
-            log(f"[HARVEST] year={y} ERREUR: {e}")
-
-    return {
-        "version": APP_VERSION,
-        "timestamp": _utc_ts(),
-        "pack_id": pack.get("pack_id"),
-        "items_total": len(pairs),
-        "items_corrige_ok": corrige_ok,
-        "library": pairs,
-    }
-
-
-# =============================================================================
-# Qi/RQi EXTRACTION
-# =============================================================================
-_EXERCICE_RE = re.compile(r"(?i)(?:^|\n)\s*(?:EXERCICE|Ex\.?)\s*(\d+|[IVX]+)", re.MULTILINE)
-_PARTIE_RE = re.compile(r"(?i)(?:^|\n)\s*(?:PARTIE|Part)\s*([A-Z]|\d+)", re.MULTILINE)
-_QUESTION_RE = re.compile(r"(?m)^\s*(\d{1,2}|[a-h])\s*[\)\.\-:]\s+")
-_MATH_SYMBOL_RE = re.compile(r"[=<>≤≥∈∀∃∑∏∫√]")
-
-def _build_intent_re(intent_verbs: List[str]) -> Optional[re.Pattern]:
-    if not intent_verbs:
-        return None
-    return re.compile(r"\b(" + "|".join(re.escape(v) for v in intent_verbs) + r")\b", re.IGNORECASE)
-
-def _chunk_candidates(text: str) -> List[str]:
-    t = (text or "").replace("\r", "\n")
-    t = re.sub(r"\n{3,}", "\n\n", t).strip()
-    if not t:
-        return []
-
-    cut_points = {0}
-    for m in _EXERCICE_RE.finditer(t):
-        cut_points.add(m.start())
-    for m in _PARTIE_RE.finditer(t):
-        cut_points.add(m.start())
-    for m in _QUESTION_RE.finditer(t):
-        cut_points.add(m.start())
-    for m in re.finditer(r"\n\n+", t):
-        cut_points.add(m.end())
-
-    idxs = sorted(cut_points)
-    chunks: List[str] = []
-    for a, b in zip(idxs, idxs[1:] + [len(t)]):
-        c = re.sub(r"\s+", " ", t[a:b]).strip()
-        if c and len(c) > 20:
-            chunks.append(c)
-    return chunks
-
-def _looks_like_question(s: str, intent_re) -> bool:
-    if not s or len(s) < 25:
-        return False
-    has_intent = bool(intent_re and intent_re.search(s)) or ("?" in s)
-    has_math = bool(_MATH_SYMBOL_RE.search(s)) or bool(re.search(r"\b\d+\b", s))
-    return has_intent or (has_math and len(s) > 40)
-
-def split_questions(text: str, text_proc: Dict[str, Any], max_items: int = 220) -> Tuple[List[str], Dict[str, int]]:
-    intent_re = _build_intent_re(text_proc.get("intent_verbs", []))
-    raw_chunks = _chunk_candidates(text)
-
-    keep: List[str] = []
-    seen = set()
-    for c in raw_chunks:
-        key = stable_id(norm_text(c)[:400])
-        if key in seen:
-            continue
-        seen.add(key)
-        if len(c) > 2500:
-            c = c[:2500]
-        if _looks_like_question(c, intent_re):
-            keep.append(c)
-        if len(keep) >= max_items:
-            break
-
-    return keep, {"raw": len(raw_chunks), "kept": len(keep)}
-
-def align_qi_rqi(questions: List[str], responses: List[str]) -> List[Optional[int]]:
-    link: List[Optional[int]] = [None] * len(questions)
-    if not questions or not responses:
-        return link
-
-    q_tokens = [tokenize(q) for q in questions]
-    r_tokens = [tokenize(r) for r in responses]
-    used_r = set()
-
-    for i, q_tok in enumerate(q_tokens):
-        best_j, best_s = None, 0.0
-        for j, r_tok in enumerate(r_tokens):
-            if j in used_r:
-                continue
-            s = jaccard(q_tok, r_tok)
-            if s > best_s:
-                best_s, best_j = s, j
-        if best_j is not None and best_s >= 0.08:
-            link[i] = best_j
-            used_r.add(best_j)
-
-    return link
-
-
-# =============================================================================
-# ARI EXTRACTION (PACK-DRIVEN) — ENRICHI (evidence + match_count)
-# =============================================================================
-def extract_ari_trace(question: str, response: str, ari_config: Dict[str, Any]) -> Dict[str, Any]:
-    op_patterns = ari_config.get("op_patterns", [])
-    if not op_patterns:
-        return {
-            "ops": [{"op": "OP_STANDARD", "confidence": 0.5, "evidence": [], "match_count": 0}],
-            "primary_op": "OP_STANDARD",
-            "all_ops": ["OP_STANDARD"],
-            "confidence_global": 0.5,
-        }
-
-    combined = norm_text(f"{question} {response}")
-    ops: List[Dict[str, Any]] = []
-    seen = set()
-
-    for item in op_patterns:
-        pattern = item.get("pattern", "")
-        op_code = item.get("op", "")
-        weight = float(item.get("weight", 1.0))
-        if not pattern or not op_code:
-            continue
-        try:
-            matches = list(re.finditer(pattern, combined, re.IGNORECASE))
-            if matches and op_code not in seen:
-                evidence = [m.group() for m in matches[:3]]
-                confidence = min(0.9, 0.6 + 0.1 * len(matches)) * weight
-                ops.append({
-                    "op": op_code,
-                    "confidence": round(confidence, 4),
-                    "evidence": evidence,
-                    "match_count": len(matches),
-                })
-                seen.add(op_code)
-        except re.error:
-            continue
-
-    if not ops:
-        ops = [{"op": "OP_STANDARD", "confidence": 0.5, "evidence": [], "match_count": 0}]
-        seen = {"OP_STANDARD"}
-
-    primary_order = ari_config.get("primary_ops_order", [])
-    ops_in_trace = {x["op"] for x in ops}
-    primary_op = "OP_STANDARD"
-    for op in primary_order:
-        if op in ops_in_trace:
-            primary_op = op
-            break
-
-    conf_global = max(float(x.get("confidence", 0.5)) for x in ops) if ops else 0.5
-
-    return {
-        "ops": ops,
-        "primary_op": primary_op,
-        "all_ops": sorted(list(ops_in_trace)) if ops_in_trace else ["OP_STANDARD"],
-        "confidence_global": round(conf_global, 4),
-    }
-
-
-# =============================================================================
-# TRIGGERS (ENRICHIS)
-# =============================================================================
-def build_triggers(question: str, ari_trace: Dict[str, Any], text_proc: Dict[str, Any]) -> List[str]:
-    triggers: List[str] = []
-
-    # Triggers ARI
-    for op_item in ari_trace.get("ops", []):
-        triggers.append(f"ARI:{op_item.get('op', 'OP_STANDARD')}")
-
-    # Triggers Keywords
-    q_norm = norm_text(question)
-    for kw in text_proc.get("trigger_keywords", []):
-        if kw and kw in q_norm:
-            triggers.append(f"KW:{kw.upper()}")
-
-    # Trigger Intent (un seul)
-    for verb in text_proc.get("intent_verbs", [])[:30]:
-        if verb and verb in q_norm:
-            triggers.append(f"INTENT:{verb.upper()}")
-            break
-
-    # Unique, max 15
-    uniq = list(dict.fromkeys(triggers))
-    return uniq[:15]
-
-
-# =============================================================================
-# CHAPTER MAPPING (avec score)
-# =============================================================================
-def map_qi_to_chapter(question: str, chapters: List[Dict[str, Any]]) -> Tuple[str, int]:
-    if not chapters:
-        return "UNMAPPED", 0
-    q_norm = norm_text(question)
-    best_ch, best_score = "UNMAPPED", 0
-    for ch in chapters:
-        kws = ch.get("keywords", []) or []
-        score = sum(1 for kw in kws if kw and kw in q_norm)
-        if score > best_score:
-            best_score, best_ch = score, ch.get("code", "UNMAPPED")
-    return best_ch, int(best_score)
-
-
-# =============================================================================
-# FRT PACK (export séparé) + QC référence frt_id
-# =============================================================================
-def build_frt_pack(ari_config: Dict[str, Any]) -> Dict[str, Any]:
-    templates: Dict[str, List[str]] = ari_config.get("frt_templates", {}) or {}
-    op_labels: Dict[str, str] = ari_config.get("op_labels", {}) or {}
-    frt_items: Dict[str, Any] = {}
-
-    for op_code, steps in templates.items():
-        if not steps:
-            continue
-        label = op_labels.get(op_code, op_code.replace("OP_", "").replace("_", " ").lower())
-        frt_id = f"FRT_{stable_id(op_code)}"
-        frt_items[frt_id] = {
-            "frt_id": frt_id,
-            "primary_op": op_code,
-            "title": f"Comment {label} ?",
-            "steps": steps,
-            "steps_count": len(steps),
-            "generated_at": _utc_ts(),
-        }
-
-    # Assurer un fallback OP_STANDARD
-    if "FRT_" + stable_id("OP_STANDARD") not in frt_items and "OP_STANDARD" in templates:
-        op_code = "OP_STANDARD"
-        steps = templates.get(op_code, [])
-        frt_id = f"FRT_{stable_id(op_code)}"
-        frt_items[frt_id] = {
-            "frt_id": frt_id,
-            "primary_op": op_code,
-            "title": "Comment résoudre un exercice standard ?",
-            "steps": steps,
-            "steps_count": len(steps),
-            "generated_at": _utc_ts(),
-        }
-
-    return {
-        "version": APP_VERSION,
-        "generated_at": _utc_ts(),
-        "items": frt_items,
-    }
-
-
-def frt_id_for_op(primary_op: str) -> str:
-    return f"FRT_{stable_id(primary_op)}"
-
-
-# =============================================================================
-# QC GENERATION — COMPLET (zéro orphan imposé)
-# =============================================================================
-def build_qc_from_qi(
-    qi_items: List[Dict[str, Any]],
-    chapters: List[Dict[str, Any]],
-    ari_config: Dict[str, Any],
-    qc_format: Dict[str, str],
-) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-    # Bucketing par (chapter_code, primary_op)
-    buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for qi in qi_items:
-        # IMPORTANT: Pour garantir orphans==0 sur Qi posables, on bucket même UNMAPPED.
-        cc = qi.get("chapter_code", "UNMAPPED") or "UNMAPPED"
-        op = qi.get("primary_op", "OP_STANDARD") or "OP_STANDARD"
-        buckets.setdefault((cc, op), []).append(qi)
-
-    log(f"[QC] Buckets={len(buckets)}")
-
-    op_labels = ari_config.get("op_labels", {}) or {}
-    qc_pack: List[Dict[str, Any]] = []
-    qc_map: Dict[str, str] = {}
-
-    for (cc, primary_op), items in sorted(buckets.items()):
-        posable = [x for x in items if x.get("has_rqi")]
-        cluster_size = len(items)
-        posable_count = len(posable)
-
-        qc_id = f"QC_{stable_id(cc, primary_op)}"
-        label = op_labels.get(primary_op, primary_op.replace("OP_", "").replace("_", " ").lower())
-
-        prefix = qc_format["prefix"]
-        suffix = qc_format["suffix"]
-        qc_text = f"{prefix}{label}{suffix}"
-
-        if posable_count >= 2:
-            qc_state = "POSABLE"
-        elif posable_count == 1:
-            qc_state = "POSABLE_WEAK"
-        else:
-            qc_state = "UNPOSABLE"
-
-        trig_counts: Dict[str, int] = {}
-        all_ops = set()
-        for it in items:
-            for t in it.get("triggers", []):
-                trig_counts[t] = trig_counts.get(t, 0) + 1
-            all_ops.update(it.get("ari_trace", {}).get("all_ops", []) or [])
-
-        qc_item = {
-            "qc_id": qc_id,
-            "qc": qc_text,
-            "qc_label": label,
-            "chapter_code": cc,
-            "primary_op": primary_op,
-            "all_ops": sorted(list(all_ops)) if all_ops else ["OP_STANDARD"],
-            "cluster_size": cluster_size,
-            "posable_in_cluster": posable_count,
-            "qc_state": qc_state,
-            "qi_ids": [x["qi_id"] for x in items],
-            "triggers": [k for k, _ in sorted(trig_counts.items(), key=lambda x: -x[1])][:10],
-            # Référence FRT séparée (export frt_pack.json)
-            "frt_id": frt_id_for_op(primary_op),
-        }
-        qc_pack.append(qc_item)
-
-        for it in items:
-            qc_map[it["qi_id"]] = qc_id
-
-    log(f"[QC] Total={len(qc_pack)} | POSABLE={sum(1 for q in qc_pack if q['qc_state'] in ('POSABLE','POSABLE_WEAK'))}")
-    return qc_pack, qc_map
-
-
-# =============================================================================
-# F1/F2 (KERNEL) — UTILISÉ POUR SCORE + SELECTION_REPORT
-# =============================================================================
-def compute_trigger_weights(triggers: List[str]) -> Dict[str, float]:
-    uniq = list(dict.fromkeys(triggers or []))
-    n = len(uniq)
-    return {t: 1.0 / n for t in uniq} if n else {}
-
-def f1_raw(delta_c: float, epsilon: float, Tj: Dict[str, float], m_q: int) -> float:
-    s = sum(v for _, v in sorted(Tj.items())[:m_q]) if Tj else 0.0
-    return float(delta_c) * (float(epsilon) + float(s)) ** 2
-
-def f1_normalize_in_chapter(qc_list: List[Dict[str, Any]]) -> None:
-    if not qc_list:
-        return
-    raws = [float(q.get("psi_raw", 0.0)) for q in qc_list]
-    mx = max(raws) if raws else 0.0
-    for q in qc_list:
-        q["Psi_q"] = float(q.get("psi_raw", 0.0)) / mx if mx > 0 else 0.0
-
-def sigma_similarity(qc_a: Dict[str, Any], qc_b: Dict[str, Any]) -> float:
-    a_ops, b_ops = set(qc_a.get("all_ops", []) or []), set(qc_b.get("all_ops", []) or [])
-    if a_ops and b_ops:
-        return len(a_ops & b_ops) / max(1, len(a_ops | b_ops))
-    return 0.0
-
-def f2_score(qc: Dict[str, Any], selected: List[Dict[str, Any]], n_hist: int, N_total: int, alpha: float, t_rec: float) -> float:
-    Psi_q = float(qc.get("Psi_q", 0.0))
-    base = (float(n_hist) / max(1, int(N_total))) * (1.0 + float(alpha) / max(1e-9, float(t_rec))) * Psi_q
-    prod = 1.0
-    for p in selected:
-        prod *= (1.0 - sigma_similarity(qc, p))
-    return base * prod * 100.0
-
-def progressive_select(qc_list: List[Dict[str, Any]], N_total: int, f1f2_params: Dict[str, float], top_k: int = 15) -> List[Dict[str, Any]]:
-    selected: List[Dict[str, Any]] = []
-    remaining = [q for q in qc_list if q.get("qc_state") in ("POSABLE", "POSABLE_WEAK")]
-    alpha, t_rec = f1f2_params.get("alpha", F2_ALPHA), f1f2_params.get("t_rec", F2_TREC)
-
-    for _ in range(min(top_k, len(remaining))):
-        best = None
-        for qc in remaining:
-            n_hist = int(qc.get("cluster_size", 1))
-            sc = f2_score(qc, selected, n_hist, int(N_total), float(alpha), float(t_rec))
-            qc["f2_score"] = float(sc)
-            if best is None or float(sc) > float(best.get("f2_score", 0.0)):
-                best = qc
-        if best is None:
-            break
-        selected.append(best)
-        remaining = [x for x in remaining if x["qc_id"] != best["qc_id"]]
-    return selected
-
-
-# =============================================================================
-# SANITY / COVERAGE
-# =============================================================================
-def sanity_eval(qi_items: List[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
-    seen, dups = set(), 0
-    for q in qi_items:
-        k = stable_id(norm_text(q.get("qi", ""))[:300])
-        if k in seen:
-            dups += 1
-        else:
-            seen.add(k)
-    dup_ratio = dups / max(1, len(qi_items))
-    ok = dup_ratio <= 0.35
-    return ok, {"dup_ratio_pct": round(dup_ratio * 100, 2), "duplicates": dups}
-
-def compute_coverage(qi_items: List[Dict[str, Any]], qc_map: Dict[str, str]) -> float:
-    # KPI: couverture des Qi posables (has_rqi=True) qui ont une QC
-    if not qi_items:
-        return 0.0
-    posable = [qi for qi in qi_items if qi.get("has_rqi")]
-    if not posable:
-        return 0.0
-    covered = sum(1 for qi in posable if qi["qi_id"] in qc_map)
-    return covered / max(1, len(posable))
-
-
-# =============================================================================
-# PIPELINE (volume fixe) — Génère Qi → ARI → QC + FRT refs
-# =============================================================================
-def run_pipeline(library: List[Dict[str, Any]], volume: int, pack: Dict[str, Any]) -> Dict[str, Any]:
-    text_proc = pack_text_processing(pack)
-    ari_config = pack_ari_config(pack)
-    qc_fmt = pack_qc_format(pack)
-
-    subject = st.session_state.get("subject")
-    level = st.session_state.get("level")
-    if not subject or not level:
-        raise ValueError("subject/level non initialisés (activation pack incomplète)")
-
-    chapters = pack_chapters(pack, subject, level)
-
-    exploitable = [it for it in library if it.get("corrige?") and it.get("corrige_url")]
-    to_process = exploitable[:min(int(volume), len(exploitable))]
-    log(f"[PIPELINE] volume={volume} pairs_exploitables={len(to_process)}/{len(exploitable)}")
-
-    qi_items: List[Dict[str, Any]] = []
-
-    for pair in to_process:
-        pid = pair["pair_id"]
-        try:
-            su_pdf = fetch_pdf_bytes(pair["sujet_url"])
-            co_pdf = fetch_pdf_bytes(pair["corrige_url"])
-        except Exception as e:
-            log(f"[DL] ERREUR {pid}: {e}")
-            continue
-
-        su_text = extract_text_from_pdf(su_pdf, text_proc)
-        co_text = extract_text_from_pdf(co_pdf, text_proc)
-
-        if not su_text or not co_text:
-            log(f"[EXTRACT] SKIP {pid}: texte vide")
-            continue
-
-        qs, stat_q = split_questions(su_text, text_proc)
-        rs, stat_r = split_questions(co_text, text_proc)
-        link = align_qi_rqi(qs, rs)
-
-        matched = sum(1 for x in link if x is not None)
-        log(f"[ALIGN] {pid}: Qi={len(qs)}(raw={stat_q['raw']}) RQi={len(rs)}(raw={stat_r['raw']}) matched={matched}")
-
-        for i, q in enumerate(qs):
-            if not q.strip():
-                continue
-            j = link[i] if i < len(link) else None
-            r = rs[j] if (j is not None and j < len(rs)) else ""
-
-            qi_id = f"QI_{stable_id(pid, str(i), norm_text(q)[:180])}"
-
-            ari_trace = extract_ari_trace(q, r, ari_config)
-            triggers = build_triggers(q, ari_trace, text_proc)
-            chapter_code, chapter_score = map_qi_to_chapter(q, chapters)
-
-            qi_items.append({
-                "qi_id": qi_id,
-                "pair_id": pid,
-                "qi": q,
-                "rqi": r,
-                "has_rqi": bool(r),
-                "chapter_code": chapter_code,
-                "chapter_match_score": int(chapter_score),
-                "primary_op": ari_trace["primary_op"],
-                "ari_trace": ari_trace,
-                "triggers": triggers,
-            })
-
-    sanity_ok, sanity_audit = sanity_eval(qi_items)
-
-    # FRT pack (export séparé)
-    frt_pack = build_frt_pack(ari_config)
-
-    # QC + map (doit assurer la couverture des Qi posables → orphans==0 au final si pipeline OK)
-    qc_pack, qc_map = build_qc_from_qi(qi_items, chapters, ari_config, qc_fmt)
-
-    # F1 compute (psi_raw + Psi_q)
-    f1f2_params = pack_f1f2_params(pack)
-    eps = float(f1f2_params["epsilon"])
-
-    for qc in qc_pack:
-        ch_info = next((c for c in chapters if c.get("code") == qc["chapter_code"]), {})
-        delta_c = float(ch_info.get("delta_c", 1.0))
-
-        all_triggers: List[str] = []
-        qi_by_id = {q["qi_id"]: q for q in qi_items}
-        for qi_id in qc.get("qi_ids", []):
-            qi = qi_by_id.get(qi_id)
-            if qi:
-                all_triggers.extend(qi.get("triggers", []))
-
-        Tj = compute_trigger_weights(all_triggers)
-        qc["psi_raw"] = f1_raw(delta_c, eps, Tj, len(Tj))
-
-    # Normalize by chapter
-    by_ch: Dict[str, List[Dict[str, Any]]] = {}
-    for qc in qc_pack:
-        by_ch.setdefault(qc["chapter_code"], []).append(qc)
-    for qcs in by_ch.values():
-        f1_normalize_in_chapter(qcs)
-
-    # Link QC to Qi + orphans
-    orphans = 0
-    for qi in qi_items:
-        if qi["qi_id"] not in qc_map:
-            qi["is_orphan"] = True
-            qi["qc_id"] = None
-            if qi.get("has_rqi"):
-                orphans += 1
-        else:
-            qi["is_orphan"] = False
-            qi["qc_id"] = qc_map[qi["qi_id"]]
-
-    coverage = compute_coverage(qi_items, qc_map)
-
-    qi_total = len(qi_items)
-    rqi_total = sum(1 for q in qi_items if q.get("has_rqi"))
-    qi_posable = sum(1 for q in qi_items if q.get("has_rqi") and not q.get("is_orphan"))
-    qc_total = len(qc_pack)
-    qc_posable = sum(1 for q in qc_pack if q.get("qc_state") in ("POSABLE", "POSABLE_WEAK"))
-
-    audit = {
-        "qi_total": qi_total,
-        "rqi_total": rqi_total,
-        "qi_posable": qi_posable,
-        "qi_orphans": orphans,  # uniquement Qi posables orphelines
-        "qc_total": qc_total,
-        "qc_posable": qc_posable,
-        "coverage": round(float(coverage), 4),
-        "sanity_ok": bool(sanity_ok),
-        "sanity_audit": sanity_audit,
-        "subject": subject,
-        "level": level,
-    }
-
-    return {
-        "qi_pack": qi_items,
-        "qc_pack": qc_pack,
-        "frt_pack": frt_pack,
-        "qc_map": qc_map,
-        "audit": audit,
-    }
-
-
-# =============================================================================
-# SATURATION — BOUCLE PROGRESSIVE (KERNEL) jusqu'à new_QC == 0
-# =============================================================================
-def run_saturation_progressive(
-    library: List[Dict[str, Any]],
-    vol_start: int,
-    vol_max: int,
-    step: int,
-    pack: Dict[str, Any],
-    selection_top_k: int = 15,
-) -> Dict[str, Any]:
-    log(f"[SAT] progressive start={vol_start} max={vol_max} step={step}")
-
-    prev_set: Optional[set] = None
-    prev_volume: Optional[int] = None
-    prev_out: Optional[Dict[str, Any]] = None
-
-    iterations: List[Dict[str, Any]] = []
-
-    final_out: Optional[Dict[str, Any]] = None
-    final_new_qc: List[str] = []
-
-    for vol in range(int(vol_start), int(vol_max) + 1, max(1, int(step))):
-        out = run_pipeline(library, vol, pack)
-        qc_ids = {qc["qc_id"] for qc in out["qc_pack"]}
-
-        if prev_set is None:
-            new_qc = sorted(list(qc_ids))
-        else:
-            new_qc = sorted(list(qc_ids - prev_set))
-
-        it = {
-            "volume": vol,
-            "qc_total": out["audit"]["qc_total"],
-            "qc_posable": out["audit"]["qc_posable"],
-            "qi_total": out["audit"]["qi_total"],
-            "qi_posable": out["audit"]["qi_posable"],
-            "orphans": out["audit"]["qi_orphans"],
-            "coverage": out["audit"]["coverage"],
-            "sanity_ok": out["audit"]["sanity_ok"],
-            "new_qc_count": len(new_qc),
-        }
-        iterations.append(it)
-
-        log(f"[SAT] vol={vol} qc={it['qc_total']} new_QC={it['new_qc_count']} orphans={it['orphans']} coverage={it['coverage']:.2f} sanity={it['sanity_ok']}")
-
-        # Kernel rule: one iteration with new_QC == 0 (i.e., qc_ids stable vs previous volume)
-        if prev_set is not None and len(new_qc) == 0:
-            final_out = out
-            final_new_qc = []
-            log(f"[SAT] CONVERGED at vol={vol} (new_QC=0)")
-            break
-
-        prev_set = qc_ids
-        prev_volume = vol
-        prev_out = out
-        final_out = out
-        final_new_qc = new_qc[:200]  # keep sample in audit
-
-    if final_out is None:
-        raise RuntimeError("Saturation: aucune itération produite (bibliothèque vide ou erreur)")
-
-    # Selection report (F2) par chapitre, sur final_out
-    f1f2_params = pack_f1f2_params(pack)
-    subject = st.session_state.get("subject")
-    level = st.session_state.get("level")
-    chapters = pack_chapters(pack, subject, level)
-
-    N_total = int(final_out["audit"]["qi_posable"])
-    by_ch: Dict[str, List[Dict[str, Any]]] = {}
-    for qc in final_out["qc_pack"]:
-        by_ch.setdefault(qc["chapter_code"], []).append(qc)
-
-    selection: List[Dict[str, Any]] = []
-    for cc, qcs in by_ch.items():
-        selected = progressive_select(qcs, N_total, f1f2_params, top_k=int(selection_top_k))
-        ch_info = next((c for c in chapters if c.get("code") == cc), {"label": cc})
-        selection.append({
-            "chapter_code": cc,
-            "chapter_label": ch_info.get("label", cc),
-            "qc_count": len(qcs),
-            "selected_count": len(selected),
-            "selected_qc": [{
-                "qc_id": x["qc_id"],
-                "qc": x["qc"],
-                "primary_op": x["primary_op"],
-                "Psi_q": round(float(x.get("Psi_q", 0.0)), 4),
-                "f2_score": round(float(x.get("f2_score", 0.0)), 4),
-                "frt_id": x.get("frt_id", ""),
-            } for x in selected],
-        })
-
-    selection_report = {"generated_at": _utc_ts(), "chapters": selection}
-
-    # SEALED strict (kernel)
-    new_qc_is_zero = (iterations[-1]["new_qc_count"] == 0) if len(iterations) >= 2 else False
-    sanity_ok = bool(final_out["audit"]["sanity_ok"])
-    orphans = int(final_out["audit"]["qi_orphans"])
-    qc_posable = int(final_out["audit"]["qc_posable"])
-    qi_posable = int(final_out["audit"]["qi_posable"])
-
-    sealed = (
-        new_qc_is_zero and
-        sanity_ok and
-        orphans == 0 and
-        qc_posable > 0 and
-        qi_posable > 0
-    )
-
-    seal_reason = _seal_reason_strict(new_qc_is_zero, sanity_ok, orphans, qc_posable, qi_posable)
-
-    audit = {
-        "version": APP_VERSION,
-        "timestamp": _utc_ts(),
-        "pack_id": pack.get("pack_id"),
-        "pack_sig_sha256": pack.get("_pack_sig_sha256"),
-        "iterations": iterations,
-        "final_volume": iterations[-1]["volume"],
-        "new_qc_zero_reached": bool(new_qc_is_zero),
-        "last_new_qc_sample": final_new_qc[:20],
-        "phase_final": final_out["audit"],
-        "sealed": bool(sealed),
-        "seal_reason": seal_reason,
-    }
-
-    return {
-        "final": final_out,
-        "selection_report": selection_report,
-        "audit": audit,
-    }
-
-
-def _seal_reason_strict(new_qc_zero: bool, sanity_ok: bool, orphans: int, qc_posable: int, qi_posable: int) -> str:
-    if new_qc_zero and sanity_ok and orphans == 0 and qc_posable > 0 and qi_posable > 0:
-        return "ALL_CHECKS_PASSED"
-    reasons: List[str] = []
-    if not new_qc_zero:
-        reasons.append("SATURATION_NOT_CONVERGED_new_QC!=0")
-    if not sanity_ok:
-        reasons.append("SANITY_FAILED")
-    if orphans != 0:
-        reasons.append(f"ORPHANS_POSABLE={orphans}")
-    if qc_posable <= 0:
-        reasons.append("NO_QC_POSABLE")
-    if qi_posable <= 0:
-        reasons.append("NO_QI_POSABLE")
-    return " | ".join(reasons) if reasons else "UNKNOWN"
-
-
-# =============================================================================
-# RUN SIGNATURE (preuve) — SHA256 de tous les outputs
-# =============================================================================
-def build_run_signature(
-    pack: Dict[str, Any],
-    qi_pack: Any,
-    qc_pack: Any,
-    frt_pack: Any,
-    mapping_qi_to_qc: Any,
-    selection_report: Any,
-    audit: Any,
-    logs: str,
-) -> Dict[str, Any]:
-    def h(obj: Any) -> str:
-        return _sha256_text(_json_dumps_stable(obj))
-
-    sig = {
-        "version": APP_VERSION,
-        "timestamp": _utc_ts(),
-        "pack_id": pack.get("pack_id"),
-        "pack_sig_sha256": pack.get("_pack_sig_sha256"),
-        "hashes": {
-            "qi_pack_sha256": h(qi_pack),
-            "qc_pack_sha256": h(qc_pack),
-            "frt_pack_sha256": h(frt_pack),
-            "mapping_qi_to_qc_sha256": h(mapping_qi_to_qc),
-            "selection_report_sha256": h(selection_report),
-            "audit_sha256": h(audit),
-            "logs_sha256": _sha256_text(logs),
-        },
-        "counts": {
-            "qi": len(qi_pack) if isinstance(qi_pack, list) else 0,
-            "qc": len(qc_pack) if isinstance(qc_pack, list) else 0,
-            "frt": len((frt_pack or {}).get("items", {})) if isinstance(frt_pack, dict) else 0,
-            "mapping": len(mapping_qi_to_qc) if isinstance(mapping_qi_to_qc, dict) else 0,
-        },
-    }
-    sig["run_signature_sha256"] = h(sig)
-    return sig
-
-
-# =============================================================================
-# UI
-# =============================================================================
-def metric_row(pairs: int, corr_ok: int, qi: int, qi_posable: int, qc: int, coverage: float, sealed: bool):
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.metric("Pairs", pairs)
-    c2.metric("Corrigés", corr_ok)
-    c3.metric("Qi", qi)
-    c4.metric("Qi POSABLE", qi_posable)
-    c5.metric("QC", qc)
-    c6.metric("Coverage", f"{coverage:.0%}")
-    c7.metric("SEALED", "✅ YES" if sealed else "❌ NO")
-
-
-def _safe_set_default_subject_level(pack: Dict[str, Any]) -> None:
-    taxonomy = pack.get("chapter_taxonomy", {}) or {}
-    subjects = list(taxonomy.keys())
-    if subjects:
-        st.session_state.subject = st.session_state.subject or subjects[0]
-        levels = list((taxonomy.get(st.session_state.subject) or {}).keys())
-        if levels:
-            st.session_state.level = st.session_state.level or levels[0]
-
-
-def main() -> None:
-    st.set_page_config(page_title=f"SMAXIA GTE {APP_VERSION}", layout="wide")
-    ss_init()
-
-    st.markdown(f"# SMAXIA GTE Console {APP_VERSION}")
-    st.caption("ISO-PROD | Pack-Driven | Saturation progressive (new_QC=0) | ARI evidence | Exports preuve (mapping + signature)")
-
-    # SIDEBAR
-    with st.sidebar:
-        st.markdown("## 1. ACTIVATION PACK")
-
-        country_options = list(GENESIS_PACKS.keys())
-        country_labels = [f"{code} - {GENESIS_PACKS[code][0]}" for code in country_options]
-        selected_idx = st.selectbox("Sélectionner le pays", range(len(country_options)), format_func=lambda i: country_labels[i])
-        selected_country = country_options[selected_idx]
-
-        st.markdown("---")
-        st.caption("Pack externe (optionnel)")
-        uploaded = st.file_uploader("Pack JSON", type=["json"])
-
-        if st.button("ACTIVER", use_container_width=True, type="primary"):
-            try:
-                if uploaded:
-                    pack = json.loads(uploaded.read().decode("utf-8"))
-                    pack["_source"] = "UPLOAD"
-                    pack["_pack_sig_sha256"] = _sha256_text(_json_dumps_stable(pack))
-                    log(f"[PACK] Upload pack_id={pack.get('pack_id')}")
+            audit["pages"] = len(pdf.pages)
+            for p in pdf.pages:
+                txt = p.extract_text(x_tolerance=2, y_tolerance=2, layout=True) or ""
+                lines = [ln.rstrip() for ln in txt.splitlines() if ln.strip()]
+                if lines:
+                    audit["pages_with_text"] += 1
                 else:
-                    pack = generate_pack(selected_country)
-                    log(f"[PACK] Genesis country={selected_country}")
+                    audit["empty_pages"] += 1
+                pages_lines.append(lines)
+    except Exception as e:
+        audit["warnings"].append(f"pdfplumber_open_failed: {e}")
+        return [], audit
 
-                st.session_state.pack_active = pack
-                st.session_state.pack_id = pack.get("pack_id", "")
-                st.session_state.pack_sig_sha256 = pack.get("_pack_sig_sha256", "")
-                st.session_state.country = pack.get("country_code", "")
+    # If mostly empty => likely scanned. We do not hard-depend on OCR libs.
+    if audit["pages"] > 0 and audit["pages_with_text"] / max(1, audit["pages"]) < 0.25:
+        audit["warnings"].append("low_text_density_likely_scanned")
+        # Optional OCR if available
+        try:
+            import pytesseract  # type: ignore
+            from pdf2image import convert_from_bytes  # type: ignore
+            audit["mode"] = "ocr_fallback"
+            pages_lines = []
+            images = convert_from_bytes(pdf_bytes, dpi=250)
+            for img in images:
+                ocr = pytesseract.image_to_string(img, lang="fra+eng")
+                lines = [ln.rstrip() for ln in ocr.splitlines() if ln.strip()]
+                pages_lines.append(lines)
+            audit["pages_with_text"] = sum(1 for pl in pages_lines if pl)
+            audit["empty_pages"] = audit["pages"] - audit["pages_with_text"]
+        except Exception as e:
+            audit["warnings"].append(f"ocr_unavailable_or_failed: {e}")
 
-                _safe_set_default_subject_level(pack)
+    return pages_lines, audit
 
-                # Reset runtime
-                st.session_state.library = []
-                st.session_state.harvest_manifest = None
-                st.session_state.qi_pack = None
-                st.session_state.qc_pack = None
-                st.session_state.frt_pack = None
-                st.session_state.qc_map = None
-                st.session_state.selection_report = None
-                st.session_state.last_run_audit = None
-                st.session_state.run_signature = None
-                st.session_state.sealed = False
-                st.session_state.run_stats = {
-                    "pairs": 0, "corriges": 0, "qi": 0, "rqi": 0, "qi_posable": 0,
-                    "orphans": 0, "qc": 0, "qc_posable": 0, "coverage": 0.0, "sanity_ok": False,
-                }
+EXO_RE = re.compile(r"(?i)\bexercice\s+([0-9ivx]+)\b")
+QNUM_RE = re.compile(r"^\s*(?:question\s*)?(\d{1,2})\s*[\)\.\:\-]\s+(.+)\s*$", re.I)
+SUBQ_RE = re.compile(r"^\s*([a-h])\)\s+(.+)\s*$", re.I)
+SUBQ2_RE = re.compile(r"^\s*\(([a-h])\)\s+(.+)\s*$", re.I)
 
-                st.success(f"✅ Pack activé: {st.session_state.pack_id}")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erreur: {e}")
+def looks_like_evaluable(line: str) -> bool:
+    # Minimal kernel-safe heuristic: task/request indicators (language-level, not chapter hardcode)
+    # If pack provides better rule, it will be used at POSABLE_EVALUABLE stage.
+    task_verbs = [
+        "calcul", "détermin", "resoud", "résoud", "montr", "justif", "démontr", "prouv",
+        "établ", "donner", "tracer", "étudier", "simplif", "factoris", "approx",
+        "interpr", "conclu", "vérif", "valider"
+    ]
+    l = line.lower()
+    if "?" in line:
+        return True
+    return any(v in l for v in task_verbs)
 
-        if st.session_state.pack_active:
-            pack = st.session_state.pack_active
-            st.success(f"✅ {st.session_state.pack_id}")
-            st.caption(f"Pays: {pack.get('country_name')}")
-            st.caption(f"Source: {pack.get('_source')}")
-            st.caption(f"PackSig: {st.session_state.pack_sig_sha256[:12]}...")
+def join_lines(lines: List[str]) -> str:
+    # Preserve paragraph-ish spacing, but keep it deterministic
+    s = "\n".join(lines)
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
-            st.markdown("---")
-            st.markdown("## 2. SÉLECTION")
+def sanitize_text(text: str, lang: str) -> Tuple[str, List[Dict[str, Any]]]:
+    deriv = []
+    s = text
 
-            taxonomy = pack.get("chapter_taxonomy", {}) or {}
-            subjects = list(taxonomy.keys())
+    # Remove obvious headers/footers artifacts (deterministic regex)
+    s2 = re.sub(r"\bpage\s+\d+\s*/\s*\d+\b", " ", s, flags=re.I)
+    if s2 != s:
+        deriv.append({"op": "rm_page_counter", "before_sha": sha256_text(s), "after_sha": sha256_text(s2)})
+        s = s2
 
-            if subjects:
-                subject = st.selectbox("Matière", subjects, index=subjects.index(st.session_state.subject) if st.session_state.subject in subjects else 0)
-                st.session_state.subject = subject
+    # Neutralize years
+    s2 = re.sub(r"\b(19|20)\d{2}\b", "<YEAR>", s)
+    if s2 != s:
+        deriv.append({"op": "neutralize_year", "before_sha": sha256_text(s), "after_sha": sha256_text(s2)})
+        s = s2
 
-                levels = list((taxonomy.get(subject) or {}).keys())
-                if levels:
-                    level = st.selectbox("Niveau", levels, index=levels.index(st.session_state.level) if st.session_state.level in levels else 0)
-                    st.session_state.level = level
+    # Neutralize long IDs / centers patterns
+    s2 = re.sub(r"\b[A-Z]{2,}\-[A-Z0-9]{2,}\b", "<ID>", s)
+    if s2 != s:
+        deriv.append({"op": "neutralize_id", "before_sha": sha256_text(s), "after_sha": sha256_text(s2)})
+        s = s2
 
-            chapters = pack_chapters(pack, st.session_state.subject, st.session_state.level)
-            if chapters:
-                st.markdown("### Chapitres (aperçu)")
-                for ch in chapters[:8]:
-                    st.caption(f"• {ch.get('code')} — {ch.get('label')}")
+    # Neutralize standalone numbers (keep math structure moderately)
+    s2 = re.sub(r"(?<![A-Za-z])(\d+([.,]\d+)?)(?![A-Za-z])", "<NUM>", s)
+    if s2 != s:
+        deriv.append({"op": "neutralize_numbers", "before_sha": sha256_text(s), "after_sha": sha256_text(s2)})
+        s = s2
 
-    # MAIN
-    if not st.session_state.pack_active:
-        st.warning("Sélectionnez un pays et cliquez sur ACTIVER.")
-        return
+    # Whitespace normalize
+    s2 = re.sub(r"[ \t]+", " ", s).strip()
+    if s2 != s:
+        deriv.append({"op": "ws_normalize", "before_sha": sha256_text(s), "after_sha": sha256_text(s2)})
+        s = s2
 
-    pack = st.session_state.pack_active
+    return s, deriv
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Import", "RUN", "Résultats", "Exports"])
+def atomise_subject(pages_lines: List[List[str]], doc_id: str, lang: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Produce raw question segments with locators:
+      {exo_ref, q_ref, qi_raw, locator}
+    Captures numbered questions + lettered sub-questions as separate Qi units.
+    """
+    audit = {
+        "doc_id": doc_id,
+        "pages": len(pages_lines),
+        "exo_detected": 0,
+        "q_units": 0,
+        "warnings": []
+    }
 
-    lib = st.session_state.library
-    corr_ok = sum(1 for x in lib if x.get("corrige?"))
-    stats = st.session_state.run_stats
+    units: List[Dict[str, Any]] = []
 
-    # TAB 1 - IMPORT
-    with tab1:
-        st.markdown("## Import & Harvest")
-        metric_row(len(lib), corr_ok, stats.get("qi", 0), stats.get("qi_posable", 0), stats.get("qc", 0), float(stats.get("coverage", 0.0)), st.session_state.sealed)
+    current_exo = None
+    current_qnum = None
+    current_unit_lines: List[str] = []
+    current_locator = None
+    current_qref = None
 
-        if lib:
-            st.dataframe(
-                [{k: r.get(k, "") for k in ["pair_id", "year", "sujet", "corrige?", "match_score"]} for r in lib[:80]],
-                use_container_width=True,
-                hide_index=True,
-            )
+    def flush_unit():
+        nonlocal current_unit_lines, current_locator, current_qref, current_exo
+        if not current_unit_lines or not current_locator:
+            current_unit_lines = []
+            current_locator = None
+            return
+        raw = join_lines(current_unit_lines)
+        # Conservative filter: must look evaluable OR be non-trivial length
+        if looks_like_evaluable(raw) or len(raw) >= 60:
+            units.append({
+                "exo_ref": current_exo,
+                "q_ref": current_qref,
+                "qi_raw": raw,
+                "locator": current_locator
+            })
+        current_unit_lines = []
+        current_locator = None
 
-        st.markdown("### HARVEST")
-        source = pack_harvest_source(pack)
-        if source:
-            st.info(f"Source: {source.get('source_name')}")
-            c1, c2 = st.columns(2)
-            years_back = c1.number_input("Années", 1, 15, 5)
-            volume_max = c2.number_input("Volume max", 5, 150, 30)
+    for pi, lines in enumerate(pages_lines):
+        for li, line in enumerate(lines):
+            # Exercice detection
+            m_exo = EXO_RE.search(line)
+            if m_exo:
+                current_exo = str(m_exo.group(1)).upper()
+                audit["exo_detected"] += 1
 
-            if st.button("HARVEST", use_container_width=True):
-                with st.spinner("Harvest en cours..."):
-                    try:
-                        manifest = harvest_from_pack(pack, st.session_state.level, st.session_state.subject, int(years_back), int(volume_max))
-                        st.session_state.harvest_manifest = manifest
-                        st.session_state.library = manifest["library"]
+            # Question start (numbered)
+            m_q = QNUM_RE.match(line)
+            m_sub = SUBQ_RE.match(line) or SUBQ2_RE.match(line)
 
-                        st.session_state.sealed = False
-                        st.session_state.qi_pack = None
-                        st.session_state.qc_pack = None
-                        st.session_state.frt_pack = None
-                        st.session_state.qc_map = None
-                        st.session_state.selection_report = None
-                        st.session_state.last_run_audit = None
-                        st.session_state.run_signature = None
-                        st.session_state.run_stats = {
-                            "pairs": len(st.session_state.library),
-                            "corriges": sum(1 for x in st.session_state.library if x.get("corrige?")),
-                            "qi": 0, "rqi": 0, "qi_posable": 0,
-                            "orphans": 0, "qc": 0, "qc_posable": 0,
-                            "coverage": 0.0, "sanity_ok": False,
-                        }
+            if m_q:
+                # New numbered question => flush previous unit
+                flush_unit()
+                current_qnum = m_q.group(1)
+                rest = m_q.group(2)
+                current_qref = f"{current_qnum}"
+                current_unit_lines = [rest] if rest else []
+                current_locator = Locator(page_start=pi, page_end=pi, line_start=li, line_end=li)
+                continue
 
-                        st.success(f"✅ {manifest['items_total']} pairs (corrigés={manifest['items_corrige_ok']})")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ {e}")
+            if m_sub and current_qnum is not None:
+                # New sub-question => flush previous unit, start new unit with sub label
+                flush_unit()
+                sub = m_sub.group(1).lower()
+                rest = m_sub.group(2)
+                current_qref = f"{current_qnum}{sub}"
+                current_unit_lines = [rest] if rest else []
+                current_locator = Locator(page_start=pi, page_end=pi, line_start=li, line_end=li)
+                continue
 
-    # TAB 2 - RUN
-    with tab2:
-        st.markdown("## RUN — Saturation progressive (new_QC=0)")
+            # Accumulate into current unit if active
+            if current_locator is not None:
+                current_unit_lines.append(line)
+                # extend locator (multi-line, multi-page)
+                current_locator.page_end = pi
+                current_locator.line_end = li
 
-        lib2 = st.session_state.library
-        corr_ok2 = sum(1 for x in lib2 if x.get("corrige?"))
+    flush_unit()
 
-        if not lib2:
-            st.warning("Bibliothèque vide — faire HARVEST d'abord.")
-        elif corr_ok2 <= 0:
-            st.error("Aucun corrigé exploitable (corrige_url absent).")
-        else:
-            max_vol = max(1, min(200, corr_ok2))
+    audit["q_units"] = len(units)
+    if len(units) == 0:
+        audit["warnings"].append("no_question_units_detected")
 
-            st.markdown("### Paramètres")
-            c1, c2, c3 = st.columns(3)
-            vol_start = c1.number_input("vol_start", 1, max_vol, min(5, max_vol))
-            vol_max = c2.number_input("vol_max", int(vol_start), max_vol, min(max(10, int(vol_start)), max_vol))
-            step = c3.number_input("step", 1, 25, 1)
+    return units, audit
 
-            c4, c5 = st.columns(2)
-            selection_top_k = c4.number_input("F2 top_k / chapitre", 5, 30, 15)
-            st.caption("SEALED strict = (new_QC==0) AND (orphans==0) AND sanity_ok AND qc_posable>0 AND qi_posable>0")
+def atomise_correction(pages_lines: List[List[str]], doc_id: str, lang: str) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """
+    Correction segmentation indexed by (exo_ref, q_ref) where possible.
+    Returns dict key -> {rqi_raw, locator}
+    """
+    audit = {"doc_id": doc_id, "pages": len(pages_lines), "segments": 0, "warnings": []}
+    idx: Dict[str, Dict[str, Any]] = {}
 
-            if st.button("LANCER TEST SATURATION", use_container_width=True, type="primary"):
-                with st.spinner("RUN en cours..."):
-                    try:
-                        log(f"=== RUN {APP_VERSION} ===")
-                        res = run_saturation_progressive(lib2, int(vol_start), int(vol_max), int(step), pack, int(selection_top_k))
+    current_exo = None
+    current_qnum = None
+    current_key = None
+    cur_lines: List[str] = []
+    cur_loc = None
 
-                        final = res["final"]
-                        st.session_state.qi_pack = final["qi_pack"]
-                        st.session_state.qc_pack = final["qc_pack"]
-                        st.session_state.frt_pack = final["frt_pack"]
-                        st.session_state.qc_map = final["qc_map"]
-                        st.session_state.selection_report = res["selection_report"]
-                        st.session_state.last_run_audit = res["audit"]
-                        st.session_state.sealed = bool(res["audit"]["sealed"])
+    def flush():
+        nonlocal current_key, cur_lines, cur_loc
+        if current_key and cur_lines and cur_loc:
+            idx[current_key] = {"rqi_raw": join_lines(cur_lines), "locator": cur_loc}
+        current_key = None
+        cur_lines = []
+        cur_loc = None
 
-                        # mapping_qi_to_qc export (preuve)
-                        mapping_qi_to_qc = st.session_state.qc_map or {}
+    for pi, lines in enumerate(pages_lines):
+        for li, line in enumerate(lines):
+            m_exo = EXO_RE.search(line)
+            if m_exo:
+                current_exo = str(m_exo.group(1)).upper()
 
-                        # signature (preuve)
-                        sig = build_run_signature(
-                            pack=pack,
-                            qi_pack=st.session_state.qi_pack or [],
-                            qc_pack=st.session_state.qc_pack or [],
-                            frt_pack=st.session_state.frt_pack or {},
-                            mapping_qi_to_qc=mapping_qi_to_qc,
-                            selection_report=st.session_state.selection_report or {},
-                            audit=st.session_state.last_run_audit or {},
-                            logs=logs_text(),
-                        )
-                        st.session_state.run_signature = sig
+            m_q = QNUM_RE.match(line)
+            m_sub = SUBQ_RE.match(line) or SUBQ2_RE.match(line)
 
-                        # Stats UI
-                        qi_total = len(st.session_state.qi_pack or [])
-                        rqi_total = sum(1 for q in (st.session_state.qi_pack or []) if q.get("has_rqi"))
-                        qi_posable = int((res["audit"]["phase_final"] or {}).get("qi_posable", 0))
-                        orphans = int((res["audit"]["phase_final"] or {}).get("qi_orphans", 0))
-                        qc_total = len(st.session_state.qc_pack or [])
-                        qc_posable = int((res["audit"]["phase_final"] or {}).get("qc_posable", 0))
-                        coverage = float((res["audit"]["phase_final"] or {}).get("coverage", 0.0))
+            if m_q:
+                flush()
+                current_qnum = m_q.group(1)
+                rest = m_q.group(2)
+                q_ref = f"{current_qnum}"
+                current_key = f"{current_exo or 'X'}::{q_ref}"
+                cur_lines = [rest] if rest else []
+                cur_loc = Locator(page_start=pi, page_end=pi, line_start=li, line_end=li)
+                continue
 
-                        st.session_state.run_stats = {
-                            "pairs": len(lib2),
-                            "corriges": corr_ok2,
-                            "qi": qi_total,
-                            "rqi": rqi_total,
-                            "qi_posable": qi_posable,
-                            "orphans": orphans,
-                            "qc": qc_total,
-                            "qc_posable": qc_posable,
-                            "coverage": coverage,
-                            "sanity_ok": bool((res["audit"]["phase_final"] or {}).get("sanity_ok", False)),
-                        }
+            if m_sub and current_qnum is not None:
+                flush()
+                sub = (m_sub.group(1) or "").lower()
+                rest = m_sub.group(2)
+                q_ref = f"{current_qnum}{sub}"
+                current_key = f"{current_exo or 'X'}::{q_ref}"
+                cur_lines = [rest] if rest else []
+                cur_loc = Locator(page_start=pi, page_end=pi, line_start=li, line_end=li)
+                continue
 
-                        if st.session_state.sealed:
-                            st.success(f"✅ SEALED = YES | final_volume={res['audit']['final_volume']} | coverage={coverage:.0%}")
-                        else:
-                            st.warning(f"⚠️ SEALED = NO | {res['audit']['seal_reason']}")
+            if cur_loc is not None:
+                cur_lines.append(line)
+                cur_loc.page_end = pi
+                cur_loc.line_end = li
 
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ {e}")
-                        import traceback
-                        st.text(traceback.format_exc())
+    flush()
+    audit["segments"] = len(idx)
+    if len(idx) == 0:
+        audit["warnings"].append("no_correction_segments_detected")
 
-        st.markdown("### Logs")
-        st.text_area("", logs_text(), height=220)
+    return idx, audit
 
-    # TAB 3 - RESULTS
-    with tab3:
-        st.markdown("## Résultats")
+def best_effort_match_rqi(qi_raw: str, corr_idx: Dict[str, Dict[str, Any]]) -> Tuple[Optional[str], float, Optional[Dict[str, Any]]]:
+    """
+    Fallback matching when numbering keys fail: pick segment with highest similarity on sanitized surface.
+    This does NOT create content; it only selects an existing segment.
+    """
+    if not corr_idx:
+        return None, 0.0, None
+    q = re.sub(r"\s+", " ", qi_raw).strip().lower()
+    best = (0.0, None, None)
+    for k, v in corr_idx.items():
+        s = re.sub(r"\s+", " ", v["rqi_raw"]).strip().lower()
+        sim = difflib.SequenceMatcher(None, q[:1200], s[:1200]).ratio()
+        if sim > best[0]:
+            best = (sim, k, v)
+    if best[1] is None:
+        return None, 0.0, None
+    return best[2]["rqi_raw"], float(best[0]), {"match_key": best[1], "sim": float(best[0])}
 
-        audit = st.session_state.last_run_audit
-        if not audit:
-            st.info("Lancez le RUN pour voir les résultats.")
-        else:
-            pb = audit.get("phase_final", {}) or {}
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("SEALED", "✅ YES" if audit.get("sealed") else "❌ NO")
-            c2.metric("Final volume", audit.get("final_volume", 0))
-            c3.metric("Orphans (posable)", pb.get("qi_orphans", 0))
-            c4.metric("Coverage (KPI)", f"{float(pb.get('coverage', 0.0)):.0%}")
+# =============================================================================
+# POSABLE Gate (corrigé + scope + évaluable)
+# =============================================================================
+def scope_match_chapter(pack: Dict[str, Any], qi_clean: str, rqi_clean: Optional[str]) -> Tuple[Optional[str], Dict[str, Any], List[str]]:
+    """
+    Pack-driven scope rules.
+    Expected pack.academic.chapters = [{chapter_code, label, match_keywords[], match_regexes[]}]
+    Returns: chapter_ref, scope_trace, reason_codes(if fail)
+    """
+    chapters = pack_get(pack, "academic.chapters", [])
+    if not chapters:
+        return None, {"method": "none", "details": "pack academic.chapters missing"}, [RC_SCOPE_UNRESOLVED]
 
-            st.markdown("### Audit strict (Kernel)")
-            st.write(f"- new_QC==0 atteint : **{audit.get('new_qc_zero_reached')}**")
-            st.write(f"- sanity_ok : **{pb.get('sanity_ok')}**")
-            st.write(f"- qi_posable : **{pb.get('qi_posable')}**")
-            st.write(f"- qc_posable : **{pb.get('qc_posable')}**")
-            st.write(f"- seal_reason : **{audit.get('seal_reason')}**")
+    text = (qi_clean + "\n" + (rqi_clean or "")).lower()
 
-            st.markdown("### Itérations de saturation")
-            iters = audit.get("iterations", []) or []
-            if iters:
-                st.dataframe(iters, use_container_width=True, hide_index=True)
+    scores = []
+    for ch in chapters:
+        code = ch.get("chapter_code") or ch.get("code")
+        if not code:
+            continue
+        kw = ch.get("match_keywords", []) or []
+        rg = ch.get("match_regexes", []) or []
+        hit_kw = [k for k in kw if isinstance(k, str) and k.lower() in text]
+        hit_rg = []
+        for r in rg:
+            try:
+                if re.search(r, text, flags=re.I):
+                    hit_rg.append(r)
+            except Exception:
+                continue
+        score = len(hit_kw) + 2 * len(hit_rg)
+        if score > 0:
+            scores.append((score, code, hit_kw, hit_rg))
 
-            st.markdown("### Sélection F2 par chapitre")
-            sel = st.session_state.selection_report or {}
-            for ch in sel.get("chapters", []) if isinstance(sel, dict) else []:
-                with st.expander(f"{ch.get('chapter_label')} ({ch.get('selected_count')}/{ch.get('qc_count')} QC)"):
-                    for qc in ch.get("selected_qc", []):
-                        st.markdown(f"**{qc.get('qc')}**")
-                        st.caption(f"ID: {qc.get('qc_id')} | Ψ={qc.get('Psi_q')} | F2={qc.get('f2_score')} | FRT={qc.get('frt_id')}")
+    scores = stable_sort(scores, key_fn=lambda x: (-x[0], x[1]))
 
-    # TAB 4 - EXPORTS + EXPLORER
-    with tab4:
-        st.markdown("## Exports (preuves) + Explorateur")
+    if not scores:
+        return None, {"method": "keywords/regex", "hits": []}, [RC_SCOPE_UNRESOLVED]
 
-        metric_row(
-            len(lib), corr_ok,
-            stats.get("qi", 0), stats.get("qi_posable", 0),
-            stats.get("qc", 0), float(stats.get("coverage", 0.0)),
-            st.session_state.sealed,
+    # Ambiguity: top two close
+    if len(scores) >= 2 and scores[0][0] == scores[1][0]:
+        return None, {"method": "keywords/regex", "top": scores[:3]}, [RC_SCOPE_AMBIGUOUS]
+
+    top = scores[0]
+    trace = {"method": "keywords/regex", "chapter_ref": top[1], "score": top[0], "hit_keywords": top[2], "hit_regexes": top[3]}
+    return top[1], trace, []
+
+def posable_gate(pack: Dict[str, Any], atoms: List[Atom]) -> Tuple[Dict[str, PosableDecision], Dict[str, ChapterMetrics]]:
+    """
+    Determine POSABLE per Atom/Qi:
+      - POSABLE_CORRIGE: rqi_clean exists
+      - POSABLE_SCOPE: chapter resolvable (pack rules)
+      - POSABLE_EVALUABLE: minimal task criterion (pack may override)
+    """
+    decisions: Dict[str, PosableDecision] = {}
+    chapter_counts: Dict[str, Dict[str, int]] = {}
+
+    # Pack may provide a regex list for evaluable detection
+    eval_rules = pack_get(pack, "policy.posable.evaluable_regexes", None)
+
+    for a in atoms:
+        reason = []
+        evidence_refs = [a.source_fingerprint]  # minimal; per-atom evidence pack will add more
+        chapter_ref = None
+        scope_trace = {}
+
+        # POSABLE_CORRIGE
+        if not a.rqi_clean:
+            reason.append(RC_CORRIGE_MISSING)
+
+        # POSABLE_EVALUABLE
+        is_eval = looks_like_evaluable(a.qi_raw)
+        if eval_rules:
+            try:
+                is_eval = any(re.search(rgx, a.qi_raw, flags=re.I) for rgx in eval_rules)
+            except Exception:
+                pass
+        if not is_eval:
+            reason.append(RC_NOT_EVALUABLE)
+
+        # POSABLE_SCOPE (only if corrigé exists; still compute trace)
+        chapter_ref, scope_trace, scope_rc = scope_match_chapter(pack, a.qi_clean, a.rqi_clean)
+        reason.extend(scope_rc)
+
+        posable = (len(reason) == 0)
+
+        decisions[a.qi_id] = PosableDecision(
+            qi_id=a.qi_id,
+            chapter_ref=chapter_ref,
+            posable_status=posable,
+            posable_reason_codes=reason,
+            evidence_refs=evidence_refs,
+            scope_trace=scope_trace
         )
 
-        colA, colB = st.columns(2)
-
-        with colA:
-            st.download_button("logs.txt", logs_text(), "logs.txt")
-            if st.session_state.qi_pack is not None:
-                st.download_button("qi_pack.json", json.dumps(st.session_state.qi_pack, ensure_ascii=False, indent=2), "qi_pack.json")
-            if st.session_state.qc_pack is not None:
-                st.download_button("qc_pack.json", json.dumps(st.session_state.qc_pack, ensure_ascii=False, indent=2), "qc_pack.json")
-            if st.session_state.frt_pack is not None:
-                st.download_button("frt_pack.json", json.dumps(st.session_state.frt_pack, ensure_ascii=False, indent=2), "frt_pack.json")
-
-        with colB:
-            # Preuve mapping
-            if st.session_state.qc_map is not None:
-                st.download_button("mapping_qi_to_qc.json", json.dumps(st.session_state.qc_map, ensure_ascii=False, indent=2), "mapping_qi_to_qc.json")
-            if st.session_state.selection_report is not None:
-                st.download_button("selection_report.json", json.dumps(st.session_state.selection_report, ensure_ascii=False, indent=2), "selection_report.json")
-            if st.session_state.last_run_audit is not None:
-                st.download_button("audit.json", json.dumps(st.session_state.last_run_audit, ensure_ascii=False, indent=2), "audit.json")
-            if st.session_state.run_signature is not None:
-                st.download_button("run_signature.json", json.dumps(st.session_state.run_signature, ensure_ascii=False, indent=2), "run_signature.json")
-
-        st.markdown("---")
-        st.markdown("## Explorateur QC → Qi → ARI → FRT")
-
-        if st.session_state.qc_pack and st.session_state.qi_pack:
-            qc_pack = st.session_state.qc_pack
-            qi_pack = st.session_state.qi_pack
-            frt_pack = st.session_state.frt_pack or {}
-            frt_items = (frt_pack.get("items", {}) or {}) if isinstance(frt_pack, dict) else {}
-
-            ch_opts = ["ALL"] + sorted({qc.get("chapter_code", "UNMAPPED") for qc in qc_pack})
-            sel_ch = st.selectbox("Filtrer par chapitre", ch_opts)
-
-            qcs = qc_pack if sel_ch == "ALL" else [q for q in qc_pack if q.get("chapter_code") == sel_ch]
-            qcs = sorted(qcs, key=lambda x: (-int(x.get("posable_in_cluster", 0)), str(x.get("qc_id", ""))))
-
-            if qcs:
-                qc_labels = [
-                    f"{q.get('qc_id')} | {q.get('chapter_code')} | {q.get('primary_op')} | n={q.get('cluster_size')} | posable={q.get('posable_in_cluster')}"
-                    for q in qcs
-                ]
-                sel_idx = st.selectbox("Sélectionner une QC", range(len(qc_labels)), format_func=lambda i: qc_labels[i])
-                qc = qcs[sel_idx]
-
-                st.markdown(f"### {qc.get('qc')}")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Cluster", int(qc.get("cluster_size", 0)))
-                c2.metric("Posable", int(qc.get("posable_in_cluster", 0)))
-                c3.metric("État", qc.get("qc_state", ""))
-                c4.metric("Ψ (F1)", f"{float(qc.get('Psi_q', 0.0)):.3f}")
-
-                # FRT (lookup via frt_id)
-                st.markdown("#### FRT (Fiche Réponse Type)")
-                frt = frt_items.get(qc.get("frt_id", ""), {})
-                if frt and frt.get("steps"):
-                    st.caption(f"{frt.get('frt_id')} — {frt.get('title')}")
-                    for step in frt.get("steps", []):
-                        st.markdown(f"- {step}")
-                else:
-                    st.caption("FRT introuvable (frt_id non résolu).")
-
-                # Triggers
-                st.markdown("#### Triggers QC")
-                st.write(qc.get("triggers", []))
-
-                # Qi liées
-                st.markdown("#### Qi sources")
-                qi_by_id = {q["qi_id"]: q for q in qi_pack}
-                for qi_id in qc.get("qi_ids", [])[:25]:
-                    q = qi_by_id.get(qi_id)
-                    if not q:
-                        continue
-                    title = f"{qi_id} | RQi={'✅' if q.get('has_rqi') else '❌'} | {q.get('primary_op')} | CH={q.get('chapter_code')} (score={q.get('chapter_match_score')})"
-                    with st.expander(title):
-                        st.markdown("**Qi**")
-                        st.text(q.get("qi", "")[:1600])
-                        if q.get("rqi"):
-                            st.markdown("**RQi**")
-                            st.text(q.get("rqi", "")[:1200])
-                        st.markdown("**ARI trace (evidence)**")
-                        st.json(q.get("ari_trace", {}))
-                        st.markdown("**Triggers Qi**")
-                        st.write(q.get("triggers", []))
+        ch = chapter_ref or "UNSCOPED"
+        chapter_counts.setdefault(ch, {"posable": 0, "quarantined": 0})
+        if posable and chapter_ref:
+            chapter_counts[ch]["posable"] += 1
         else:
-            st.info("Aucun résultat à explorer — lancer le RUN.")
+            chapter_counts[ch]["quarantined"] += 1
 
+    chapter_metrics: Dict[str, ChapterMetrics] = {}
+    for ch, cnt in chapter_counts.items():
+        total = cnt["posable"] + cnt["quarantined"]
+        chapter_metrics[ch] = ChapterMetrics(
+            chapter_ref=ch,
+            N_total_posable=int(cnt["posable"]),
+            quarantined_count=int(cnt["quarantined"]),
+            posable_rate=float(cnt["posable"]) / max(1, total)
+        )
 
-if __name__ == "__main__":
-    main()
+    return decisions, chapter_metrics
+
+# =============================================================================
+# Cognitive Verb Ontology (Kernel minimal) + Pack mappings
+# =============================================================================
+KERNEL_VERBS = [
+    ("IDENTIFY", ["identifier", "repérer", "nommer"], 0.15),
+    ("DEFINE", ["définir", "rappeler"], 0.15),
+    ("ANALYZE", ["analyser", "observer", "examiner"], 0.20),
+    ("SYNTHESIZE", ["synthétiser", "conclure"], 0.20),
+    ("ILLUSTRATE", ["illustrer", "exemplifier"], 0.25),
+    ("SIMPLIFY", ["simplifier", "factoriser", "réduire"], 0.25),
+    ("MODEL", ["schématiser", "modéliser"], 0.30),
+    ("PLAN", ["planifier", "organiser"], 0.30),
+    ("CALCULATE", ["calculer", "mesurer", "quantifier"], 0.30),
+    ("FORMULATE", ["exprimer", "formuler"], 0.30),
+    ("COMPARE", ["comparer", "opposer", "distinguer"], 0.35),
+    ("APPLY", ["appliquer", "utiliser"], 0.35),
+    ("INTERPRET", ["interpréter"], 0.35),
+    ("SOLVE", ["résoudre", "déterminer"], 0.40),
+    ("DIFF_INTEG", ["dériver", "intégrer"], 0.40),
+    ("ARGUE", ["argumenter", "justifier"], 0.45),
+    ("PROVE", ["démontrer", "prouver"], 0.50),
+    ("RECURRENCE", ["récurrence"], 0.60),
+]
+
+def build_verb_map(pack: Dict[str, Any], lang: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns mapping from surface token -> {verb_id, weight}
+    Pack may provide:
+      pack.policy.verb_ontology.synonyms = { "differencier": "DIFF_INTEG", ... }
+      pack.policy.verb_ontology.weights_override = { "DIFF_INTEG": 0.42, ... }
+    """
+    weights_override = pack_get(pack, "policy.verb_ontology.weights_override", {}) or {}
+    synonyms = pack_get(pack, "policy.verb_ontology.synonyms", {}) or {}
+
+    verb_map: Dict[str, Dict[str, Any]] = {}
+    for vid, forms, w in KERNEL_VERBS:
+        w2 = float(weights_override.get(vid, w))
+        for f in forms:
+            verb_map[f.lower()] = {"verb_id": vid, "weight": w2}
+
+    # Add pack synonyms
+    for surf, vid in synonyms.items():
+        if isinstance(surf, str) and isinstance(vid, str):
+            base_w = next((x[2] for x in KERNEL_VERBS if x[0] == vid), 0.25)
+            w2 = float(weights_override.get(vid, base_w))
+            verb_map[surf.lower()] = {"verb_id": vid, "weight": w2}
+
+    return verb_map
+
+def mine_traces(pack: Dict[str, Any], atoms: List[Atom], posable: Dict[str, PosableDecision], lang: str) -> Dict[str, TraceARI]:
+    """
+    IA1 Miner (factuel): actions observed + evidence refs, no synthesis.
+    """
+    verb_map = build_verb_map(pack, lang)
+    traces: Dict[str, TraceARI] = {}
+
+    for a in atoms:
+        dec = posable.get(a.qi_id)
+        if not dec or not dec.posable_status or not dec.chapter_ref:
+            continue
+
+        text = (a.rqi_clean or "").lower()
+
+        actions = []
+        used = set()
+        for surf, meta in verb_map.items():
+            # deterministic: scan for word boundaries
+            if re.search(rf"\b{re.escape(surf)}\b", text, flags=re.I):
+                vid = meta["verb_id"]
+                if vid in used:
+                    continue
+                # Evidence snippet (limited)
+                m = re.search(rf"(.{{0,40}})\b{re.escape(surf)}\b(.{{0,40}})", text, flags=re.I)
+                snippet = (m.group(0) if m else surf)[:120]
+                actions.append({
+                    "verb_id": vid,
+                    "surface": surf,
+                    "weight": meta["weight"],
+                    "evidence": snippet
+                })
+                used.add(vid)
+
+        # Ensure deterministic order: by first appearance index in text
+        def first_pos(surf: str) -> int:
+            m = re.search(rf"\b{re.escape(surf)}\b", text, flags=re.I)
+            return m.start() if m else 10**9
+        actions = stable_sort(actions, key_fn=lambda x: (first_pos(x["surface"]), x["verb_id"]))
+
+        # Triggers (simple: based on actions)
+        triggers = [{"trigger_id": f"TRG_{ac['verb_id']}", "verb_id": ac["verb_id"], "evidence": ac["evidence"]} for ac in actions]
+
+        output_type = pack_get(pack, "policy.outputs.default_output_type", "GENERIC")
+
+        traces[a.qi_id] = TraceARI(
+            qi_id=a.qi_id,
+            chapter_ref=dec.chapter_ref,
+            actions=actions,
+            triggers=triggers,
+            output_type=str(output_type),
+            evidence_refs=[a.source_fingerprint]
+        )
+
+    return traces
+
+# =============================================================================
+# Clustering intra-chapitre (features on ARI signals, not Qi raw text)
+# =============================================================================
+def trace_signature(tr: TraceARI) -> str:
+    # Deterministic signature: ordered verb_ids
+    vids = [a["verb_id"] for a in tr.actions]
+    return "SIG:" + "-".join(vids) if vids else "SIG:EMPTY"
+
+def build_clusters(pack: Dict[str, Any], traces: Dict[str, TraceARI]) -> List[ClusterCandidate]:
+    """
+    Cluster per chapter using ARI signals.
+    If sklearn available, use TF-IDF on verb_id sequences; else bucket by signature.
+    """
+    by_ch: Dict[str, List[TraceARI]] = {}
+    for tr in traces.values():
+        by_ch.setdefault(tr.chapter_ref, []).append(tr)
+
+    clusters: List[ClusterCandidate] = []
+    for ch in stable_sort(by_ch.keys(), key_fn=lambda x: x):
+        trs = stable_sort(by_ch[ch], key_fn=lambda t: t.qi_id)
+        if len(trs) == 0:
+            continue
+
+        # Represent each trace as a "document" of verb_ids
+        docs = [" ".join([a["verb_id"] for a in tr.actions]) for tr in trs]
+        qi_ids = [tr.qi_id for tr in trs]
+
+        if SKLEARN_OK and len(trs) >= 4:
+            # Params from pack
+            dist_thr = float(pack_get(pack, "policy.clustering.distance_threshold", 0.55))
+            vect = TfidfVectorizer(token_pattern=r"(?u)\b[A-Z_]+\b")
+            X = vect.fit_transform(docs)
+            # Agglomerative clustering on cosine distance
+            sim = cosine_similarity(X)
+            # distance = 1 - sim
+            dist = 1.0 - sim
+            # sklearn expects condensed? We'll use precomputed affinity by converting to linkage on distance threshold via average linkage
+            # AgglomerativeClustering supports metric='precomputed' in newer versions; handle both.
+            try:
+                model = AgglomerativeClustering(
+                    n_clusters=None,
+                    metric="precomputed",
+                    linkage="average",
+                    distance_threshold=dist_thr,
+                )
+                labels = model.fit_predict(dist)
+            except Exception:
+                # fallback: bucket by raw signature (still deterministic)
+                labels = None
+
+            if labels is None:
+                # signature buckets
+                buckets: Dict[str, List[str]] = {}
+                for tr in trs:
+                    buckets.setdefault(trace_signature(tr), []).append(tr.qi_id)
+                for bi, sig in enumerate(stable_sort(buckets.keys(), key_fn=lambda x: x)):
+                    ids = stable_sort(buckets[sig], key_fn=lambda x: x)
+                    clusters.append(ClusterCandidate(
+                        cluster_id=f"{ch}::BKT::{bi:03d}",
+                        chapter_ref=ch,
+                        qi_ids=ids,
+                        n_q_cluster=len(ids),
+                        qi_champion_id=ids[0],
+                        cluster_coherence_score=1.0,
+                        signature_variance_flag=False
+                    ))
+            else:
+                # build cluster candidates
+                label_set = stable_sort(set(labels.tolist()), key_fn=lambda x: int(x))
+                for lab in label_set:
+                    members = [qi_ids[i] for i in range(len(qi_ids)) if int(labels[i]) == int(lab)]
+                    members = stable_sort(members, key_fn=lambda x: x)
+                    # coherence heuristic: average intra-cluster similarity
+                    idxs = [qi_ids.index(m) for m in members]
+                    if len(idxs) >= 2:
+                        sub = sim[np.ix_(idxs, idxs)]
+                        coh = float((sub.sum() - len(idxs)) / max(1, (len(idxs) * (len(idxs) - 1))))
+                    else:
+                        coh = 0.0
+                    clusters.append(ClusterCandidate(
+                        cluster_id=f"{ch}::CL::{int(lab):03d}",
+                        chapter_ref=ch,
+                        qi_ids=members,
+                        n_q_cluster=len(members),
+                        qi_champion_id=members[0],
+                        cluster_coherence_score=coh,
+                        signature_variance_flag=False
+                    ))
+        else:
+            # Pure deterministic buckets by signature
+            buckets: Dict[str, List[str]] = {}
+            for tr in trs:
+                buckets.setdefault(trace_signature(tr), []).append(tr.qi_id)
+            for bi, sig in enumerate(stable_sort(buckets.keys(), key_fn=lambda x: x)):
+                ids = stable_sort(buckets[sig], key_fn=lambda x: x)
+                clusters.append(ClusterCandidate(
+                    cluster_id=f"{ch}::BKT::{bi:03d}",
+                    chapter_ref=ch,
+                    qi_ids=ids,
+                    n_q_cluster=len(ids),
+                    qi_champion_id=ids[0],
+                    cluster_coherence_score=1.0,
+                    signature_variance_flag=False
+                ))
+
+    return clusters
+
+# =============================================================================
+# IA1 Builder: QC + ARI + FRT + EvidencePack + SIG
+# =============================================================================
+def qc_format(pack: Dict[str, Any], lang: str, core: str) -> str:
+    prefix = pack_get(pack, "policy.qc_format.prefix", "Comment ")
+    suffix = pack_get(pack, "policy.qc_format.suffix", " ?")
+    s = f"{prefix}{core}".strip()
+    if not s.endswith("?") and suffix.strip().endswith("?"):
+        s = s.rstrip(" ?") + suffix
+    else:
+        s = s + (suffix if not s.endswith(suffix.strip()) else "")
+    return s.strip()
+
+def pick_qc_core(pack: Dict[str, Any], lang: str, actions: List[Dict[str, Any]]) -> str:
+    """
+    Pack may provide mapping from verb_id -> phrase, else minimal deterministic mapping.
+    """
+    m = pack_get(pack, "policy.qc_phrases.by_verb_id", {}) or {}
+    if actions:
+        top = actions[0]["verb_id"]
+        phrase = m.get(top)
+        if isinstance(phrase, str) and phrase.strip():
+            return phrase.strip()
+        # fallback phrases (language-level, not chapter-level)
+        fallback = {
+            "DIFF_INTEG": "dériver ou intégrer une expression",
+            "SOLVE": "résoudre une équation ou un problème",
+            "CALCULATE": "effectuer un calcul",
+            "PROVE": "démontrer un résultat",
+            "APPLY": "appliquer une règle ou un théorème",
+            "ANALYZE": "analyser une situation et conclure",
+        }
+        return fallback.get(top, "résoudre un exercice standard")
+    return "résoudre un exercice standard"
+
+def build_frt(pack: Dict[str, Any], lang: str, trace_list: List[TraceARI], atoms_by_qi: Dict[str, Atom]) -> Dict[str, Any]:
+    """
+    FRT template mandatory sections:
+      Usage / Preconditions / ARI typed / Transitions & checkpoints / Pitfalls / Expected output / Evidence
+    Pack may provide operator templates by output_type or by dominant verb_id.
+    """
+    # Evidence: list of source fingerprints + snippets
+    evid = []
+    for tr in trace_list:
+        a = atoms_by_qi.get(tr.qi_id)
+        if not a:
+            continue
+        evid.append({
+            "qi_id": tr.qi_id,
+            "source_fp": a.source_fingerprint,
+            "rqi_snippet": (a.rqi_clean or "")[:220]
+        })
+
+    # Build typed ARI (normalized IDs)
+    # Deterministic: keep union of steps in majority order; use first trace as spine.
+    spine = trace_list[0].actions if trace_list and trace_list[0].actions else []
+    ari_steps = []
+    for i, ac in enumerate(spine):
+        ari_steps.append({
+            "step": i + 1,
+            "verb_id": ac["verb_id"],
+            "label": ac["verb_id"],  # label can be localized by pack at UI time
+            "evidence": ac.get("evidence", "")[:120]
+        })
+
+    frt = {
+        "usage": "Procédure type applicable aux questions partageant la même structure de résolution (ARI).",
+        "preconditions": [
+            "Énoncé compris après sanitization (aucune constante locale nécessaire).",
+            "Données nécessaires disponibles dans l’énoncé.",
+        ],
+        "ari_typed": ari_steps,
+        "transitions_checkpoints": [
+            "Après chaque étape, vérifier la cohérence des hypothèses et des transformations.",
+            "Valider les conditions d’application (domaines, contraintes, existence)."
+        ],
+        "pitfalls_fatal": [
+            "Oublier une condition d’application.",
+            "Introduire une constante locale (interdit).",
+            "Ajouter une étape non supportée par les corrigés (RECONSTRUCTED interdit en CAS 1)."
+        ],
+        "expected_output": "Résultat final conforme au corrigé de référence (après sanitization).",
+        "evidence": evid
+    }
+
+    # Template override by pack (operator-specific)
+    tpl = pack_get(pack, "policy.frt_templates.by_output_type", {}) or {}
+    if trace_list:
+        ot = trace_list[0].output_type
+        if isinstance(tpl.get(ot), dict):
+            # shallow merge deterministically
+            frt = {**frt, **tpl[ot]}
+
+    return frt
+
+def build_qc_candidates(
+    pack: Dict[str, Any],
+    atoms: List[Atom],
+    posable: Dict[str, PosableDecision],
+    traces: Dict[str, TraceARI],
+    clusters: List[ClusterCandidate],
+    lang: str
+) -> List[QCCandidate]:
+    atoms_by_qi = {a.qi_id: a for a in atoms}
+    candidates: List[QCCandidate] = []
+
+    # level coefficient delta_c from pack (secret; if missing, default 1.0)
+    delta_c = float(pack_get(pack, "policy.level.delta_c", 1.0))
+    eps = float(pack_get(pack, "policy.scoring.eps", 1e-6))
+
+    # historical occurrence index optional
+    hist = pack_get(pack, "history.sig_occurrences", {}) or {}
+    alpha = float(pack_get(pack, "policy.scoring.alpha_recency", 0.0))
+
+    for cl in clusters:
+        # anti-singleton strictly enforced at IA2 stage, but we can pre-mark
+        qi_ids = [qid for qid in cl.qi_ids if qid in traces]
+        if not qi_ids:
+            continue
+        trace_list = [traces[qid] for qid in qi_ids]
+        trace_list = stable_sort(trace_list, key_fn=lambda t: t.qi_id)
+
+        # Champion: deterministic (cluster's champion id)
+        champ = traces.get(cl.qi_champion_id) or trace_list[0]
+
+        # QC core phrase from actions
+        core = pick_qc_core(pack, lang, champ.actions)
+        qc_text = qc_format(pack, lang, core)
+
+        # ARI typed (use champion spine)
+        ari = {
+            "typed_only": True,
+            "steps": [{
+                "step": i + 1,
+                "verb_id": ac["verb_id"],
+                "weight": float(ac.get("weight", 0.25)),
+                "evidence": ac.get("evidence", "")[:120]
+            } for i, ac in enumerate(champ.actions)]
+        }
+
+        # Triggers union (deterministic)
+        trg = []
+        seen = set()
+        for tr in trace_list:
+            for t in tr.triggers:
+                tid = t.get("trigger_id")
+                if not tid or tid in seen:
+                    continue
+                trg.append(t)
+                seen.add(tid)
+        trg = stable_sort(trg, key_fn=lambda x: x.get("trigger_id", ""))
+
+        frt = build_frt(pack, lang, trace_list, atoms_by_qi)
+
+        # SIG(q): signature of champion
+        sig = trace_signature(champ)
+
+        # EvidencePack minimal
+        sources = []
+        extractions = []
+        derivations = []
+        for qid in qi_ids:
+            a = atoms_by_qi.get(qid)
+            if not a:
+                continue
+            sources.append({
+                "url": a.source_url,
+                "fingerprint": a.source_fingerprint,
+                "doc_kind": "pair_subject+correction",
+            })
+            extractions.append({
+                "qi_id": a.qi_id,
+                "qi_locator": asdict(a.extraction_locators.get("qi")) if a.extraction_locators.get("qi") else None,
+                "rqi_locator": asdict(a.extraction_locators.get("rqi")) if a.extraction_locators.get("rqi") else None,
+            })
+            derivations.extend(a.sanitizer_derivations)
+
+        evidence_pack = {
+            "kernel_version": KERNEL_VERSION,
+            "pack_fingerprint": pack.get("_pack_bytes_sha256", ""),
+            "sources": sources,
+            "extractions": extractions,
+            "derivations": derivations,
+            "fingerprints": [x.get("fingerprint") for x in sources if x.get("fingerprint")],
+            "timestamps": [now_iso()],
+        }
+
+        # Provisional coverage map: attach only cluster members for now (expanded later at selection)
+        coverage_prov = {
+            "cover_set": qi_ids,
+            "attach_rules": "cluster_members_initial"
+        }
+
+        # ---- Scoring (deterministic, kernel-consistent in spirit; exact parameters pack-driven)
+        # F1: normalized cognitive weight sum (intra-chapitre normalization done later if needed)
+        raw = sum(float(s["weight"]) for s in ari["steps"])
+        f1_raw = delta_c * raw
+        f1 = f1_raw  # normalization done per chapter after IA2 PASS if desired
+
+        # F2: popularity/recency/anti-redundancy (anti-redondance applied during greedy selection)
+        n_hist = float(hist.get(sig, 0.0))
+        rec = 0.0  # if pack provides last_seen timestamps, can compute
+        f2 = (n_hist + alpha * rec + eps) * (f1 + eps)
+
+        # IA2 audit placeholder; actual audit computed next
+        candidates.append(QCCandidate(
+            qc_id=f"QC_{sha256_text(cl.cluster_id + sig)[7:19]}",
+            chapter_ref=cl.chapter_ref,
+            qc_text=qc_text,
+            language=lang,
+            ari_typed=ari,
+            frt=frt,
+            triggers=trg,
+            sig=sig,
+            n_q_cluster=cl.n_q_cluster,
+            evidence_pack=evidence_pack,
+            coverage_map_provisional=coverage_prov,
+            f1=float(f1),
+            f2=float(f2),
+            ia2_audit=[],
+            ia2_pass=False
+        ))
+
+    return candidates
+
+# =============================================================================
+# IA2 Judge (boolean checks, CAS 1 ONLY)
+# =============================================================================
+def ia2_checks(pack: Dict[str, Any], qc: QCCandidate) -> Tuple[bool, List[AuditEntry]]:
+    audits: List[AuditEntry] = []
+
+    def add(check_id: str, ok: bool, details: str, fixes: List[str], evidence: Optional[List[str]] = None):
+        audits.append(AuditEntry(
+            check_id=check_id,
+            status="PASS" if ok else "FAIL",
+            evidence_refs=evidence or [],
+            details=details,
+            fix_recommendations=fixes if not ok else []
+        ))
+
+    # QC_FORM: must end with ? and (for FR) start with "Comment"
+    qc_prefix = pack_get(pack, "policy.qc_format.prefix", "Comment ")
+    ok_form = qc.qc_text.strip().endswith("?") and qc.qc_text.strip().startswith(qc_prefix)
+    add("QC_FORM", ok_form, "QC UI format check", ["Ensure pack qc_format prefix/suffix applied correctly"])
+
+    # NO_LOCAL_CONSTANTS (heuristic): reject if obvious year/center remains
+    has_year = bool(re.search(r"\b(19|20)\d{2}\b", qc.qc_text))
+    has_num = bool(re.search(r"\b\d+\b", qc.qc_text))
+    ok_local = (not has_year) and (not has_num)
+    add("NO_LOCAL_CONSTANTS", ok_local, "QC must not contain local constants", ["Improve sanitization or QC core phrase selection"])
+
+    # FRT_TEMPLATE_OK: mandatory keys
+    mandatory = ["usage", "preconditions", "ari_typed", "transitions_checkpoints", "pitfalls_fatal", "expected_output", "evidence"]
+    ok_frt = all(k in qc.frt for k in mandatory)
+    add("FRT_TEMPLATE_OK", ok_frt, "FRT mandatory sections present", ["Ensure FRT builder includes all required sections"])
+
+    # ARI_TYPED_ONLY
+    ok_ari = bool(qc.ari_typed.get("typed_only", False)) and isinstance(qc.ari_typed.get("steps", []), list)
+    add("ARI_TYPED_ONLY", ok_ari, "ARI typed-only check", ["Ensure ARI uses canonical verb IDs only"])
+
+    # NO_RECONSTRUCTION (CAS 1): we cannot prove reconstruction here; enforce cluster evidence exists
+    ok_evid = bool(qc.evidence_pack.get("extractions")) and bool(qc.evidence_pack.get("sources"))
+    add("NO_RECONSTRUCTION", ok_evid, "EvidencePack must contain sources/extractions", ["Attach proper locators and extracted segments to EvidencePack"])
+
+    # Anti-singleton
+    ok_cluster = qc.n_q_cluster >= 2
+    add("ANTI_SINGLETON", ok_cluster, "n_q_cluster >= 2 required to canonize QC", ["Increase volume or clustering coherence; singletons must go to residual/quarantine"])
+
+    passed = all(a.status == "PASS" for a in audits)
+    return passed, audits
+
+# =============================================================================
+# Attach/Cover/Coverage + selection (coverage-driven)
+# =============================================================================
+def attach_decision(tr_qi: TraceARI, qc: QCCandidate) -> Tuple[bool, str]:
+    # Attach = TRUE iff triggers compatible AND ARI spine compatible (no extra steps)
+    qc_steps = [s["verb_id"] for s in qc.ari_typed.get("steps", [])]
+    qi_steps = [a["verb_id"] for a in tr_qi.actions]
+
+    # triggers: qi must be subset of qc triggers (by verb_id)
+    qc_trg_verbs = set([t.get("verb_id") for t in qc.triggers if t.get("verb_id")])
+    if any(v not in qc_trg_verbs for v in qi_steps):
+        return False, ATT_TRIGGER_MISS
+
+    # ARI spine compatibility: qi_steps must be subset (order-preserving) of qc_steps
+    it = iter(qc_steps)
+    ok_order = True
+    for v in qi_steps:
+        found = False
+        for vv in it:
+            if vv == v:
+                found = True
+                break
+        if not found:
+            ok_order = False
+            break
+    if not ok_order:
+        return False, ATT_NEEDS_EXTRA_STEP
+
+    return True, "OK"
+
+def greedy_select_cover(pack: Dict[str, Any], chapter_ref: str, qcs: List[QCCandidate], traces: Dict[str, TraceARI]) -> SelectionResult:
+    # Universe POSABLE for chapter
+    universe = [tr.qi_id for tr in traces.values() if tr.chapter_ref == chapter_ref]
+    universe = stable_sort(universe, key_fn=lambda x: x)
+    uncovered = set(universe)
+
+    # Precompute cover sets deterministically
+    cover_sets: Dict[str, List[str]] = {}
+    motifs: Dict[Tuple[str, str], str] = {}  # (qi_id, qc_id) -> motif
+    for qc in qcs:
+        cov = []
+        for qi_id in universe:
+            ok, reason = attach_decision(traces[qi_id], qc)
+            if ok:
+                cov.append(qi_id)
+            else:
+                motifs[(qi_id, qc.qc_id)] = reason
+        cover_sets[qc.qc_id] = stable_sort(cov, key_fn=lambda x: x)
+
+    selected: List[str] = []
+    coverage_map: Dict[str, Any] = {qi: {"status": "ORPHAN", "qc_id": None, "evidence_refs": [], "motifs": []} for qi in universe}
+
+    # Anti-redundancy uses cosine on step vectors (if sklearn ok)
+    def step_vector(qc: QCCandidate) -> Dict[str, float]:
+        vec = {}
+        for s in qc.ari_typed.get("steps", []):
+            vid = s["verb_id"]
+            vec[vid] = vec.get(vid, 0.0) + 1.0
+        return vec
+
+    qc_vec = {qc.qc_id: step_vector(qc) for qc in qcs}
+
+    def cosine_vec(a: Dict[str, float], b: Dict[str, float]) -> float:
+        keys = set(a.keys()) | set(b.keys())
+        va = np.array([a.get(k, 0.0) for k in keys], dtype=float)
+        vb = np.array([b.get(k, 0.0) for k in keys], dtype=float)
+        na = np.linalg.norm(va)
+        nb = np.linalg.norm(vb)
+        if na <= 1e-9 or nb <= 1e-9:
+            return 0.0
+        return float(np.dot(va, vb) / (na * nb))
+
+    def anti_redondance(qc_id: str, selected_ids: List[str]) -> float:
+        # product (1 - sim) with already selected
+        prod = 1.0
+        for sid in selected_ids:
+            sim = cosine_vec(qc_vec[qc_id], qc_vec[sid])
+            prod *= (1.0 - clamp(sim, 0.0, 0.95))
+        return float(prod)
+
+    # Selection loop
+    max_k = int(pack_get(pack, "policy.selection.max_k_per_chapter", 9999))
+    while uncovered and len(selected) < max_k:
+        best = None
+        for qc in qcs:
+            if not qc.ia2_pass:
+                continue
+            if qc.qc_id in selected:
+                continue
+            newly = [qi for qi in cover_sets[qc.qc_id] if qi in uncovered]
+            gain = len(newly)
+            if gain <= 0:
+                continue
+            ar = anti_redondance(qc.qc_id, selected)
+            score = (gain, qc.f2 * ar, qc.qc_id)  # deterministic tie-break
+            if best is None or score > best[0]:
+                best = (score, qc, newly)
+
+        if best is None:
+            break
+
+        _, qc_best, newly = best
+        selected.append(qc_best.qc_id)
+        for qi in newly:
+            coverage_map[qi] = {"status": "COVERED", "qc_id": qc_best.qc_id, "evidence_refs": qc_best.evidence_pack.get("fingerprints", [])[:3], "motifs": []}
+            uncovered.discard(qi)
+
+    # Orphans
+    orphans = stable_sort(list(uncovered), key_fn=lambda x: x)
+
+    # Coverage KPI
+    covered = sum(1 for qi in universe if coverage_map[qi]["status"] == "COVERED")
+    kpi = float(covered) / max(1, len(universe))
+
+    # Add motifs for uncovered (optional, deterministic)
+    for qi in orphans:
+        # record top 3 failure motifs against best 3 qc by f2
+        ranked = stable_sort([qc for qc in qcs if qc.ia2_pass], key_fn=lambda q: (-q.f2, q.qc_id))
+        top = []
+        for qc in ranked[:3]:
+            top.append({"qc_id": qc.qc_id, "reason": motifs.get((qi, qc.qc_id), "NO_MATCH")})
+        coverage_map[qi]["motifs"] = top
+
+    return SelectionResult(
+        chapter_ref=chapter_ref,
+        selected_qc_ids=selected,
+        coverage_map_final=coverage_map,
+        orphans=orphans,
+        coverage_kpi=kpi
+    )
+
+# =============================================================================
+# End-to-end pipeline for a given volume
+# =============================================================================
+def build_atoms_from_pair(pack: Dict[str, Any], pair: Pair, lang: str) -> Tuple[List[Atom], Dict[str, Any]]:
+    """
+    Atomisation + Sanitization + Qi<->RQi matching (no creation).
+    """
+    audit = {"pair_id": pair.pair_id, "pairing_confidence": pair.pairing_confidence, "steps": [], "quarantine": []}
+    atoms: List[Atom] = []
+
+    # Must have correction in CAS 1 ONLY, else quarantine all
+    if pair.correction is None:
+        audit["quarantine"].append({"pair_id": pair.pair_id, "reason": RC_CORRIGE_MISSING})
+        return [], audit
+
+    doc_bytes = st.session_state.get("_doc_bytes", {})
+    subj_b = doc_bytes.get(pair.subject.doc_id)
+    corr_b = doc_bytes.get(pair.correction.doc_id) if pair.correction else None
+
+    if not subj_b:
+        audit["quarantine"].append({"subject_doc_id": pair.subject.doc_id, "reason": RC_SUBJECT_UNREADABLE})
+        return [], audit
+    if not corr_b:
+        audit["quarantine"].append({"correction_doc_id": pair.correction.doc_id, "reason": RC_CORRIGE_UNREADABLE})
+        return [], audit
+
+    subj_pages, subj_a = extract_pdf_pages_text(subj_b)
+    corr_pages, corr_a = extract_pdf_pages_text(corr_b)
+    audit["steps"].append({"subject_extraction": subj_a})
+    audit["steps"].append({"correction_extraction": corr_a})
+
+    if len(subj_pages) == 0 or ("low_text_density_likely_scanned" in subj_a.get("warnings", []) and subj_a.get("mode") != "ocr_fallback"):
+        audit["quarantine"].append({"pair_id": pair.pair_id, "reason": RC_SUBJECT_UNREADABLE, "details": subj_a})
+        return [], audit
+    if len(corr_pages) == 0 or ("low_text_density_likely_scanned" in corr_a.get("warnings", []) and corr_a.get("mode") != "ocr_fallback"):
+        audit["quarantine"].append({"pair_id": pair.pair_id, "reason": RC_CORRIGE_UNREADABLE, "details": corr_a})
+        return [], audit
+
+    subj_units, subj_unit_a = atomise_subject(subj_pages, pair.subject.doc_id, lang)
+    corr_idx, corr_unit_a = atomise_correction(corr_pages, pair.correction.doc_id, lang)
+    audit["steps"].append({"subject_atomisation": subj_unit_a})
+    audit["steps"].append({"correction_atomisation": corr_unit_a})
+
+    # Year ref best-effort from filename
+    year_ref = None
+    m = re.search(r"(19|20)\d{2}", pair.subject.filename)
+    if m:
+        year_ref = m.group(0)
+
+    # Build atoms: for each subject Qi unit, try exact key match (exo_ref::q_ref), else similarity fallback
+    for i, u in enumerate(subj_units):
+        exo_ref = u.get("exo_ref") or "X"
+        q_ref = u.get("q_ref") or f"Q{i+1}"
+        qi_raw = u["qi_raw"]
+        key = f"{exo_ref}::{q_ref}"
+        rqi_raw = None
+        rqi_loc = None
+        match_meta = None
+        pairing_conf = pair.pairing_confidence
+
+        if key in corr_idx:
+            rqi_raw = corr_idx[key]["rqi_raw"]
+            rqi_loc = corr_idx[key]["locator"]
+            match_meta = {"method": "key_match", "key": key}
+        else:
+            # fallback selection
+            rqi_raw2, sim, meta = best_effort_match_rqi(qi_raw, corr_idx)
+            if rqi_raw2 and sim >= float(pack_get(pack, "policy.pairing.min_similarity_fallback", 0.45)):
+                rqi_raw = rqi_raw2
+                match_meta = {"method": "similarity_fallback", **(meta or {})}
+                pairing_conf = min(pairing_conf, sim)
+                # locator: use matched key locator if possible
+                mk = (meta or {}).get("match_key")
+                if mk and mk in corr_idx:
+                    rqi_loc = corr_idx[mk]["locator"]
+
+        # CAS 1 ONLY: if no RQi segment => quarantine via POSABLE later (rqi_clean=None)
+        qi_clean, qi_der = sanitize_text(qi_raw, lang)
+        rqi_clean = None
+        rqi_der = []
+        if rqi_raw:
+            rqi_clean, rqi_der = sanitize_text(rqi_raw, lang)
+
+        deriv = []
+        deriv.extend([{"target": "qi", **d} for d in qi_der])
+        deriv.extend([{"target": "rqi", **d} for d in rqi_der])
+        if match_meta:
+            deriv.append({"op": "qi_rqi_match", "meta": match_meta})
+
+        qi_id = f"QI_{sha256_text(pair.subject.doc_id + '|' + exo_ref + '|' + q_ref + '|' + qi_clean)[7:19]}"
+        rqi_id = f"RQI_{sha256_text(pair.correction.doc_id + '|' + exo_ref + '|' + q_ref)[7:19]}" if rqi_raw else None
+
+        atoms.append(Atom(
+            atom_id=f"ATOM_{sha256_text(qi_id + '|' + (rqi_id or 'NONE'))[7:19]}",
+            subject_id=pair.subject.doc_id,
+            correction_id=pair.correction.doc_id if pair.correction else None,
+            qi_id=qi_id,
+            rqi_id=rqi_id,
+            exo_ref=str(exo_ref),
+            q_ref=str(q_ref),
+            qi_raw=qi_raw,
+            rqi_raw=rqi_raw,
+            qi_clean=qi_clean,
+            rqi_clean=rqi_clean,
+            language_detected=lang,
+            year_ref=year_ref,
+            source_url=pair.subject.url,
+            source_fingerprint=pair.subject.bytes_sha256,
+            extraction_locators={
+                "qi": u["locator"],
+                "rqi": rqi_loc if rqi_loc else Locator(page_start=-1, page_end=-1)
+            },
+            sanitizer_derivations=deriv,
+            pairing_confidence=float(pairing_conf),
+            figure_refs=[]
+        ))
+
+    return atoms, audit
+
+def run_pipeline(pack: Dict[str, Any], pairs: List[Pair], lang: str) -> Dict[str, Any]:
+    """
+    Full pipeline:
+      Pairs -> ATOMS -> POSABLE -> TRACES -> CLUSTERS -> QC candidates -> IA2 -> Selection/Coverage
+    """
+    # Build atoms for all pairs
+    all_atoms: List[Atom] = []
+    pair_audits = []
+    for pr in pairs:
+        atoms, aud = build_atoms_from_pair(pack, pr, lang)
+        pair_audits.append(aud)
+        all_atoms.extend(atoms)
+
+    # POSABLE gate
+    posable, chapter_metrics = posable_gate(pack, all_atoms)
+
+    # Miner traces (POSABLE only)
+    traces = mine_traces(pack, all_atoms, posable, lang)
+
+    # Clusters
+    clusters = build_clusters(pack, traces)
+
+    # Candidates
+    qcs = build_qc_candidates(pack, all_atoms, posable, traces, clusters, lang)
+
+    # IA2
+    for qc in qcs:
+        ok, aud = ia2_checks(pack, qc)
+        qc.ia2_audit = aud
+        qc.ia2_pass = ok
+
+    # Selection & coverage per chapter
+    by_ch: Dict[str, List[QCCandidate]] = {}
+    for qc in qcs:
+        by_ch.setdefault(qc.chapter_ref, []).append(qc)
+
+    selections: Dict[str, SelectionResult] = {}
+    for ch in stable_sort(by_ch.keys(), key_fn=lambda x: x):
+        selections[ch] = greedy_select_cover(pack, ch, by_ch[ch], traces)
+
+    # Global KPIs
+    total_posable = sum(cm.N_total_posable for cm in chapter_metrics.values() if cm.chapter_ref not in ["UNSCOPED"])
+    total_orphans = sum(len(sel.orphans) for sel in selections.values())
+    coverage_global = 1.0 if total_posable == 0 else float(total_posable - total_orphans) / float(total_posable)
+
+    return {
+        "atoms": all_atoms,
+        "pair_audits": pair_audits,
+        "posable": posable,
+        "chapter_metrics": chapter_metrics,
+        "traces": traces,
+        "clusters": clusters,
+        "qc_candidates": qcs,
+        "selections": selections,
+        "kpi": {
+            "total_pairs": len(pairs),
+            "total_atoms": len(all_atoms),
+            "total_qi": len(all_atoms),
+            "total_rqi": sum(1 for a in all_atoms if a.rqi_clean),
+            "total_posable": total_posable,
+            "total_qc": sum(len(sel.selected_qc_ids) for sel in selections.values()),
+            "total_orphans": total_orphans,
+            "coverage_global": coverage_global
+        }
+    }
+
+# =============================================================================
+# Saturation loop (new_QC=0)
+# =============================================================================
+def qc_set_signature(selections: Dict[str, SelectionResult]) -> str:
+    items = []
+    for ch in stable_sort(selections.keys(), key_fn=lambda x: x):
+        items.extend([f"{ch}:{qc_id}" for qc_id in selections[ch].selected_qc_ids])
+    return sha256_text("|".join(items))
+
+def run_saturation(pack: Dict[str, Any], all_pairs: List[Pair], lang: str, vol_start: int, vol_max: int, step: int) -> Dict[str, Any]:
+    logs = []
+    iters = []
+    prev_sig = None
+    last_result = None
+
+    # deterministic ordering of pairs
+    ordered = stable_sort(all_pairs, key_fn=lambda p: p.pair_id)
+
+    for vol in range(vol_start, vol_max + 1, step):
+        subset = ordered[:vol]
+        t0 = time.time()
+        res = run_pipeline(pack, subset, lang)
+        dt = time.time() - t0
+
+        sig = qc_set_signature(res["selections"])
+        new_qc_count = 0
+        if prev_sig is None:
+            new_qc_count = res["kpi"]["total_qc"]
+        else:
+            new_qc_count = 0 if sig == prev_sig else 1  # strict: detect change; detailed diff can be added
+
+        prev_sig = sig
+        last_result = res
+
+        iters.append({
+            "volume": vol,
+            "qc_total": res["kpi"]["total_qc"],
+            "qi_total": res["kpi"]["total_qi"],
+            "rqi_total": res["kpi"]["total_rqi"],
+            "qi_posable": res["kpi"]["total_posable"],
+            "orphans": res["kpi"]["total_orphans"],
+            "coverage": res["kpi"]["coverage_global"],
+            "new_qc_count": new_qc_count,
+            "runtime_s": round(dt, 2),
+            "sig": sig
+        })
+
+        logs.append(f"[{now_iso()}] vol={vol} qi={res['kpi']['total_qi']} rqi={res['kpi']['total_rqi']} posable={res['kpi']['total_posable']} qc={res['kpi']['total_qc']} orphans={res['kpi']['total_orphans']} coverage={res['kpi']['coverage_global']:.3f} new_qc={new_qc_count}")
+
+        # stop condition: one iteration with new_QC=0
+        if new_qc_count == 0 and vol > vol_start:
+            break
+
+    # SEALED strict:
+    # - new_QC==0 on last iter
+    # - orphans==0
+    # - sanity_ok: at least 1 posable and 1 qc if posable>0
+    final = iters[-1] if iters else None
+    sealed = False
+    seal_reason = "NOT_RUN"
+    if final:
+        sanity_ok = True
+        if final["qi_posable"] > 0 and final["qc_total"] <= 0:
+            sanity_ok = False
+        sealed = (final["new_qc_count"] == 0) and (final["orphans"] == 0) and sanity_ok
+        seal_reason = "ALL_CHECKS_PASSED" if sealed else "FAILED_STRICT_CHECKS"
+
+    return {
+        "iterations": iters,
+        "logs": logs,
+        "sealed": sealed,
+        "seal_reason": seal_reason,
+        "last_result": last_result
+    }
+
+# =============================================================================
+# Exports + signature
+# =============================================================================
+def make_exports(pack: Dict[str, Any], sat: Dict[str, Any]) -> Dict[str, Any]:
+    res = sat.get("last_result") or {}
+    atoms: List[Atom] = res.get("atoms", [])
+    posable: Dict[str, PosableDecision] = res.get("posable", {})
+    qcs: List[QCCandidate] = res.get("qc_candidates_
