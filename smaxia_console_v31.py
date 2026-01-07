@@ -104,6 +104,7 @@ RC_SCOPE_CONFLICT = "RC_SCOPE_CONFLICT"
 RC_SCOPE_OUTSIDE_PACK = "RC_SCOPE_OUTSIDE_PACK"
 
 RC_NOT_A_QUESTION = "RC_NOT_A_QUESTION"
+RC_NOT_EVALUABLE = RC_NOT_A_QUESTION  # alias toléré (audit externe)
 RC_DEPENDENCY_MISSING_CONTEXT = "RC_DEPENDENCY_MISSING_CONTEXT"
 RC_NON_DETERMINISTIC_STATEMENT = "RC_NON_DETERMINISTIC_STATEMENT"
 
@@ -1178,10 +1179,46 @@ def compute_f1(pack: Dict[str, Any], qc: QC, cognitive_weights: Dict[str, float]
     return psi_raw, psi_raw  # normalisation done later
 
 def compute_similarity_sigma(q1: QC, q2: QC) -> float:
-    # σ in [0,1] using cosine-like Jaccard over action spine
-    a1 = [s.step_id for s in q1.ari.steps]
-    a2 = [s.step_id for s in q2.ari.steps]
-    return cosine_like_from_jaccard(jaccard(a1, a2))
+    """σ(q,p) — Similarité cosinus sur embeddings ARI normalisé (Kernel §2.2).
+
+    Implémentation déterministe sans dépendances externes:
+    - embedding sparse = vecteur {step_id: weight} issu de l'ARI typé.
+    - cosine(v,w) = dot(v,w) / (||v||·||w||).
+    """
+    wa: Dict[str, float] = {}
+    wb: Dict[str, float] = {}
+
+    for s in q1.ari.steps:
+        sid = str(s.step_id).strip()
+        if sid:
+            wa[sid] = wa.get(sid, 0.0) + float(getattr(s, "weight", 0.0) or 0.0)
+
+    for s in q2.ari.steps:
+        sid = str(s.step_id).strip()
+        if sid:
+            wb[sid] = wb.get(sid, 0.0) + float(getattr(s, "weight", 0.0) or 0.0)
+
+    if not wa or not wb:
+        return 0.0
+
+    dot = 0.0
+    for sid, va in wa.items():
+        vb = wb.get(sid)
+        if vb is not None:
+            dot += va * vb
+
+    na = math.sqrt(sum(v * v for v in wa.values()))
+    nb = math.sqrt(sum(v * v for v in wb.values()))
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+
+    sigma = dot / (na * nb)
+    if sigma < 0.0:
+        sigma = 0.0
+    elif sigma > 1.0:
+        sigma = 1.0
+    return float(sigma)
+
 
 def load_history_index(path: str) -> Dict[str, Dict[str, Any]]:
     if os.path.exists(path):
