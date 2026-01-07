@@ -45,7 +45,18 @@ import streamlit as st
 
 # PDF / images
 import pdfplumber
-from pypdf import PdfReader
+# PDF reader (avoid hard dependency on pypdf in Streamlit Cloud)
+try:
+    from pypdf import PdfReader  # type: ignore
+    _PDF_READER_IMPL = "pypdf"
+except Exception:  # pragma: no cover
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+        _PDF_READER_IMPL = "PyPDF2"
+    except Exception:  # pragma: no cover
+        PdfReader = None  # type: ignore
+        _PDF_READER_IMPL = "none"
+
 from PIL import Image
 
 # HTML parsing
@@ -447,8 +458,10 @@ class DocText:
     text_sha256: str
 
 def pdf_text_first(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
-    meta = {"engine": "pdfplumber+pypdf"}
+    meta: Dict[str, Any] = {"engine": f"pdfplumber+{_PDF_READER_IMPL}", "pdf_reader_impl": _PDF_READER_IMPL}
     text_parts: List[str] = []
+
+    # [1] TEXT-FIRST via pdfplumber (best when PDF has embedded text)
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for i, page in enumerate(pdf.pages):
@@ -458,15 +471,18 @@ def pdf_text_first(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
     except Exception as e:
         meta["pdfplumber_error"] = str(e)[:300]
 
-    # pypdf as backup to capture text in some PDFs
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        for i, page in enumerate(reader.pages):
-            t = page.extract_text() or ""
-            if t.strip():
-                text_parts.append(f"\n\n--- PAGE {i+1} (pypdf) ---\n{t}")
-    except Exception as e:
-        meta["pypdf_error"] = str(e)[:300]
+    # Optional secondary text extraction via PdfReader (environment-dependent)
+    if PdfReader is not None:
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            for i, page in enumerate(getattr(reader, "pages", [])):
+                t = (page.extract_text() or "") if page is not None else ""
+                if t.strip():
+                    text_parts.append(f"\n\n--- PAGE {i+1} ({_PDF_READER_IMPL}) ---\n{t}")
+        except Exception as e:
+            meta["pdf_reader_error"] = str(e)[:300]
+    else:
+        meta["pdf_reader_missing"] = True
 
     text = norm_ws("\n".join(text_parts))
     meta["text_chars"] = len(text)
@@ -1689,7 +1705,7 @@ def build_qc_for_chapter(pack: Dict[str, Any], chapter_ref: str, atoms: List[Ato
     N_total = len(universe)
 
     for qc in qcs:
-        aud = ia2_checks(pack, chapter_ref, qc, universe_qi_ids=universe, N_total=N_total, ocr_context_refs=[])
+        aud = ia2_checks(pack, chapter_ref, qc, universe_qi_ids=universe, N_total=N_total, ocr_context_refs=ocr_context_refs)
         audits.append(aud)
 
     # Keep only IA2 PASS for scoring/selection
