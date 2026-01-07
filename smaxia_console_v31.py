@@ -1,6 +1,6 @@
 
 # =============================================================================
-# SMAXIA GTE Console V31.10.22 (ISO-PROD — Kernel V10.6.2)
+# SMAXIA GTE Console V31.10.23 (ISO-PROD — Kernel V10.6.2)
 # =============================================================================
 # OBJECTIF (TEST = PROD-MIRROR):
 # - Exécuter la chaîne complète "Extract Not Create" sur couples Sujet+Corrigé.
@@ -44,18 +44,10 @@ import requests
 import streamlit as st
 
 # PDF / images
-import pdfplumber
-# PDF reader (avoid hard dependency on pypdf in Streamlit Cloud)
-try:
-    from pypdf import PdfReader  # type: ignore
-    _PDF_READER_IMPL = "pypdf"
-except Exception:  # pragma: no cover
-    try:
-        from PyPDF2 import PdfReader  # type: ignore
-        _PDF_READER_IMPL = "PyPDF2"
-    except Exception:  # pragma: no cover
-        PdfReader = None  # type: ignore
-        _PDF_READER_IMPL = "none"
+# PDF reader (not required): TEXT-FIRST uses pdfplumber (pdfminer.six).
+PdfReader = None  # type: ignore  # kept for compatibility (unused)
+_PDF_READER_IMPL = "pdfplumber"
+
 
 from PIL import Image
 
@@ -68,7 +60,7 @@ from bs4 import BeautifulSoup
 # =============================================================================
 
 KERNEL_VERSION = "V10.6.2"
-APP_VERSION = "V31.10.22"
+APP_VERSION = "V31.10.23"
 
 # Kernel-scoped constant (sealed)
 EPSILON = 0.1
@@ -733,128 +725,165 @@ def fetch_url_bytes(url: str, timeout: int = 40) -> Tuple[bytes, str]:
     return r.content, ct
 
 def harvest_pairs_from_pack(pack: Dict[str, Any], selected_years: List[int], max_pairs: int) -> Tuple[List[PairItem], List[str]]:
-    """
-    Minimal harvester: uses pack.harvest.roots[] to crawl and pair subject/correction
-    by pack.harvest.pairing_regexes or filename heuristics.
+    """Pack-driven harvester (robust).
+
+    Goals:
+    - No domain hardcode in code.
+    - Works with generic HTML pages that list documents.
+    - Supports root templates with {year} expanded from selected_years.
+
+    Strategy:
+    1) Expand roots (templates) for each selected year (or a single pass if no years).
+    2) Crawl each expanded root (HTML) and collect candidate links (URL + anchor text).
+    3) Classify candidates into SUBJECT vs CORRECTION using pack regexes.
+    4) Pair globally (across all roots) using token overlap + optional year agreement.
+
+    Notes:
+    - We intentionally accept links without .pdf extension (e.g., CMS download endpoints) and let later fetch detect mime.
     """
     logs: List[str] = []
     roots = pack_get(pack, "harvest.roots", []) or []
     if not roots:
         return [], ["Pack missing harvest.roots"]
 
-    # pairing rules (pack-driven)
     subj_regexes = pack_get(pack, "harvest.subject_regexes", []) or []
     corr_regexes = pack_get(pack, "harvest.correction_regexes", []) or []
     year_regex = pack_get(pack, "harvest.year_regex", r"(20\d{2})")
+    min_pair_conf = float(pack_get(pack, "harvest.min_pairing_confidence", 0.25))
+    max_links_per_root = safe_int(pack_get(pack, "harvest.max_links_per_root", 2500), 2500)
 
-    def extract_year(name: str) -> Optional[int]:
-        m = re.search(year_regex, name)
+    def extract_year(s: str) -> Optional[int]:
+        m = re.search(year_regex, s or "")
         if not m:
             return None
         y = safe_int(m.group(1), 0)
         return y if y else None
 
-    def is_subject_name(name: str) -> bool:
+    def norm_tokens(s: str) -> List[str]:
+        return re.findall(r"[a-z0-9]+", (s or "").lower())
+
+    def is_subject(label: str) -> bool:
         if subj_regexes:
-            return any(re.search(rx, name, flags=re.IGNORECASE) for rx in subj_regexes)
-        # fallback heuristic (not métier-specific)
-        return "corrig" not in name.lower()
+            return any(re.search(rx, label, flags=re.IGNORECASE) for rx in subj_regexes)
+        # fallback: not a correction
+        return not is_correction(label)
 
-    def is_correction_name(name: str) -> bool:
+    def is_correction(label: str) -> bool:
         if corr_regexes:
-            return any(re.search(rx, name, flags=re.IGNORECASE) for rx in corr_regexes)
-        return "corrig" in name.lower()
+            return any(re.search(rx, label, flags=re.IGNORECASE) for rx in corr_regexes)
+        return bool(re.search(r"corrig|correction", label, flags=re.IGNORECASE))
 
-    pairs: List[PairItem] = []
-    quarantines: List[str] = []
-
-    # Crawl each root (HTML)
-    for root in roots:
-        if not is_url(root):
-            quarantines.append(f"Invalid root URL: {root}")
+    # Expand roots (templates)
+    expanded_roots: List[str] = []
+    years = [int(y) for y in selected_years] if selected_years else []
+    for r0 in roots:
+        if not is_url(str(r0)):
+            logs.append(f"[HARVEST_QUARANTINE] Invalid root URL: {r0}")
             continue
+        r0s = str(r0)
+        if "{year}" in r0s and years:
+            for y in years:
+                expanded_roots.append(r0s.replace("{year}", str(y)))
+        else:
+            expanded_roots.append(r0s)
+
+    # Collect candidates
+    candidates: List[Tuple[str, str, Optional[int], str]] = []  # (url, label, year, root)
+    for root in expanded_roots:
         logs.append(f"[HARVEST] root={root}")
         try:
             html_bytes, ct = fetch_url_bytes(root)
             if ct != "text/html":
-                quarantines.append(f"Root not HTML: {root} (ct={ct})")
+                logs.append(f"[HARVEST_SKIP] Root not HTML: {root} (ct={ct})")
                 continue
+
             soup = BeautifulSoup(html_bytes.decode("utf-8", errors="ignore"), "html.parser")
-            links = []
+            n = 0
             for a in soup.find_all("a"):
                 href = a.get("href")
                 if not href:
                     continue
                 u = urljoin(root, href)
-                p = urlparse(u).path.lower()
-                # accept pdf/html/images
-                if any(p.endswith(ext) for ext in (".pdf", ".html", ".htm", ".png", ".jpg", ".jpeg")):
-                    links.append(u)
-
-            # Group by year if possible
-            items = []
-            for u in links:
-                name = os.path.basename(urlparse(u).path)
-                y = extract_year(name) or extract_year(u)
-                if selected_years and (y is None or y not in selected_years):
+                if not is_url(u):
                     continue
-                items.append((u, name, y))
 
-            subjects = [it for it in items if is_subject_name(it[1])]
-            corrections = [it for it in items if is_correction_name(it[1])]
+                # label combines anchor text and basename (many CMS links hide filename)
+                anchor_text = norm_ws(a.get_text(" ") or "")
+                base = os.path.basename(urlparse(u).path) or ""
+                label = (anchor_text + " " + base).strip() or u
 
-            # Pairing: best match by shared tokens (deterministic)
-            for su, sname, sy in subjects:
-                # choose correction that shares maximal token overlap and same year if present
-                stoks = set(re.findall(r"[a-z0-9]+", sname.lower()))
-                best = None
-                best_score = -1.0
-                for cu, cname, cy in corrections:
-                    if sy and cy and sy != cy:
-                        continue
-                    ctoks = set(re.findall(r"[a-z0-9]+", cname.lower()))
-                    overlap = len(stoks & ctoks)
-                    score = overlap / max(1, len(stoks))
-                    if score > best_score:
-                        best_score = score
-                        best = (cu, cname, cy)
-                if best and best_score >= float(pack_get(pack, "harvest.min_pairing_confidence", 0.25)):
-                    cu, cname, cy = best
-                    pair_id = f"PAIR_{uuid.uuid4().hex[:12]}"
-                    pairs.append(PairItem(
-                        pair_id=pair_id,
-                        subject_url=su,
-                        correction_url=cu,
-                        year=sy or cy,
-                        meta={"subject_name": sname, "correction_name": cname, "root": root},
-                        pairing_confidence=float(best_score),
-                    ))
-                else:
-                    quarantines.append(f"{RC_CORRIGE_MISSING}: no correction match for {sname}")
+                y = extract_year(label) or extract_year(u)
+                if years and (y is None or y not in years):
+                    continue
 
-            if len(pairs) >= max_pairs:
-                break
+                candidates.append((u, label, y, root))
+                n += 1
+                if n >= max_links_per_root:
+                    break
+
+            logs.append(f"[HARVEST] root_candidates={n}")
 
         except Exception as e:
-            quarantines.append(f"[HARVEST_ERROR] {root}: {str(e)[:200]}")
+            logs.append(f"[HARVEST_ERROR] {root}: {str(e)[:200]}")
 
-    # Deterministic trimming
+    if not candidates:
+        logs.append("[HARVEST] No candidates collected")
+        return [], logs
+
+    # Split subjects vs corrections
+    subjects = [(u, label, y, r) for (u, label, y, r) in candidates if is_subject(label) and not is_correction(label)]
+    corrections = [(u, label, y, r) for (u, label, y, r) in candidates if is_correction(label)]
+
+    logs.append(f"[HARVEST] subjects={len(subjects)} corrections={len(corrections)}")
+
+    if not subjects or not corrections:
+        # Still return empty pairs but with actionable logs
+        if not subjects:
+            logs.append("[HARVEST] No SUBJECT candidates (check harvest.subject_regexes in pack)")
+        if not corrections:
+            logs.append("[HARVEST] No CORRECTION candidates (check harvest.correction_regexes in pack)")
+        return [], logs
+
+    corr_tokens = [(set(norm_tokens(label)), u, label, y) for (u, label, y, _) in corrections]
+
+    pairs: List[PairItem] = []
+    for su, slabel, sy, _root in subjects:
+        stoks = set(norm_tokens(slabel))
+        if not stoks:
+            continue
+        best = None
+        best_score = -1.0
+        for ctoks, cu, clabel, cy in corr_tokens:
+            if sy and cy and sy != cy:
+                continue
+            overlap = len(stoks & ctoks)
+            score = overlap / max(1, len(stoks))
+            if score > best_score:
+                best_score = score
+                best = (cu, clabel, cy)
+
+        if best and best_score >= min_pair_conf:
+            cu, clabel, cy = best
+            pair_id = f"PAIR_{uuid.uuid4().hex[:12]}"
+            pairs.append(PairItem(
+                pair_id=pair_id,
+                subject_url=su,
+                correction_url=cu,
+                year=sy or cy,
+                meta={"subject_label": slabel, "correction_label": clabel},
+                pairing_confidence=float(best_score),
+            ))
+
+        if len(pairs) >= max_pairs:
+            break
+
+    # Deterministic ordering and trimming
     pairs = sorted(pairs, key=lambda p: (p.year or 0, -p.pairing_confidence, p.pair_id))[:max_pairs]
     logs.append(f"[HARVEST] pairs={len(pairs)}")
-    return pairs, logs + quarantines
+    if not pairs:
+        logs.append("[HARVEST] No pairs built (increase min_pairing_confidence or refine regexes)")
 
-
-# =============================================================================
-# Atomisation: Qi/RQi extraction (multi-strategy, deterministic, no invention)
-# =============================================================================
-
-_QI_SPLIT_PATTERNS = [
-    r"(?m)^\s*(?:Question|Q)\s*\d+\s*[:.)-]\s+",
-    r"(?m)^\s*\d+\s*[\).]\s+",
-    r"(?m)^\s*\(\s*[a-z]\s*\)\s+",
-    r"(?m)^\s*[a-z]\)\s+",
-    r"(?m)^\s*[•\-]\s+",
-]
+    return pairs, logs
 
 def split_into_segments(text: str, max_segments: int = 120) -> List[Tuple[str, Tuple[int,int]]]:
     """
@@ -1607,6 +1636,8 @@ def build_atoms_for_pair(pack: Dict[str, Any], pair: PairItem, evidence: Dict[st
             pairing_confidence=float(conf),
             figure_refs=[],
         )
+        # Attach OCR evidence refs (required by OCR V10.6.2): propagate to IA2 audit context
+        atom.sanitizer_derivations.append({"op": "ocr_context", "ocr_evidence_refs": list(ocr_evidence_refs)})
 
         # Attach POSABLE decision to evidence
         evidence_ref = f"EV_POSABLE:{qi_id}"
@@ -1630,7 +1661,7 @@ def build_atoms_for_pair(pack: Dict[str, Any], pair: PairItem, evidence: Dict[st
     return atoms, sorted(set(quarantine_rc)), ocr_evidence_refs
 
 
-def build_qc_for_chapter(pack: Dict[str, Any], chapter_ref: str, atoms: List[Atom], evidence: Dict[str, Any], history_index: Dict[str, Any]) -> Tuple[List[QC], List[IA2AuditLog]]:
+def build_qc_for_chapter(pack: Dict[str, Any], chapter_ref: str, atoms: List[Atom], evidence: Dict[str, Any], history_index: Dict[str, Any], ocr_context_refs: List[str]) -> Tuple[List[QC], List[IA2AuditLog]]:
     cognitive_weights = load_cognitive_table(pack)
     alpha = float(pack_get(pack, "policy.alpha", 0.0))
     delta_matrix = pack_get(pack, "policy.delta_c", {}) or {}
@@ -1752,7 +1783,7 @@ def build_qc_for_chapter(pack: Dict[str, Any], chapter_ref: str, atoms: List[Ato
     return qcs_pass, audits_pass
 
 
-def run_gte(pack: Dict[str, Any], years: List[int], max_pairs: int, vol_start: int, vol_max: int, step: int, top_k_per_chapter: int) -> Dict[str, Any]:
+def run_gte(pack: Dict[str, Any], years: List[int], max_pairs: int, vol_start: int, vol_max: int, step: int, top_k_per_chapter: int, override_pairs: Optional[List[PairItem]] = None) -> Dict[str, Any]:
     # EvidencePack skeleton (matches user JSON key set, extended)
     evidence_pack = {
         "version": APP_VERSION,
@@ -1782,8 +1813,14 @@ def run_gte(pack: Dict[str, Any], years: List[int], max_pairs: int, vol_start: i
     }
 
     logs: List[str] = []
-    pairs, harvest_logs = harvest_pairs_from_pack(pack, selected_years=years, max_pairs=max_pairs)
-    logs.extend(harvest_logs)
+    
+    logs: List[str] = []
+    if override_pairs is not None and len(override_pairs) > 0:
+        pairs = override_pairs
+        logs.append('[HARVEST] override_pairs used')
+    else:
+        pairs, harvest_logs = harvest_pairs_from_pack(pack, selected_years=years, max_pairs=max_pairs)
+        logs.extend(harvest_logs)
 
     # History index storage (deterministic local file)
     hist_path = pack_get(pack, "policy.history_index_path", "historical_index.json")
@@ -1816,22 +1853,34 @@ def run_gte(pack: Dict[str, Any], years: List[int], max_pairs: int, vol_start: i
                 quarantine.append({"pair_id": p.pair_id, "reason_codes": qrc})
             atoms_this.extend(a)
 
-        # Group atoms by chapter_ref (read from derivations in atom.sanitizer_derivations)
+        # Group atoms by chapter_ref + collect OCR context refs (pack-driven evidence)
         chap_atoms: Dict[str, List[Atom]] = {}
+        chap_ocr_refs: Dict[str, List[str]] = {}
         for a in atoms_this:
-            # extract last scope_posable entry
             chapter_ref = None
+            ocr_refs_local: List[str] = []
             for d in reversed(a.sanitizer_derivations):
                 if d.get("op") == "scope_posable":
                     chapter_ref = d.get("chapter_ref")
-                    break
+                if d.get("op") == "ocr_context":
+                    ocr_refs_local = list(d.get("ocr_evidence_refs") or [])
+                if chapter_ref is not None and ocr_refs_local is not None:
+                    # keep scanning to capture both; break only when both seen
+                    if chapter_ref and ocr_refs_local is not None:
+                        # continue scanning to also preserve determinism; not required
+                        pass
             if not chapter_ref:
                 continue
             chap_atoms.setdefault(chapter_ref, []).append(a)
+            if ocr_refs_local:
+                cur = chap_ocr_refs.get(chapter_ref) or []
+                cur.extend(ocr_refs_local)
+                chap_ocr_refs[chapter_ref] = cur
 
         # Build QC per chapter
         for chapter_ref, atoms in sorted(chap_atoms.items(), key=lambda kv: kv[0]):
-            qcs, auds = build_qc_for_chapter(pack, chapter_ref, atoms, evidence_pack, history_index)
+            ocr_refs = sorted(set(chap_ocr_refs.get(chapter_ref, []) or []))
+            qcs, auds = build_qc_for_chapter(pack, chapter_ref, atoms, evidence_pack, history_index, ocr_context_refs=ocr_refs)
             # Limit top_k per chapter (selection later is coverage-driven; but keep cap for UI)
             qcs = sorted(qcs, key=lambda q: (-q.psi_norm, q.qc_id))[:top_k_per_chapter]
             qc_this.extend(qcs)
@@ -1857,16 +1906,23 @@ def run_gte(pack: Dict[str, Any], years: List[int], max_pairs: int, vol_start: i
     orphans: List[str] = []
     safety_events: List[Dict[str, Any]] = []
 
-    # Rebuild chap_atoms from all_atoms
+    # Rebuild chap_atoms from all_atoms (and retain OCR context refs for traceability)
     chap_atoms: Dict[str, List[Atom]] = {}
+    chap_ocr_refs: Dict[str, List[str]] = {}
     for a in all_atoms:
         chapter_ref = None
+        ocr_refs_local: List[str] = []
         for d in reversed(a.sanitizer_derivations):
             if d.get("op") == "scope_posable":
                 chapter_ref = d.get("chapter_ref")
-                break
+            if d.get("op") == "ocr_context":
+                ocr_refs_local = list(d.get("ocr_evidence_refs") or [])
         if chapter_ref:
             chap_atoms.setdefault(chapter_ref, []).append(a)
+            if ocr_refs_local:
+                cur = chap_ocr_refs.get(chapter_ref) or []
+                cur.extend(ocr_refs_local)
+                chap_ocr_refs[chapter_ref] = cur
 
     chap_qcs: Dict[str, List[QC]] = {}
     for qc in all_qcs:
@@ -2029,7 +2085,7 @@ def make_genesis_pack_fr() -> Dict[str, Any]:
     Replace by your real CAP JSON in production.
     """
     pack = {
-        "pack_id": "CAP_FR_GENESIS_V31_10_22",
+        "pack_id": "CAP_FR_GENESIS_V31_10_23",
         "pack_version": "PACK_ACADEMIC_FR_2026_01_V1",
         "pack_fingerprint_sha256": "",
         "language": {"default": "fr"},
@@ -2048,7 +2104,12 @@ def make_genesis_pack_fr() -> Dict[str, Any]:
         },
         "harvest": {
             "roots": [
-                # You must supply real roots in your own pack; kept empty by default to avoid implicit domain hardcode.
+                "https://www.apmep.fr/spip.php?page=recherche&recherche=bac%20math%20{year}%20sujet",
+                "https://www.apmep.fr/spip.php?page=recherche&recherche=bac%20math%20{year}%20corrig%C3%A9",
+                "https://www.apmep.fr/spip.php?page=recherche&recherche=DST%20math%20{year}%20corrig%C3%A9",
+                "https://www.apmep.fr/spip.php?page=recherche&recherche=DST%20math%20{year}%20sujet",
+                "https://www.apmep.fr/spip.php?page=recherche&recherche=annales%20math%20{year}%20corrig%C3%A9",
+                "https://www.apmep.fr/spip.php?page=recherche&recherche=annales%20math%20{year}%20sujet",
             ],
             "min_pairing_confidence": 0.25,
             "year_regex": r"(20\d{2})",
@@ -2056,11 +2117,13 @@ def make_genesis_pack_fr() -> Dict[str, Any]:
             "correction_regexes": [r"corrig"],
         },
         "academic": {
-            "chapters": [
-                # Example structure. Replace by real pack content.
-                {"chapter_ref": "CHAPTER_1", "match_keywords": [], "match_regexes": []},
-            ]
-        },
+    "chapters": [
+        {"chapter_ref": "FR_MATH_TLE_FONCTIONS", "label": "Fonctions", "match_keywords": ["fonction", "dérivée", "variation", "limite", "courbe", "tangente"], "match_regexes": [r"(?i)\b(dériv|derive|variation|limite|tangente)\b"]},
+        {"chapter_ref": "FR_MATH_TLE_GEOM_ESPACE", "label": "Géométrie dans l'espace", "match_keywords": ["espace", "vecteur", "plan", "droite", "repère", "orthogonal", "produit scalaire", "distance"], "match_regexes": [r"(?i)\b(espace|vecteur|produit\s+scalaire|orthogon)\b"]},
+        {"chapter_ref": "FR_MATH_TLE_COMPLEXES", "label": "Nombres complexes", "match_keywords": ["complexe", "affixe", "module", "argument", "forme trigonométrique", "e^{i"], "match_regexes": [r"(?i)\b(complex|affixe|module|argument)\b"]},
+        {"chapter_ref": "FR_MATH_TLE_PROBA_SUITES", "label": "Probabilités et suites", "match_keywords": ["probabilité", "loi", "binomiale", "conditionnelle", "suite", "récurrence", "u_n", "v_n"], "match_regexes": [r"(?i)\b(probabil|binomial|conditionnell|suite|récurr|recurr)\b"]},
+    ]
+},
         "cognitive": {
             # Canonical weights (Kernel table socle) — the IDs are conceptuels, not tied to a country.
             "weights": {
@@ -2179,6 +2242,39 @@ with tab_import:
         st.dataframe([asdict(p) for p in pairs])
         st.text("\n".join(logs[-200:]))
 
+
+    st.markdown("### Injection manuelle (si Harvest = 0)")
+    st.caption("Permet de tester le pipeline sur un couple Sujet+Corrigé sans dépendre du crawler.")
+    mcol1, mcol2, mcol3 = st.columns([5,5,2])
+    manual_subject = mcol1.text_input("Subject URL (PDF)", key="manual_subject_url")
+    manual_correction = mcol2.text_input("Correction URL (PDF)", key="manual_correction_url")
+    manual_year = mcol3.number_input("Année", min_value=2000, max_value=dt.datetime.utcnow().year, value=dt.datetime.utcnow().year, step=1, key="manual_year")
+
+    if st.button("Ajouter paire manuelle"):
+        if manual_subject and manual_correction and is_url(manual_subject) and is_url(manual_correction):
+            mp = st.session_state.get("manual_pairs", [])
+            mp.append(PairItem(
+                pair_id=f"MANUAL_{uuid.uuid4().hex[:10]}",
+                subject_url=manual_subject.strip(),
+                correction_url=manual_correction.strip(),
+                year=int(manual_year),
+                meta={"source": "manual"},
+                pairing_confidence=1.0,
+            ))
+            st.session_state["manual_pairs"] = mp
+            st.success("Paire manuelle ajoutée.")
+        else:
+            st.error("Veuillez fournir deux URLs valides (http/https).")
+
+    mp = st.session_state.get("manual_pairs", [])
+    if mp:
+        st.write(f"Paires manuelles: {len(mp)}")
+        st.dataframe([asdict(x) for x in mp])
+        if st.button("Vider les paires manuelles"):
+            st.session_state["manual_pairs"] = []
+            st.success("Liste vidée.")
+
+
 with tab_run:
     st.subheader("RUN — Saturation progressive (new_QC=0)")
     c1, c2, c3, c4 = st.columns(4)
@@ -2198,6 +2294,7 @@ with tab_run:
                 vol_max=int(vol_max),
                 step=int(step),
                 top_k_per_chapter=int(top_k),
+                override_pairs=st.session_state.get('manual_pairs') if st.session_state.get('manual_pairs') else None,
             )
         st.session_state["last_run"] = res
         st.success("RUN terminé.")
