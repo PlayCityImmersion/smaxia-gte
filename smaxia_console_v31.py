@@ -1,309 +1,1034 @@
-"""
-smaxia_gte_v32_04_iso_fullauto.py
-SMAXIA GTE — Full Auto Harness (NO manual file creation)
-
-Objectif:
-- Harvest réel (APMEP) => URLs PDF + hash URL
-- Appel du kernel scellé V10.6.2 via run_granulo_test(urls, volume)
-- UI: QC par "chapitre" (champ libre) + Audit binaire orphelins
-- Export preuve (JSON) sans upload requis
-
-Notes d'ingénierie:
-- Streamlit cache_data pour I/O web (recommandé pour API calls). :contentReference[oaicite:1]{index=1}
-- requests timeout en tuple (connect, read). :contentReference[oaicite:2]{index=2}
-"""
+# =============================================================================
+# SMAXIA GTE Console V31.10.24 (ISO-PROD — TEST=PROD)
+# =============================================================================
+# OBJECTIF (NON NÉGOCIABLE)
+# - 100% Kernel V10.6.2: AUCUNE ré-implémentation de F1–F8 / IA1 / IA2 / mapping intent_code→chapter_code.
+# - ISO-PROD: CAP (P3) + Loading Sujet+Corrigé (P5) exécutés automatiquement via prompts scellés (verbatim).
+# - UI non régressive vs V31.10.22: même logique d’usage (Activation pays -> Sélection -> RUN -> QC par chapitre -> Explorer -> Export -> Verdict).
+# - Verdict binaire central: EXISTE-T-IL une Qi posable qui ne converge vers AUCUNE QC ?
+#   OUI => FAIL ; NON => SEALED
+#
+# EXÉCUTION
+#   streamlit run smaxia_gte_v31_10_24_iso_prod_ui.py
+#
+# DÉPENDANCES
+#   pip install streamlit requests pandas beautifulsoup4 python-docx
+#
+# CONFIG LLM (obligatoire pour ISO-PROD)
+#   SMAXIA_LLM_PROVIDER = OPENAI | GEMINI | CUSTOM
+#   OPENAI:
+#     OPENAI_API_KEY, OPENAI_MODEL (ex: gpt-4.1, gpt-4.1-mini, etc.)
+#   GEMINI:
+#     GOOGLE_API_KEY, GEMINI_MODEL (ex: gemini-1.5-pro, etc.)
+#   CUSTOM:
+#     SMAXIA_LLM_EXECUTOR = "module:function"  (callable(prompt_text:str, variables:dict) -> dict)
+#
+# PROMPTS SCELLÉS (AUTO-LOAD, ZÉRO ACTION MANUELLE)
+# - P3: Academic Pack
+# - P5: Harvester Sentinel (pairs Sujet/Corrigé)
+# Le script tente automatiquement de les charger depuis plusieurs emplacements.
+# =============================================================================
 
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 import hashlib
-import re
+import importlib
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
 
 import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-# =========================
-# CORE (non-métier)
-# =========================
-APP_TITLE = "SMAXIA GTE – ISO Full Auto (V32.04.00)"
-APP_VERSION = "V32.04.00"
-USER_AGENT = "SMAXIA-GTE/1.0"
-REQ_TIMEOUT = (5.0, 20.0)  # connect, read :contentReference[oaicite:3]{index=3}
+# Optional (docx prompts)
+try:
+    from docx import Document  # python-docx
+except Exception:
+    Document = None
+
+
+# =============================================================================
+# UI / APP CONFIG
+# =============================================================================
+
+APP_TITLE = "SMAXIA GTE — Audit QC/ARI/FRT (ISO-PROD)"
+APP_VERSION = "V31.10.24"
+
+PIPELINE_PHASES = [
+    "PHASE_01_ACTIVATION_CAP",
+    "PHASE_02_CATALOG_UI",
+    "PHASE_03_HARVEST_PAIRS",
+    "PHASE_04_SNAPSHOT_URLS",
+    "PHASE_05_KERNEL_RUN",
+    "PHASE_06_QC_BY_CHAPTER",
+    "PHASE_07_EXPLORER",
+    "PHASE_08_AUDIT_ORPHELINS",
+    "PHASE_09_EXPORT_PROOF",
+    "PHASE_10_VERDICT",
+]
+
+USER_AGENT = "SMAXIA-GTE/ISO-PROD"
+REQ_TIMEOUT = (6.0, 30.0)
+
 RUN_DIR = Path("./_gte_runs")
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
-# Seeds "réels" (test harness) — APMEP annales
-# (Vous pouvez en ajouter sans hardcoder de logique métier: ce sont des URLs de seeds)
-DEFAULT_SEEDS = [
-    "https://www.apmep.fr/Annales-du-Bac-Terminale",  # page d'index annales :contentReference[oaicite:4]{index=4}
-    "https://www.apmep.fr/Annee-2025",                # page année 2025 :contentReference[oaicite:5]{index=5}
-]
 
-PDF_EXT = ".pdf"
-
-# =========================
-# PREUVE / STRUCTURES
-# =========================
-@dataclass
-class HarvestItem:
-    seed: str
-    url: str
-    url_sha256: str
+# =============================================================================
+# DATA CONTRACTS (ISO)
+# =============================================================================
 
 @dataclass
-class ProofSnapshot:
+class PromptBundle:
+    p3_text: str
+    p5_text: str
+    p3_source: str
+    p5_source: str
+
+@dataclass
+class PairSnapshot:
+    sujet_url: str
+    corrige_url: str
+    sujet_url_sha256: str
+    corrige_url_sha256: str
+    evidence: Dict[str, Any]
+
+@dataclass
+class ProofExport:
     timestamp: str
-    seeds: List[str]
-    harvested_count: int
-    harvested_urls: List[str]
-    harvested_url_hashes: List[str]
+    app_version: str
+    mode: str
+    inputs: Dict[str, Any]
+    prompts_sources: Dict[str, str]
+    cap_sha256: str
+    cap: Dict[str, Any]
+    pairs: List[Dict[str, Any]]
     kernel_import_ok: bool
+    kernel_module: str
+    kernel_result_keys: List[str]
     verdict: str
     audit: Dict[str, Any]
 
-# =========================
-# UTILS déterministes
-# =========================
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+# =============================================================================
+# Deterministic utils
+# =============================================================================
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
-def domain(url: str) -> str:
-    return urlparse(url).netloc.lower().split(":")[0]
-
 def stable_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
-# =========================
-# FETCH + PARSE (cache)
-# =========================
-@st.cache_data(ttl=3600)
-def fetch_html(url: str) -> Tuple[int, str]:
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, headers=headers, timeout=REQ_TIMEOUT, allow_redirects=True)
-    return r.status_code, r.text
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def extract_pdf_links(seed_url: str, html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        absu = urljoin(seed_url, href)
-        if absu.lower().endswith(PDF_EXT):
-            links.append(absu)
-    return sorted(set(links))
+def is_pdf_url(u: str) -> bool:
+    return u.lower().split("?")[0].endswith(".pdf")
 
-def harvest_from_seeds(seeds: List[str], max_pdfs: int, allow_domains: Optional[List[str]] = None) -> List[HarvestItem]:
-    items: List[HarvestItem] = []
-    for seed in seeds:
+def url_domain(u: str) -> str:
+    from urllib.parse import urlparse
+    return urlparse(u).netloc.lower().split(":")[0]
+
+def domain_allowed(u: str, allowed_domains: List[str]) -> bool:
+    d = url_domain(u)
+    allowed = [a.lower().strip() for a in allowed_domains if a and isinstance(a, str)]
+    return any(d == a or d.endswith("." + a) for a in allowed)
+
+
+# =============================================================================
+# Prompt auto-loader (verbatim)
+# =============================================================================
+
+CANDIDATE_P3 = [
+    "PROMPTS_SCELLES/P3_ACADEMIC_PACK.txt",
+    "PROMPTS_SCELLES/P3_ACADEMIC_PACK.md",
+    "PROMPTS_SCELLES/P3_ACADEMIC_PACK.docx",
+    "PROMPT P3 — ACADEMIC PACK.docx",
+    "P3_ACADEMIC_PACK.docx",
+    "P3_ACADEMIC_PACK.md",
+    "P3_ACADEMIC_PACK.txt",
+]
+
+CANDIDATE_P5 = [
+    "PROMPTS_SCELLES/P5_HARVESTER.txt",
+    "PROMPTS_SCELLES/P5_HARVESTER.md",
+    "PROMPTS_SCELLES/P5_HARVESTER.docx",
+    "P5_HARVESTER_V2.2_SENTINEL.md",
+    "P5_HARVESTER.md",
+    "P5_HARVESTER.txt",
+]
+
+def _read_text_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+def _read_docx_file(path: Path) -> str:
+    if Document is None:
+        raise RuntimeError("python-docx non disponible, impossible de lire le prompt .docx")
+    doc = Document(str(path))
+    parts = []
+    for p in doc.paragraphs:
+        t = (p.text or "").rstrip()
+        if t:
+            parts.append(t)
+    return "\n".join(parts).strip()
+
+def _find_file(candidates: List[str]) -> Tuple[Optional[Path], Optional[str]]:
+    """
+    Recherche dans:
+      - dossier courant
+      - dossier du script (si connu)
+      - /mnt/data (utile en sandbox)
+    """
+    roots = []
+    try:
+        roots.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+    roots.append(Path.cwd())
+    roots.append(Path("/mnt/data"))
+
+    for root in roots:
+        for rel in candidates:
+            p = (root / rel).resolve()
+            if p.exists() and p.is_file():
+                return p, str(p)
+    return None, None
+
+def load_prompts_scelles() -> PromptBundle:
+    p3_path, p3_src = _find_file(CANDIDATE_P3)
+    p5_path, p5_src = _find_file(CANDIDATE_P5)
+
+    if not p3_path:
+        raise FileNotFoundError(
+            "PROMPT P3 introuvable. Cherché: " + ", ".join(CANDIDATE_P3)
+        )
+    if not p5_path:
+        raise FileNotFoundError(
+            "PROMPT P5 introuvable. Cherché: " + ", ".join(CANDIDATE_P5)
+        )
+
+    def read_any(p: Path) -> str:
+        if p.suffix.lower() == ".docx":
+            return _read_docx_file(p)
+        return _read_text_file(p)
+
+    p3_text = read_any(p3_path)
+    p5_text = read_any(p5_path)
+
+    if len(p3_text) < 500:
+        raise ValueError("PROMPT P3 semble vide ou tronqué (taille < 500 chars).")
+    if len(p5_text) < 500:
+        raise ValueError("PROMPT P5 semble vide ou tronqué (taille < 500 chars).")
+
+    return PromptBundle(
+        p3_text=p3_text,
+        p5_text=p5_text,
+        p3_source=p3_src or str(p3_path),
+        p5_source=p5_src or str(p5_path),
+    )
+
+
+# =============================================================================
+# LLM Strict JSON Executor (ISO)
+# =============================================================================
+
+def _llm_provider() -> str:
+    return (os.getenv("SMAXIA_LLM_PROVIDER") or "OPENAI").strip().upper()
+
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Variable d'environnement manquante: {name}")
+    return v
+
+def _coerce_json_object(text: str) -> Dict[str, Any]:
+    """
+    Extrait le premier objet JSON dans la réponse (strict ISO: pas de prose).
+    Tolère fences ```json.
+    """
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```$", "", t)
+    t = t.strip()
+
+    # Attempt direct parse
+    try:
+        obj = json.loads(t)
+        if not isinstance(obj, dict):
+            raise ValueError("Réponse JSON non-dict")
+        return obj
+    except Exception:
+        pass
+
+    # Fallback: find {...}
+    m = re.search(r"\{.*\}", t, flags=re.DOTALL)
+    if not m:
+        raise ValueError("Aucun objet JSON détecté dans la réponse.")
+    obj = json.loads(m.group(0))
+    if not isinstance(obj, dict):
+        raise ValueError("Réponse JSON non-dict")
+    return obj
+
+@st.cache_data(ttl=900)
+def llm_json_call_strict(prompt_text: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+    provider = _llm_provider()
+
+    # Compose ISO message: prompt verbatim + variables appended as strict JSON context
+    payload_context = stable_json({"variables": variables})
+    iso_input = (
+        prompt_text.rstrip()
+        + "\n\n"
+        + "=== CONTEXTE (JSON STRICT) ===\n"
+        + payload_context
+        + "\n\n"
+        + "=== RÉPONSE ATTENDUE ===\n"
+        + "Retourne UNIQUEMENT un objet JSON valide (sans prose, sans markdown)."
+    )
+
+    if provider == "CUSTOM":
+        spec = _require_env("SMAXIA_LLM_EXECUTOR")  # module:function
+        if ":" not in spec:
+            raise RuntimeError("SMAXIA_LLM_EXECUTOR doit être 'module:function'")
+        mod_name, fn_name = spec.split(":", 1)
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, fn_name, None)
+        if not callable(fn):
+            raise RuntimeError("SMAXIA_LLM_EXECUTOR function introuvable ou non callable.")
+        out = fn(iso_input, variables)
+        if not isinstance(out, dict):
+            raise RuntimeError("CUSTOM executor doit retourner un dict.")
+        return out
+
+    if provider == "OPENAI":
+        api_key = _require_env("OPENAI_API_KEY")
+        model = os.getenv("OPENAI_MODEL") or "gpt-4.1-mini"
+        url = "https://api.openai.com/v1/responses"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model,
+            "input": iso_input,
+            "temperature": 0,
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=REQ_TIMEOUT)
+        if r.status_code >= 400:
+            raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text[:500]}")
+        data = r.json()
+
+        # Extract text from responses API
+        # Typical: output[0].content[0].text
+        text = ""
         try:
-            status, html = fetch_html(seed)
-            if status >= 400:
+            out = data.get("output", [])
+            if out and isinstance(out, list):
+                content = out[0].get("content", [])
+                if content and isinstance(content, list):
+                    text = content[0].get("text", "") or ""
+        except Exception:
+            text = ""
+
+        if not text:
+            # fallback: any string
+            text = json.dumps(data)
+
+        return _coerce_json_object(text)
+
+    if provider == "GEMINI":
+        api_key = _require_env("GOOGLE_API_KEY")
+        model = os.getenv("GEMINI_MODEL") or "gemini-1.5-pro"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        body = {
+            "contents": [{"parts": [{"text": iso_input}]}],
+            "generationConfig": {"temperature": 0},
+        }
+        r = requests.post(url, json=body, timeout=REQ_TIMEOUT)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:500]}")
+        data = r.json()
+        text = ""
+        try:
+            cand = data.get("candidates", [])
+            if cand and isinstance(cand, list):
+                parts = cand[0].get("content", {}).get("parts", [])
+                if parts and isinstance(parts, list):
+                    text = parts[0].get("text", "") or ""
+        except Exception:
+            text = ""
+
+        if not text:
+            text = json.dumps(data)
+
+        return _coerce_json_object(text)
+
+    raise RuntimeError(f"SMAXIA_LLM_PROVIDER non supporté: {provider}")
+
+
+# =============================================================================
+# CAP helpers (robust extraction, no hardcode métier)
+# =============================================================================
+
+def cap_hash(cap: Dict[str, Any]) -> str:
+    return sha256_text(stable_json(cap))
+
+def cap_get_allowed_domains(cap: Dict[str, Any]) -> List[str]:
+    # Try common locations (P3 schema varies)
+    candidates = [
+        ("allowed_domains",),
+        ("allowlist_domains",),
+        ("policy", "domains"),
+        ("harvest_policy", "domains"),
+        ("policy", "harvest", "domains"),
+        ("harvest_policy", "harvest", "domains"),
+        ("academic_system", "allowed_domains"),
+    ]
+    for path in candidates:
+        cur = cap
+        ok = True
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                ok = False
+                break
+        if ok and isinstance(cur, list) and cur:
+            return [str(x).strip().lower() for x in cur if str(x).strip()]
+    return []
+
+def cap_extract_levels_subjects(cap: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """
+    Extract display labels from P3 schema example:
+      cap["levels"] list with labels.localized.fr
+      cap["subjects"] list with labels.localized.fr
+    """
+    levels, subjects = [], []
+
+    lv = cap.get("levels")
+    if isinstance(lv, list):
+        for item in lv:
+            if not isinstance(item, dict):
                 continue
-            pdfs = extract_pdf_links(seed, html)
+            label = None
+            labels = item.get("labels", {})
+            if isinstance(labels, dict):
+                loc = labels.get("localized", {})
+                if isinstance(loc, dict):
+                    label = loc.get("fr") or loc.get("en") or labels.get("default")
+                else:
+                    label = labels.get("default")
+            label = label or item.get("level_invariant") or item.get("name")
+            if label:
+                levels.append(str(label))
+    sb = cap.get("subjects")
+    if isinstance(sb, list):
+        for item in sb:
+            if not isinstance(item, dict):
+                continue
+            label = None
+            labels = item.get("labels", {})
+            if isinstance(labels, dict):
+                loc = labels.get("localized", {})
+                if isinstance(loc, dict):
+                    label = loc.get("fr") or loc.get("en") or labels.get("default")
+                else:
+                    label = labels.get("default")
+            label = label or item.get("subject_invariant") or item.get("name")
+            if label:
+                subjects.append(str(label))
 
-            if allow_domains:
-                pdfs = [u for u in pdfs if any(domain(u) == d or domain(u).endswith("." + d) for d in allow_domains)]
+    # Fallback: if embedded in academic_system
+    if not levels and isinstance(cap.get("academic_system"), dict):
+        lv = cap["academic_system"].get("levels")
+        if isinstance(lv, list):
+            levels = [str(x.get("name") or x.get("level_invariant") or "").strip() for x in lv if isinstance(x, dict)]
+            levels = [x for x in levels if x]
 
-            for u in pdfs:
-                items.append(HarvestItem(seed=seed, url=u, url_sha256=sha256_text(u)))
+    # ensure deterministic unique
+    levels = sorted(set([x for x in levels if x.strip()]))
+    subjects = sorted(set([x for x in subjects if x.strip()]))
+
+    return levels, subjects
+
+
+# =============================================================================
+# P5 pairs validation (strict)
+# =============================================================================
+
+def parse_pairs_from_p5_output(p5_out: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Accept flexible keys but require at least a list of pairs with sujet_url/corrige_url.
+    """
+    if "pairs" in p5_out and isinstance(p5_out["pairs"], list):
+        return p5_out["pairs"]
+    if "items" in p5_out and isinstance(p5_out["items"], list):
+        return p5_out["items"]
+    if "results" in p5_out and isinstance(p5_out["results"], list):
+        return p5_out["results"]
+    # else: attempt find first list of dicts containing sujet_url
+    for k, v in p5_out.items():
+        if isinstance(v, list) and v and isinstance(v[0], dict) and ("sujet_url" in v[0] or "subject_url" in v[0]):
+            return v
+    raise ValueError("Sortie P5 invalide: liste de paires introuvable (pairs/items/results).")
+
+def normalize_pair_dict(d: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    sujet = d.get("sujet_url") or d.get("subject_url") or d.get("sujet") or d.get("subject")
+    corr = d.get("corrige_url") or d.get("correction_url") or d.get("corrige") or d.get("correction")
+    evidence = d.get("evidence") if isinstance(d.get("evidence"), dict) else {}
+    return (str(sujet).strip() if sujet else None, str(corr).strip() if corr else None, evidence)
+
+def validate_pairs(
+    raw_pairs: List[Dict[str, Any]],
+    allowed_domains: List[str],
+    max_pairs: int
+) -> List[PairSnapshot]:
+    out: List[PairSnapshot] = []
+    for d in raw_pairs:
+        if not isinstance(d, dict):
+            continue
+        sujet, corr, evidence = normalize_pair_dict(d)
+        if not sujet or not corr:
+            continue
+        if not is_pdf_url(sujet) or not is_pdf_url(corr):
+            continue
+        if allowed_domains:
+            if not domain_allowed(sujet, allowed_domains) or not domain_allowed(corr, allowed_domains):
+                continue
+        out.append(PairSnapshot(
+            sujet_url=sujet,
+            corrige_url=corr,
+            sujet_url_sha256=sha256_text(sujet),
+            corrige_url_sha256=sha256_text(corr),
+            evidence=evidence,
+        ))
+        if len(out) >= max_pairs:
+            break
+
+    if not out:
+        raise ValueError("Aucune paire valide après contrôle PDF + domaines allowlist CAP.")
+    return out
+
+
+# =============================================================================
+# Kernel call (PROD)
+# =============================================================================
+
+def try_import_kernel() -> Tuple[bool, Optional[Any], str]:
+    """
+    Attempts common module names without hardcoding business content.
+    """
+    candidates = [
+        "smaxia_granulo_engine_test",
+        "smaxia_granulo_engine",
+        "smaxia_granulo_engine_prod",
+    ]
+    for mod_name in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, "run_granulo_test"):
+                return True, mod, mod_name
         except Exception:
             continue
-
-    # Dédup + ordre déterministe
-    dedup: Dict[str, HarvestItem] = {}
-    for it in items:
-        dedup[it.url] = it
-    out = sorted(dedup.values(), key=lambda x: (x.seed, x.url))
-    return out[:max_pdfs]
-
-# =========================
-# KERNEL CALL (V10.6.2)
-# =========================
-def try_import_kernel() -> Tuple[bool, Optional[Any], str]:
-    try:
-        # Votre module scellé (déjà cité dans votre contexte projet)
-        import smaxia_granulo_engine_test as kernel
-        if not hasattr(kernel, "run_granulo_test"):
-            return False, None, "Module importé mais run_granulo_test introuvable"
-        return True, kernel, "OK"
-    except Exception as e:
-        return False, None, repr(e)
+    return False, None, "Kernel module introuvable (run_granulo_test)."
 
 def run_kernel(kernel_mod: Any, urls: List[str], volume: int) -> Dict[str, Any]:
-    # On n'interprète pas la “science” du kernel ici: on l'appelle.
     return kernel_mod.run_granulo_test(urls, volume)
 
-# =========================
-# UI
-# =========================
-def sidebar_inputs() -> None:
-    st.sidebar.header("Paramètres (FULL AUTO)")
 
-    st.session_state.chapter = st.sidebar.text_input("Chapitre (libre, pour affichage)", value="(non imposé)")
-    st.session_state.volume = st.sidebar.slider("Volume (itérations / saturation)", 1, 10, 2)
+# =============================================================================
+# Verdict (strict proof from kernel audit)
+# =============================================================================
 
-    st.session_state.max_pdfs = st.sidebar.slider("Max PDFs à harvest", 1, 50, 12)
+def verdict_from_kernel_audit(kernel_result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """
+    ISO: scellage seulement si preuve explicite 0 orphelin.
+    """
+    audit = kernel_result.get("audit", {})
+    if not isinstance(audit, dict):
+        return "FAIL", {"reason": "audit_absent_ou_non_dict"}
 
-    st.session_state.allow_domain_apmep_only = st.sidebar.checkbox("Limiter domaine à apmep.fr", value=True)
-    st.session_state.extra_seeds = st.sidebar.text_area(
-        "Seeds additionnels (1 URL/ligne) — optionnel",
-        value="",
-        help="Aucune création manuelle de fichiers. Juste des URLs si vous voulez élargir."
-    ).strip()
+    # Explicit orphans list
+    for k in ["orphans", "qi_orphans", "uncovered_qi"]:
+        if k in audit:
+            orphans = audit.get(k) or []
+            if not isinstance(orphans, list):
+                return "FAIL", {"reason": f"{k}_non_list"}
+            return ("SEALED" if len(orphans) == 0 else "FAIL"), {"orphans_key": k, "orphans": orphans}
 
-    if st.sidebar.button("RUN GTE (AUTO)", type="primary"):
-        st.session_state.run = True
-        st.rerun()
+    # coverage_map + posables list proof
+    if isinstance(audit.get("coverage_map"), dict):
+        qi_ids = audit.get("posables_qi_ids") or audit.get("qi_ids")
+        if isinstance(qi_ids, list):
+            covered = set(audit["coverage_map"].keys())
+            orphans = [q for q in qi_ids if q not in covered]
+            return ("SEALED" if len(orphans) == 0 else "FAIL"), {"orphans_key": "coverage_map", "orphans": orphans}
 
-def display_harvest(items: List[HarvestItem]) -> None:
-    st.subheader("PHASE 1 — Harvest (réel)")
-    st.metric("PDFs trouvés", len(items))
-    if items:
-        st.dataframe(pd.DataFrame([asdict(i) for i in items]), use_container_width=True)
+    return "FAIL", {"reason": "pas_de_preuve_explicite_orphelins_dans_audit"}
 
-def display_kernel_result(result: Dict[str, Any]) -> None:
-    st.subheader("PHASE 2 — Kernel V10.6.2 (run_granulo_test)")
 
-    # Affichage safe (sans supposer la structure exacte au-delà de ce que vous avez indiqué)
-    sujets = result.get("sujets", None)
-    qc = result.get("qc", None)
-    saturation = result.get("saturation", None)
-    audit = result.get("audit", {})
+# =============================================================================
+# UI components (V31.10.22-like logic)
+# =============================================================================
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Sujets", len(sujets) if isinstance(sujets, list) else (1 if sujets else 0))
-    with c2:
-        st.metric("QC", len(qc) if isinstance(qc, list) else (len(qc) if isinstance(qc, dict) else (1 if qc else 0)))
-    with c3:
-        st.metric("Saturation", str(saturation)[:40] if saturation is not None else "n/a")
+def init_state() -> None:
+    defaults = {
+        "cap": None,
+        "cap_sha": None,
+        "cap_loaded": False,
+        "prompts": None,
+        "pairs": None,
+        "kernel_ok": False,
+        "kernel_mod": None,
+        "kernel_mod_name": None,
+        "kernel_result": None,
+        "verdict": None,
+        "audit_detail": None,
+        "run_started": False,
+        "logs": [],
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    st.write("Audit (brut):")
-    st.json(audit)
+def log(msg: str) -> None:
+    st.session_state.logs.append(f"[{now_iso()}] {msg}")
 
-    st.subheader("PHASE 3 — QC par chapitre (affichage)")
-    # Votre kernel est censé ranger par chapitre via intent_code->chapter_code (selon votre V31.9.10).
-    # Ici, on fait un affichage robuste:
-    # - si qc est une dict {chapter: [qc...]} on affiche par clé
-    # - sinon, on affiche la liste brute
-    if isinstance(qc, dict):
-        for ch, qlist in qc.items():
-            with st.expander(f"Chapitre: {ch} — QC={len(qlist) if isinstance(qlist, list) else 'n/a'}", expanded=False):
-                st.json(qlist)
+def sidebar_ui() -> None:
+    st.sidebar.header("SMAXIA — ISO-PROD (V31.10.24)")
+    st.sidebar.caption("Kernel V10.6.2 — QC/ARI/FRT/Triggers uniquement via Kernel.")
+
+    st.session_state.country_code = st.sidebar.text_input("Pays (ISO)", value=st.session_state.get("country_code", "FR")).upper().strip()
+    st.session_state.volume = st.sidebar.slider("Volume (saturation)", 1, 10, int(st.session_state.get("volume", 2)))
+
+    st.sidebar.divider()
+
+    # Activation
+    if st.sidebar.button("1) Activer Pays (CAP)", type="primary"):
+        st.session_state.run_started = True
+        st.session_state.kernel_result = None
+        st.session_state.verdict = None
+        st.session_state.audit_detail = None
+        try:
+            prompts = load_prompts_scelles()
+            st.session_state.prompts = prompts
+            log(f"Prompts scellés chargés: P3={prompts.p3_source} | P5={prompts.p5_source}")
+
+            # CAP via P3
+            cap_out = llm_json_call_strict(prompts.p3_text, {"country_code_iso": st.session_state.country_code, "country_code": st.session_state.country_code})
+            st.session_state.cap = cap_out
+            st.session_state.cap_sha = cap_hash(cap_out)
+            st.session_state.cap_loaded = True
+            log(f"CAP chargé (sha256={st.session_state.cap_sha[:12]}...).")
+        except Exception as e:
+            st.session_state.cap_loaded = False
+            log(f"ERREUR CAP: {repr(e)}")
+            st.sidebar.error(f"Erreur CAP: {repr(e)}")
+
+    st.sidebar.divider()
+
+    # Selection UI from CAP (best effort)
+    if st.session_state.cap_loaded and isinstance(st.session_state.cap, dict):
+        levels, subjects = cap_extract_levels_subjects(st.session_state.cap)
+        if not levels:
+            levels = ["(CAP: niveaux indisponibles)"]
+        if not subjects:
+            subjects = ["(CAP: matières indisponibles)"]
+
+        st.session_state.level = st.sidebar.selectbox("2) Niveau", options=levels, index=0)
+        st.session_state.subject = st.sidebar.selectbox("3) Matière", options=subjects, index=0)
+
+        # Chapitre: selon P5, le chapitre peut venir après extraction Qi.
+        # Pour non-régression UI (V31.10.22): on garde un champ, mais il sert au filtrage/affichage.
+        st.session_state.chapter_filter = st.sidebar.text_input("4) Filtre chapitre (optionnel)", value=st.session_state.get("chapter_filter", ""))
+
+        st.session_state.max_pairs = st.sidebar.slider("Max paires Sujet/Corrigé", 1, 30, int(st.session_state.get("max_pairs", 6)))
+
+        if st.sidebar.button("🚀 RUN TEST CHAPITRE COMPLET", type="primary"):
+            st.session_state.run_started = True
+            st.session_state.kernel_result = None
+            st.session_state.verdict = None
+            st.session_state.audit_detail = None
+            st.rerun()
     else:
-        with st.expander(f"Chapitre (UI): {st.session_state.chapter}", expanded=True):
-            st.json(qc)
+        st.sidebar.info("Activer d'abord le pays pour charger le CAP (P3).")
 
-def audit_orphans_strict(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    st.sidebar.divider()
+    with st.sidebar.expander("Logs", expanded=False):
+        for line in st.session_state.logs[-200:]:
+            st.write(line)
+
+
+# =============================================================================
+# Pipeline (10 phases)
+# =============================================================================
+
+def phase_01_activation_cap() -> None:
+    with st.expander("PHASE 01 — Activation CAP (P3)", expanded=True):
+        if not st.session_state.cap_loaded:
+            st.warning("CAP non chargé. Utilisez 'Activer Pays (CAP)'.")
+            return
+        st.success("CAP chargé.")
+        st.write(f"CAP sha256: `{st.session_state.cap_sha}`")
+        st.json(st.session_state.cap)
+
+def phase_02_catalog_ui() -> None:
+    with st.expander("PHASE 02 — Catalogue (Niveau/Matière)", expanded=True):
+        if not st.session_state.cap_loaded:
+            st.warning("CAP requis.")
+            return
+        levels, subjects = cap_extract_levels_subjects(st.session_state.cap)
+        st.metric("Niveaux détectés", len(levels))
+        st.metric("Matières détectées", len(subjects))
+        st.write("Sélections:", {"niveau": st.session_state.get("level"), "matière": st.session_state.get("subject"), "filtre_chapitre": st.session_state.get("chapter_filter", "")})
+
+def phase_03_harvest_pairs() -> None:
+    with st.expander("PHASE 03 — Harvest Pairs Sujet/Corrigé (P5)", expanded=True):
+        if not st.session_state.cap_loaded:
+            st.warning("CAP requis.")
+            return
+        if not st.session_state.prompts:
+            st.error("Prompts scellés non chargés.")
+            return
+
+        cap = st.session_state.cap
+        allowed_domains = cap_get_allowed_domains(cap)
+
+        st.info("Exécution P5 (pairs Sujet/Corrigé) — JSON strict.")
+        try:
+            p5_out = llm_json_call_strict(
+                st.session_state.prompts.p5_text,
+                {
+                    "cap": cap,
+                    "country_code": st.session_state.country_code,
+                    "level": st.session_state.get("level"),
+                    "subject": st.session_state.get("subject"),
+                    "chapter_filter": st.session_state.get("chapter_filter", ""),
+                    "max_pairs": int(st.session_state.get("max_pairs", 6)),
+                }
+            )
+
+            raw_pairs = parse_pairs_from_p5_output(p5_out)
+            pairs = validate_pairs(raw_pairs, allowed_domains=allowed_domains, max_pairs=int(st.session_state.max_pairs))
+            st.session_state.pairs = pairs
+            log(f"Paires valides: {len(pairs)} (allow_domains={len(allowed_domains)}).")
+
+            df = pd.DataFrame([asdict(p) for p in pairs])
+            st.dataframe(df, use_container_width=True)
+
+        except Exception as e:
+            st.session_state.pairs = None
+            log(f"ERREUR P5: {repr(e)}")
+            st.error(f"Erreur P5: {repr(e)}")
+
+def phase_04_snapshot_urls() -> None:
+    with st.expander("PHASE 04 — Snapshot URLs + Hashes", expanded=True):
+        pairs: Optional[List[PairSnapshot]] = st.session_state.pairs
+        if not pairs:
+            st.warning("Aucune paire disponible (exécutez P5).")
+            return
+        urls = []
+        for p in pairs:
+            urls.append(p.sujet_url)
+            urls.append(p.corrige_url)
+        st.metric("URLs (Sujets+Corrigés)", len(urls))
+        st.code("\n".join(urls[:200]), language="text")
+        st.caption("Hashes URL (sha256):")
+        st.code("\n".join([sha256_text(u) for u in urls[:200]]), language="text")
+
+def phase_05_kernel_run(progress_bar: st.progress, step_i: int, total_steps: int) -> None:
+    with st.expander("PHASE 05 — Kernel Run (V10.6.2)", expanded=True):
+        pairs: Optional[List[PairSnapshot]] = st.session_state.pairs
+        if not pairs:
+            st.warning("Aucune paire disponible.")
+            return
+
+        ok, kernel_mod, mod_name = try_import_kernel()
+        st.session_state.kernel_ok = ok
+        st.session_state.kernel_mod = kernel_mod
+        st.session_state.kernel_mod_name = mod_name
+
+        if not ok or kernel_mod is None:
+            log("Kernel introuvable.")
+            st.error("Kernel introuvable: module exposant run_granulo_test manquant.")
+            return
+
+        urls = []
+        for p in pairs:
+            urls.append(p.sujet_url)
+            urls.append(p.corrige_url)
+
+        st.info(f"Appel kernel: {mod_name}.run_granulo_test(urls, volume={st.session_state.volume})")
+        try:
+            with st.spinner("Exécution kernel..."):
+                result = run_kernel(kernel_mod, urls=urls, volume=int(st.session_state.volume))
+            if not isinstance(result, dict):
+                raise ValueError("Kernel result non-dict (invalide).")
+
+            st.session_state.kernel_result = result
+            log(f"Kernel OK. Keys={list(result.keys())}")
+            st.success("Kernel exécuté.")
+            st.write("Keys:", list(result.keys()))
+            st.json(result.get("audit", {}))
+
+        except Exception as e:
+            st.session_state.kernel_result = None
+            log(f"ERREUR Kernel: {repr(e)}")
+            st.error(f"Erreur Kernel: {repr(e)}")
+
+        progress_bar.progress(min(1.0, (step_i + 1) / total_steps))
+
+def _extract_qc_items(kernel_result: Dict[str, Any]) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """
-    Règle centrale (binaire) selon votre spécification:
-    Existe-t-il une Qi posable qui ne converge vers AUCUNE QC ?
-    - Si le kernel fournit déjà un audit orphelins => on le respecte.
-    - Sinon, verdict = FAIL (pas de preuve).
+    Returns (mode, items)
+      mode = "DICT_BY_CHAPTER" | "LIST" | None
+      items = list of qc dicts (each may include chapter info)
     """
-    audit = result.get("audit", {}) if isinstance(result, dict) else {}
-    # Heuristiques d'acceptation: le kernel doit fournir un champ explicitement auditable.
-    # Noms possibles: "orphans", "qi_orphans", "uncovered_qi", "coverage_map" etc.
-    if isinstance(audit, dict):
-        for k in ["orphans", "qi_orphans", "uncovered_qi"]:
-            if k in audit:
-                orphans = audit.get(k) or []
-                return ("SEALED" if len(orphans) == 0 else "FAIL", {"orphans_key": k, "orphans": orphans})
+    qc = kernel_result.get("qc")
+    if qc is None:
+        return None, []
+    if isinstance(qc, dict):
+        items = []
+        for chap, qlist in qc.items():
+            if isinstance(qlist, list):
+                for it in qlist:
+                    if isinstance(it, dict):
+                        it2 = dict(it)
+                        it2.setdefault("chapter_code", chap)
+                        items.append(it2)
+                    else:
+                        items.append({"chapter_code": chap, "qc": it})
+            else:
+                items.append({"chapter_code": chap, "qc": qlist})
+        return "DICT_BY_CHAPTER", items
+    if isinstance(qc, list):
+        items = [it for it in qc if isinstance(it, dict)]
+        return "LIST", items
+    return None, []
 
-        # coverage_map: {qi_id: qc_id}
-        if "coverage_map" in audit and isinstance(audit["coverage_map"], dict):
-            # si le kernel fournit aussi la liste des qi posables
-            qi_list = audit.get("posables_qi_ids") or audit.get("qi_ids") or None
-            if isinstance(qi_list, list):
-                covered = set(audit["coverage_map"].keys())
-                orphans = [qi for qi in qi_list if qi not in covered]
-                return ("SEALED" if len(orphans) == 0 else "FAIL", {"orphans_key": "coverage_map", "orphans": orphans})
+def phase_06_qc_by_chapter() -> None:
+    with st.expander("PHASE 06 — QC par Chapitre", expanded=True):
+        kr = st.session_state.kernel_result
+        if not isinstance(kr, dict):
+            st.warning("Kernel non exécuté.")
+            return
 
-    # Pas de preuve explicite => FAIL
-    return ("FAIL", {"reason": "Kernel audit ne fournit pas de preuve explicite d'absence d'orphelins."})
+        mode, items = _extract_qc_items(kr)
+        if not items:
+            st.warning("Aucune QC détectée dans kernel_result['qc'].")
+            return
 
-def export_proof(seeds: List[str], items: List[HarvestItem], kernel_ok: bool, verdict: str, audit: Dict[str, Any]) -> None:
-    st.subheader("Export preuve (JSON)")
-    proof = ProofSnapshot(
-        timestamp=now_iso(),
-        seeds=seeds,
-        harvested_count=len(items),
-        harvested_urls=[i.url for i in items],
-        harvested_url_hashes=[i.url_sha256 for i in items],
-        kernel_import_ok=kernel_ok,
-        verdict=verdict,
-        audit=audit,
-    )
-    st.download_button(
-        "EXPORT JSON PREUVE",
-        data=json.dumps(asdict(proof), indent=2, ensure_ascii=False),
-        file_name=f"smaxia_gte_proof_{int(time.time())}.json",
-        mime="application/json",
-    )
+        # Filter by chapter if user wants
+        filt = (st.session_state.get("chapter_filter") or "").strip().lower()
+        if filt:
+            def keep(it: Dict[str, Any]) -> bool:
+                ch = str(it.get("chapter_code") or it.get("intent_code") or it.get("chapter_ref") or "").lower()
+                txt = str(it.get("qc_text") or it.get("qc") or "").lower()
+                return filt in ch or filt in txt
+            items = [it for it in items if keep(it)]
 
-def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
+        rows = []
+        for it in items:
+            qc_text = it.get("qc_text") or it.get("qc") or ""
+            chapter_code = it.get("chapter_code") or it.get("intent_code") or it.get("chapter_ref") or ""
+            evidence = it.get("evidence_qi_ids") or it.get("qi_ids") or []
+            triggers = it.get("triggers") or []
+            rows.append({
+                "chapter_code": chapter_code,
+                "qc_id": it.get("qc_id", ""),
+                "qc_text": str(qc_text)[:180],
+                "n_qi": len(evidence) if isinstance(evidence, list) else None,
+                "n_triggers": len(triggers) if isinstance(triggers, list) else None,
+            })
+
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True)
+        st.caption(f"QC items: {len(items)} (mode={mode})")
+
+        st.session_state._qc_items_cache = items  # for explorer
+
+def phase_07_explorer() -> None:
+    with st.expander("PHASE 07 — Explorateur QC → ARI → FRT → Triggers → Qi", expanded=True):
+        kr = st.session_state.kernel_result
+        items = st.session_state.get("_qc_items_cache") or []
+        if not isinstance(kr, dict) or not items:
+            st.warning("Exécutez d'abord PHASE 06.")
+            return
+
+        # Build select labels
+        labels = []
+        for idx, it in enumerate(items):
+            ch = it.get("chapter_code") or it.get("intent_code") or ""
+            txt = (it.get("qc_text") or it.get("qc") or "")
+            labels.append(f"[{idx}] {ch} — {str(txt)[:80]}")
+
+        sel = st.selectbox("Sélectionner une QC", options=list(range(len(labels))), format_func=lambda i: labels[i])
+        it = items[int(sel)]
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.subheader("QC (brut)")
+            st.json(it)
+        with c2:
+            st.subheader("Détails")
+            st.write({
+                "qc_id": it.get("qc_id"),
+                "chapter_code/intent": it.get("chapter_code") or it.get("intent_code"),
+            })
+            st.write("Triggers:")
+            st.json(it.get("triggers", []))
+            st.write("ARI spine (si fourni par kernel):")
+            st.json(it.get("ari_spine") or it.get("ari") or {})
+            st.write("FRT (si fourni par kernel):")
+            st.json(it.get("frt") or {})
+
+def phase_08_audit_orphelins() -> None:
+    with st.expander("PHASE 08 — Audit Orphelins (Verdict binaire)", expanded=True):
+        kr = st.session_state.kernel_result
+        if not isinstance(kr, dict):
+            st.warning("Kernel non exécuté.")
+            return
+        verdict, detail = verdict_from_kernel_audit(kr)
+        st.session_state.verdict = verdict
+        st.session_state.audit_detail = detail
+        st.metric("VERDICT", verdict)
+        st.json(detail)
+
+def phase_09_export_proof() -> None:
+    with st.expander("PHASE 09 — Export Proof (JSON scellable)", expanded=True):
+        if not st.session_state.cap_loaded or not st.session_state.pairs or not st.session_state.kernel_result:
+            st.warning("CAP + Paires + Kernel requis pour exporter.")
+            return
+
+        cap = st.session_state.cap
+        cap_sha = st.session_state.cap_sha
+        pairs = st.session_state.pairs
+        kr = st.session_state.kernel_result
+
+        prompts = st.session_state.prompts
+        prompts_sources = {
+            "P3": prompts.p3_source if prompts else "",
+            "P5": prompts.p5_source if prompts else "",
+        }
+
+        export = ProofExport(
+            timestamp=now_iso(),
+            app_version=APP_VERSION,
+            mode="ISO-PROD",
+            inputs={
+                "country_code": st.session_state.country_code,
+                "level": st.session_state.get("level"),
+                "subject": st.session_state.get("subject"),
+                "chapter_filter": st.session_state.get("chapter_filter", ""),
+                "volume": st.session_state.volume,
+                "max_pairs": st.session_state.max_pairs,
+            },
+            prompts_sources=prompts_sources,
+            cap_sha256=cap_sha,
+            cap=cap,
+            pairs=[asdict(p) for p in pairs],
+            kernel_import_ok=bool(st.session_state.kernel_ok),
+            kernel_module=str(st.session_state.kernel_mod_name or ""),
+            kernel_result_keys=list(kr.keys()) if isinstance(kr, dict) else [],
+            verdict=str(st.session_state.verdict or "FAIL"),
+            audit=st.session_state.audit_detail or {"reason": "audit_not_run"},
+        )
+
+        out = json.dumps(asdict(export), indent=2, ensure_ascii=False)
+        st.download_button(
+            "📥 EXPORT JSON PROOF",
+            data=out,
+            file_name=f"smaxia_gte_proof_{st.session_state.country_code}_{int(time.time())}.json",
+            mime="application/json",
+        )
+        st.code(out[:4000], language="json")
+
+def phase_10_verdict() -> None:
+    with st.expander("PHASE 10 — Verdict", expanded=True):
+        v = st.session_state.get("verdict")
+        if not v:
+            st.info("Lancer PHASE 08 pour obtenir le verdict.")
+            return
+        if v == "SEALED":
+            st.success("SEALED — Preuve: 0 orphelin (selon audit kernel).")
+        else:
+            st.error("FAIL — Preuve insuffisante ou orphelins détectés.")
+        st.json(st.session_state.get("audit_detail") or {})
+
+
+# =============================================================================
+# Main UI
+# =============================================================================
+
+def main_ui() -> None:
+    st.set_page_config(page_title=f"{APP_TITLE} {APP_VERSION}", layout="wide")
     st.title(f"{APP_TITLE} — {APP_VERSION}")
+    st.caption("ISO-PROD / Industrial Safety — Kernel V10.6.2 = source de vérité QC/ARI/FRT/Triggers.")
 
-    sidebar_inputs()
-    if not st.session_state.get("run"):
-        st.info("Cliquez RUN GTE (AUTO) pour lancer le pipeline.")
-        st.caption("Sources de test: annales APMEP (pages listant sujets/corrigés PDF).")
-        return
+    init_state()
+    sidebar_ui()
 
-    # Seeds
-    seeds = list(DEFAULT_SEEDS)
-    if st.session_state.extra_seeds:
-        seeds += [l.strip() for l in st.session_state.extra_seeds.splitlines() if l.strip()]
-    seeds = sorted(set(seeds))
+    # Global progress and status
+    progress = st.progress(0.0)
+    status = st.empty()
 
-    allow_domains = ["apmep.fr"] if st.session_state.allow_domain_apmep_only else None
+    # If user clicked RUN, execute pipeline sequentially (no background)
+    if st.session_state.get("run_started") and st.session_state.cap_loaded and st.session_state.get("level") and st.session_state.get("subject"):
+        total = len(PIPELINE_PHASES)
+        phase_fns = [
+            phase_01_activation_cap,
+            phase_02_catalog_ui,
+            phase_03_harvest_pairs,
+            phase_04_snapshot_urls,
+            None,  # kernel run needs progress handle
+            phase_06_qc_by_chapter,
+            phase_07_explorer,
+            phase_08_audit_orphelins,
+            phase_09_export_proof,
+            phase_10_verdict,
+        ]
 
-    # Phase 1 — Harvest
-    items = harvest_from_seeds(seeds=seeds, max_pdfs=st.session_state.max_pdfs, allow_domains=allow_domains)
-    display_harvest(items)
+        # PHASE 01-04
+        for i in range(0, 4):
+            status.write(f"Exécution: {PIPELINE_PHASES[i]}")
+            phase_fns[i]()
+            progress.progress((i + 1) / total)
 
-    if not items:
-        st.error("HARVEST FAIL: aucun PDF trouvé sur les seeds.")
-        export_proof(seeds, items, kernel_ok=False, verdict="FAIL", audit={"reason": "no_pdfs"})
-        return
+        # PHASE 05 kernel
+        status.write(f"Exécution: {PIPELINE_PHASES[4]}")
+        phase_05_kernel_run(progress, 4, total)
 
-    urls = [i.url for i in items]
+        # PHASE 06-10
+        for i in range(5, total):
+            status.write(f"Exécution: {PIPELINE_PHASES[i]}")
+            phase_fns[i]()
+            progress.progress((i + 1) / total)
 
-    # Phase 2 — Kernel
-    kernel_ok, kernel_mod, kernel_msg = try_import_kernel()
-    st.subheader("Kernel import")
-    st.write({"kernel_import_ok": kernel_ok, "message": kernel_msg})
+        status.write("Pipeline terminé.")
+    else:
+        st.info("1) Activer Pays (CAP) puis 2) choisir Niveau/Matière, puis 3) RUN TEST CHAPITRE COMPLET.")
 
-    if not kernel_ok:
-        st.error("Impossible d'appeler le kernel scellé: import KO. Verdict=FAIL.")
-        export_proof(seeds, items, kernel_ok=False, verdict="FAIL", audit={"reason": "kernel_import_fail", "message": kernel_msg})
-        return
+    # Always show phases (non régressif: visibilité pipeline)
+    st.subheader("Pipeline (phases)")
+    phase_01_activation_cap()
+    phase_02_catalog_ui()
+    phase_03_harvest_pairs()
+    phase_04_snapshot_urls()
+    with st.expander("PHASE 05 — Kernel Run (V10.6.2)", expanded=False):
+        st.write("Exécutez via RUN TEST CHAPITRE COMPLET (sidebar).")
+    phase_06_qc_by_chapter()
+    phase_07_explorer()
+    phase_08_audit_orphelins()
+    phase_09_export_proof()
+    phase_10_verdict()
 
-    # Run kernel
-    with st.spinner("Exécution kernel V10.6.2 (run_granulo_test)..."):
-        result = run_kernel(kernel_mod, urls=urls, volume=st.session_state.volume)
-
-    display_kernel_result(result)
-
-    # Phase 3 — Audit binaire orphelins
-    verdict, audit_detail = audit_orphans_strict(result)
-    st.subheader("VERDICT (binaire central: orphelins)")
-    st.metric("VERDICT", verdict)
-    st.json(audit_detail)
-
-    export_proof(seeds, items, kernel_ok=True, verdict=verdict, audit=audit_detail)
 
 if __name__ == "__main__":
-    main()
+    main_ui()
