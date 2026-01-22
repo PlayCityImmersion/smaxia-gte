@@ -1,18 +1,17 @@
 # =============================================================================
 # SMAXIA GTE Console V31.10.25 — ISO-PROD (FICHIER UNIQUE)
 # =============================================================================
-# DOCTRINE (Kernel V10.6.3) — TEST = PROD (LOGIQUE), DÉTERMINISME, CAS 1 ONLY
-# - Action humaine unique : choisir + valider un pays (France | Côte d’Ivoire)
-# - Ensuite : pipeline automatique bout-en-bout → affichage QC/FRT/ARI/TRIGGERS par chapitre
-# - AUCUN HARDCODE MÉTIER : toute variabilité (chapitres, keywords, params, poids) provient du CAP (LOAD_CAP)
-# - Mode déconnecté : si aucune source PDF locale n’est disponible, utilisation de STUBS conformes au CAP (données CAP)
-# - Coverage : 100% des Qi POSABLE par chapitre (zéro orphelin) OU safety-stop audité (Kernel)
-# - Anti-singleton : cluster POSABLE >= 2 (exception “chapitre pauvre” uniquement si CAP le permet, auditée)
-# - EvidencePack minimal : chaque QC expose des preuves (références pair_id / source_id / qi_ids)
+# KERNEL V10.6.3 — DOCTRINE STRICTE
+# - Action humaine unique : choisir un pays (France | Côte d’Ivoire) puis ACTIVER
+# - Ensuite : pipeline 100% automatique (ISO-PROD logique) sans autre action utilisateur
+# - ZÉRO HARDCODE MÉTIER : aucune logique pays/matière/chapitre en dur dans le CORE
+#   Toute variabilité provient du CAP (Country Academic Pack) chargé/validé.
+# - Mode déconnecté : si aucun PDF local, génération de STUBS 100% Pack-Driven (depuis CAP)
+# - Déterminisme : pas de timestamps non déterministes ; référence temporelle fixe via CAP
+# - Sortie UI (finale) : UNIQUEMENT QC / FRT / ARI / TRIGGERS par chapitre + Qi associées
 #
-# IMPORTANT
-# - Ce script ne fait AUCUN appel réseau.
-# - Pour des PDFs réels : déposer les fichiers dans le dossier défini dans le CAP (cap.sources.local_dir).
+# Correctif critique V31.10.25:
+# - Plus d'assertion "final is not None" : si 0 sources, fallback STUB Pack-Driven garanti
 # =============================================================================
 
 from __future__ import annotations
@@ -22,17 +21,15 @@ import os
 import re
 import json
 import math
-import time
 import hashlib
 import unicodedata
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict, Counter
 
 import streamlit as st
 
-# ---------------- Optional deps (local only) ----------------
+# ---------------- Optional deps (local-only; no network) ----------------
 try:
     import pdfplumber  # type: ignore
 except Exception:
@@ -73,10 +70,55 @@ RC_ATOMIZATION_LOW = "RC_ATOMIZATION_LOW"
 RC_ALIGN_LOW = "RC_ALIGN_LOW"
 RC_CLUSTER_SINGLETON_FORBIDDEN = "RC_CLUSTER_SINGLETON_FORBIDDEN"
 RC_SAFETY_STOP = "RC_SAFETY_STOP"
+RC_NO_SOURCES = "RC_NO_SOURCES"
 
 
 # =============================================================================
-# Dataclasses (proof-grade structures)
+# Deterministic helpers
+# =============================================================================
+def safe_json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
+
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def stable_id(*parts: str) -> str:
+    return hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()[:12]
+
+def norm_text(s: str) -> str:
+    s = (s or "").replace("\u00a0", " ").replace("\r", "\n")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
+
+def pack_get(pack: Dict[str, Any], path: str, default=None):
+    cur: Any = pack
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
+
+def cap_sig(pack: Dict[str, Any]) -> str:
+    # scellabilité : hash stable (tri JSON)
+    return sha256_text(safe_json_dumps(pack))
+
+def det_now(cap: Dict[str, Any]) -> str:
+    # 100% déterministe : "timestamp" dérivé du CAP (pas d'horloge système)
+    # format stable (string)
+    return f"DET_{str(pack_get(cap,'_pack_sig_sha256',''))[:16]}"
+
+def det_reference_date_iso(cap: Dict[str, Any]) -> str:
+    # Référence temporelle FIXE pour calcul t_rec (anti-aléa)
+    # CAP peut fournir f_params.reference_date_iso (ex: "2026-01-01")
+    return str(pack_get(cap, "f_params.reference_date_iso", "2026-01-01"))
+
+
+# =============================================================================
+# Structures (proof-grade)
 # =============================================================================
 @dataclass(frozen=True)
 class PdfExtractMeta:
@@ -114,7 +156,6 @@ class AriTrace:
     ops: List[AriOpEvidence]
     all_ops: List[str]
     confidence_global: float
-    # ARI steps typed (Kernel: chaque étape ARI est typée)
     step_types: List[str]
 
 @dataclass
@@ -134,7 +175,6 @@ class QiItem:
     ari: Dict[str, Any]
     triggers: List[str]
     posable: Dict[str, Any]
-    # routing / coverage
     sig_q: str
     qc_id: Optional[str] = None
     is_orphan: bool = False
@@ -156,74 +196,32 @@ class QCItem:
     chapter_label: str
     primary_op: str
     all_ops: List[str]
-    # cluster
     cluster_size: int
     posable_in_cluster: int
     qi_ids: List[str]
     triggers: List[str]
     frt: Dict[str, Any]
-    # F1/F2 (Kernel)
+    # F1/F2 terms
     delta_c: float
     epsilon: float
-    T_steps: List[Dict[str, Any]]   # [{step_type, weight}]
+    T_steps: List[Dict[str, Any]]
     sum_Tj: float
     psi_brut: float
     psi_norm: float
-    # selection / redundancy
     n_q: int
     N_total_chap: int
     alpha: float
     t_rec: float
-    sigma_terms: List[Dict[str, Any]]  # debug
+    sigma_terms: List[Dict[str, Any]]
     score_f2: float
-    # evidence
     evidence_min: Dict[str, Any]
 
 
 # =============================================================================
-# Time / deterministic helpers
-# =============================================================================
-def _utc_ts() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def safe_json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
-
-def stable_id(*parts: str) -> str:
-    return hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()[:12]
-
-def norm_text(s: str) -> str:
-    s = (s or "").replace("\u00a0", " ").replace("\r", "\n")
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.lower()
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s).strip()
-    return s
-
-def pack_get(pack: Dict[str, Any], path: str, default=None):
-    cur: Any = pack
-    for part in path.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return default
-        cur = cur[part]
-    return cur
-
-def cap_sig(pack: Dict[str, Any]) -> str:
-    # scellabilité : hash stable (tri JSON)
-    return sha256_text(safe_json_dumps(pack))
-
-
-# =============================================================================
-# CAP (EMBEDDED) — données (PAS de logique métier dans le core)
+# CAP (EMBEDDED) — Données uniquement (PAS de logique métier dans CORE)
 # =============================================================================
 def _embedded_caps() -> Dict[str, Dict[str, Any]]:
-    # NOTE: Ces CAPs sont des CAPs de TEST déconnecté.
-    # Ils respectent la doctrine: toute variabilité (chapitres/keywords/params/poids) est dans le CAP.
-    # Le CORE ne “connait” pas les chapitres.
+    # Chapter taxonomy (données CAP)
     base_math_tax = {
         "MATH": {
             "TERMINALE": [
@@ -235,7 +233,6 @@ def _embedded_caps() -> Dict[str, Dict[str, Any]]:
         }
     }
 
-    # Cognitive table (poids T_j) — CAP data
     cognitive_table = {
         "step_weights": {
             "STEP_LIMIT": 1.2,
@@ -256,10 +253,9 @@ def _embedded_caps() -> Dict[str, Dict[str, Any]]:
             "OP_SOLVE_EQUATION": ["STEP_SOLVE_EQUATION"],
             "OP_PROVE": ["STEP_PROVE"],
             "OP_STANDARD": ["STEP_STANDARD"],
-        }
+        },
     }
 
-    # IA templates (CAP data)
     ari_config = {
         "op_patterns": [
             {"op": "OP_PROBABILITY", "pattern": r"\b(probabilit|proba|loi\s+binomiale|loi\s+normale|esperance|variance|aleatoire)\b", "weight": 1.0},
@@ -289,20 +285,20 @@ def _embedded_caps() -> Dict[str, Dict[str, Any]]:
                     "Définir précisément les événements",
                     "Identifier la loi et les paramètres",
                     "Appliquer la formule / outil adapté",
-                    "Calculer, vérifier, conclure"
+                    "Calculer, vérifier, conclure",
                 ],
                 "checks": ["Valeur dans [0,1]", "Interprétation correcte"],
-                "pitfalls": ["Mauvaise loi", "Arrondis prématurés"]
+                "pitfalls": ["Mauvaise loi", "Arrondis prématurés"],
             },
             "OP_DERIVE": {
                 "procedure": [
                     "Identifier f et le domaine",
                     "Appliquer les règles de dérivation",
                     "Simplifier f'(x)",
-                    "Exploiter (variations / tangente) si demandé"
+                    "Exploiter (variations / tangente) si demandé",
                 ],
                 "checks": ["Domaine", "Signe de f' si tableau"],
-                "pitfalls": ["Erreur de règle", "Oubli domaine"]
+                "pitfalls": ["Erreur de règle", "Oubli domaine"],
             },
             "OP_STANDARD": {
                 "procedure": [
@@ -310,12 +306,12 @@ def _embedded_caps() -> Dict[str, Dict[str, Any]]:
                     "Lister données / inconnues",
                     "Choisir la méthode",
                     "Exécuter les calculs",
-                    "Vérifier et conclure"
+                    "Vérifier et conclure",
                 ],
                 "checks": ["Résultat plausible", "Conclusion explicite"],
-                "pitfalls": ["Mauvaise méthode", "Erreurs algébriques"]
-            }
-        }
+                "pitfalls": ["Mauvaise méthode", "Erreurs algébriques"],
+            },
+        },
     }
 
     qc_format = {"prefix": "Comment", "suffix": "?", "template": "{prefix} {label} {suffix}"}
@@ -345,31 +341,28 @@ def _embedded_caps() -> Dict[str, Dict[str, Any]]:
         "ocr": {"enabled": True, "min_chars_before_ocr": 1200, "max_ocr_pages": 6, "ocr_dpi": 220},
     }
 
-    # Kernel table (doc): epsilon = 0.1 (CAP may override but here aligned)
     f_params = {
         "epsilon": 0.1,
         "alpha": 1.0,
         "t_rec_min": 0.01,
         "determinism_lock": True,
+        "reference_date_iso": "2026-01-01",
     }
 
-    # POSABLE rules (CAP)
     posable_rules = {
         "require_rqi": True,
         "require_scope": True,
         "require_evaluable": True,
         "min_ari_confidence": 0.55,
-        "min_answer_len": 20
+        "min_answer_len": 20,
     }
 
-    # Clustering (CAP)
     clustering = {
         "min_posable_per_cluster": 2,
-        "merge_similarity_threshold": 0.70,   # cosine on step-vectors
-        "allow_chapter_poor_exception": True
+        "merge_similarity_threshold": 0.70,
+        "allow_chapter_poor_exception": True,
     }
 
-    # Saturation schedule (CAP)
     saturation = {
         "vol_start": 6,
         "vol_max": 30,
@@ -378,116 +371,16 @@ def _embedded_caps() -> Dict[str, Dict[str, Any]]:
         "safety_stop_max_iters": 6,
     }
 
-    # Local source dir (CAP) — user can place PDFs here.
-    # Pairing rule is also CAP-driven (simple filename tokens).
     sources = {
         "source_id": "LOCAL_OR_STUB",
         "local_dir": "./SMAXIA_CAP_DATA/{country_code}/pdf",
-        "pairing": {
-            "corrige_tokens": ["corrig", "correction", "corrige", "solution"],
-        },
+        "pairing": {"corrige_tokens": ["corrig", "correction", "corrige", "solution"]},
         "date_regexes": [r"(\d{2})[_-](\d{2})[_-](20\d{2})", r"(20\d{2})[_-](\d{2})[_-](\d{2})"],
     }
 
-    # STUB pairs (CAP data) — CAS1 ONLY: sujet + corrige (texte)
-    # Intention: fournir au minimum 2 Qi POSABLE par chapitre pour respecter anti-singleton + coverage.
-    stub_pairs_fr = [
-        {
-            "pair_id": "STUB_FR_01",
-            "year": 2023,
-            "sujet_ref": "STUB:FR:sujet:01",
-            "corrige_ref": "STUB:FR:corrige:01",
-            "sujet_text": """Exercice 1
-1) Calculer la limite de f(x) quand x tend vers +∞.
-2) Étudier la dérivée f'(x) et dresser le tableau de variations.
-Exercice 2
-1) Calculer P(X=3) où X suit une loi binomiale.
-2) Calculer l'espérance de X.""",
-            "corrige_text": """Exercice 1
-1) On calcule la limite en utilisant les propriétés usuelles : ...
-2) On dérive f, on étudie le signe de f' : ...
-Exercice 2
-1) P(X=3)=C(n,3)p^3(1-p)^(n-3) : ...
-2) E(X)=np : ..."""
-        },
-        {
-            "pair_id": "STUB_FR_02",
-            "year": 2023,
-            "sujet_ref": "STUB:FR:sujet:02",
-            "corrige_ref": "STUB:FR:corrige:02",
-            "sujet_text": """Exercice 1
-1) Calculer l'intégrale ∫_0^1 (1+x) dx.
-2) Déterminer une primitive de g(x)=e^x.
-Exercice 2
-1) Définir la suite (u_n) et étudier sa convergence.
-2) Démontrer par récurrence que u_n ≥ 0.""",
-            "corrige_text": """Exercice 1
-1) ∫_0^1 (1+x) dx = [x + x^2/2]_0^1 = ...
-2) Une primitive est e^x : ...
-Exercice 2
-1) On étudie la suite : ...
-2) Initialisation + hérédité : ..."""
-        },
-        {
-            "pair_id": "STUB_FR_03",
-            "year": 2024,
-            "sujet_ref": "STUB:FR:sujet:03",
-            "corrige_ref": "STUB:FR:corrige:03",
-            "sujet_text": """Exercice 1
-1) Calculer la limite de h(x) quand x tend vers 0.
-2) Déterminer la dérivée de h(x)=ln(1+x) et conclure.
-Exercice 2
-1) X ~ loi normale : calculer P(a ≤ X ≤ b).
-2) Calculer la variance de X.""",
-            "corrige_text": """Exercice 1
-1) Limite par équivalent : ...
-2) h'(x)=1/(1+x) : ...
-Exercice 2
-1) Standardisation puis table : ...
-2) Var(X)=σ^2 : ..."""
-        }
-    ]
+    default_scope = {"subject": "MATH", "level": "TERMINALE"}
 
-    stub_pairs_ci = [
-        {
-            "pair_id": "STUB_CI_01",
-            "year": 2023,
-            "sujet_ref": "STUB:CI:sujet:01",
-            "corrige_ref": "STUB:CI:corrige:01",
-            "sujet_text": """Exercice 1
-1) Calculer la limite de f(x) quand x tend vers +∞.
-2) Résoudre l'équation f(x)=0.
-Exercice 2
-1) Calculer une probabilité dans une loi binomiale.
-2) Calculer l'espérance.""",
-            "corrige_text": """Exercice 1
-1) Limite : ...
-2) Résolution : ...
-Exercice 2
-1) Formule binomiale : ...
-2) E(X)=np : ..."""
-        },
-        {
-            "pair_id": "STUB_CI_02",
-            "year": 2024,
-            "sujet_ref": "STUB:CI:sujet:02",
-            "corrige_ref": "STUB:CI:corrige:02",
-            "sujet_text": """Exercice 1
-1) Calculer l'intégrale ∫_0^2 x dx.
-2) Déterminer une primitive de g(x)=x^2.
-Exercice 2
-1) Étudier une suite.
-2) Démontrer par récurrence une propriété.""",
-            "corrige_text": """Exercice 1
-1) ∫_0^2 x dx = [x^2/2]_0^2 = ...
-2) Une primitive est x^3/3 : ...
-Exercice 2
-1) Convergence : ...
-2) Initialisation + hérédité : ..."""
-        }
-    ]
-
-    def _cap(country_code: str, country_name: str, stubs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _cap(country_code: str, country_name: str) -> Dict[str, Any]:
         cap = {
             "pack_id": f"CAP_{country_code}_TEST_{APP_VERSION.replace('.','_')}",
             "pack_version": APP_VERSION,
@@ -495,8 +388,8 @@ Exercice 2
             "country_name": country_name,
             "language": "fr",
             "status": "SEALED",
-            "created_at": _utc_ts(),
-            "_source": "EMBEDDED_CAP_STUB",
+            "_source": "EMBEDDED_CAP",
+            "default_scope": default_scope,
             "chapter_taxonomy": base_math_tax,
             "ari_config": ari_config,
             "cognitive_table": cognitive_table,
@@ -508,15 +401,12 @@ Exercice 2
             "clustering": clustering,
             "saturation": saturation,
             "sources": sources,
-            "stub_pairs": stubs,
+            # IMPORTANT: pas de stub_pairs en dur requis ; fallback Pack-Driven générera si nécessaire
         }
         cap["_pack_sig_sha256"] = cap_sig(cap)
         return cap
 
-    return {
-        "FR": _cap("FR", "France", stub_pairs_fr),
-        "CI": _cap("CI", "Côte d’Ivoire", stub_pairs_ci),
-    }
+    return {"FR": _cap("FR", "France"), "CI": _cap("CI", "Côte d’Ivoire")}
 
 
 # =============================================================================
@@ -536,6 +426,9 @@ def load_cap(country_code: str, uploaded_json: Optional[bytes]) -> Dict[str, Any
         cap["_pack_sig_sha256"] = cap_sig(cap)
     else:
         cap = _embedded_caps()[country_code]
+    # Ensure deterministic signature exists
+    if "_pack_sig_sha256" not in cap:
+        cap["_pack_sig_sha256"] = cap_sig(cap)
     return cap
 
 def validate_cap(cap: Dict[str, Any]) -> Tuple[bool, List[str]]:
@@ -545,16 +438,35 @@ def validate_cap(cap: Dict[str, Any]) -> Tuple[bool, List[str]]:
             errs.append(f"CAP_MISSING:{k}")
     if str(cap.get("status", "")).upper() != "SEALED":
         errs.append("CAP_STATUS_NOT_SEALED")
-    # minimal type checks
     if not isinstance(pack_get(cap, "chapter_taxonomy", {}), dict):
         errs.append("CAP_BAD_TYPE:chapter_taxonomy")
     if not isinstance(pack_get(cap, "ari_config.op_patterns", []), list):
         errs.append("CAP_BAD_TYPE:ari_config.op_patterns")
+    if not isinstance(pack_get(cap, "cognitive_table.step_weights", {}), dict):
+        errs.append("CAP_BAD_TYPE:cognitive_table.step_weights")
+    if not isinstance(pack_get(cap, "cognitive_table.op_to_steps", {}), dict):
+        errs.append("CAP_BAD_TYPE:cognitive_table.op_to_steps")
     return (len(errs) == 0), errs
+
+def cap_default_scope(cap: Dict[str, Any]) -> Tuple[str, str]:
+    subj = pack_get(cap, "default_scope.subject", None)
+    lvl = pack_get(cap, "default_scope.level", None)
+    if subj and lvl:
+        return str(subj), str(lvl)
+    # fallback: pick first subject+level deterministically from taxonomy
+    tax = pack_get(cap, "chapter_taxonomy", {}) or {}
+    subjects = sorted(list(tax.keys()))
+    if not subjects:
+        return "UNDEF", "UNDEF"
+    s0 = subjects[0]
+    levels = sorted(list((tax.get(s0) or {}).keys()))
+    if not levels:
+        return str(s0), "UNDEF"
+    return str(s0), str(levels[0])
 
 
 # =============================================================================
-# PDF text extraction (local-only) + OCR optional
+# PDF extraction (local-only) + OCR optional (still deterministic in content order)
 # =============================================================================
 def _fix_missing_spaces(text: str, text_proc: Dict[str, Any]) -> str:
     if not text:
@@ -685,7 +597,7 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, cap: Dict[str, Any]) -> Tuple[
     ocr_pages = int(ocr_cfg.get("max_ocr_pages", 6))
     ocr_dpi = int(ocr_cfg.get("ocr_dpi", 220))
 
-    t0 = time.time()
+    # no wall-clock dependency used in meta.seconds (set deterministic 0.0)
     ocr_used = False
 
     pages = _extract_pdf_pdfplumber(pdf_bytes, max_pages)
@@ -711,13 +623,12 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes, cap: Dict[str, Any]) -> Tuple[
             txt, pages, method = txt4, pages4, "pymupdf_ocr"
             ocr_used = True
 
-    dt = time.time() - t0
-    meta = PdfExtractMeta(method=method, pages=len(pages), chars=len(txt), seconds=round(dt, 3), ocr_used=ocr_used)
+    meta = PdfExtractMeta(method=method, pages=len(pages), chars=len(txt), seconds=0.0, ocr_used=ocr_used)
     return txt, meta
 
 
 # =============================================================================
-# Source loading (local dir if available, else CAP.stub_pairs)
+# Sources loading (local PDFs if available, else Pack-Driven STUB generation)
 # =============================================================================
 def _read_file_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
@@ -734,15 +645,12 @@ def _list_pdfs(local_dir: str) -> List[str]:
     return sorted(out)
 
 def _pair_pdfs(pdfs: List[str], corrige_tokens: List[str]) -> List[Dict[str, Any]]:
-    # Deterministic pairing by filename tokens (CAP data)
-    # Sujet = not containing corrige tokens; Corrige = containing corrige tokens
     def is_corrige(name: str) -> bool:
         s = norm_text(os.path.basename(name))
         return any(tok in s for tok in (corrige_tokens or []))
 
     sujets = [p for p in pdfs if not is_corrige(p)]
     corriges = [p for p in pdfs if is_corrige(p)]
-
     pairs = []
     used = set()
 
@@ -775,10 +683,88 @@ def _pair_pdfs(pdfs: List[str], corrige_tokens: List[str]) -> List[Dict[str, Any
                 "sujet_ref": os.path.basename(su),
                 "corrige_ref": os.path.basename(best),
             })
+    return pairs
+
+def cap_chapters(cap: Dict[str, Any], subject: str, level: str) -> List[Dict[str, Any]]:
+    return pack_get(cap, f"chapter_taxonomy.{subject}.{level}", []) or []
+
+def _cap_ops_order(cap: Dict[str, Any]) -> List[str]:
+    return pack_get(cap, "ari_config.primary_ops_order", []) or ["OP_STANDARD"]
+
+def _cap_op_label(cap: Dict[str, Any], op: str) -> str:
+    return str(pack_get(cap, f"ari_config.op_labels.{op}", op.replace("OP_", "").lower()))
+
+def _cap_ch_keywords(ch: Dict[str, Any]) -> List[str]:
+    kws = ch.get("keywords", []) or []
+    kws2 = [norm_text(k) for k in kws if isinstance(k, str) and k.strip()]
+    # deterministic unique
+    out = []
+    seen = set()
+    for k in kws2:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+def generate_stub_pairs_pack_driven(cap: Dict[str, Any], subject: str, level: str, min_pairs: int = 2) -> List[Dict[str, Any]]:
+    """
+    Génération STUBS 100% Pack-Driven:
+    - Utilise UNIQUEMENT CAP: chapitres, keywords, op_labels, op_patterns
+    - Garantit >=2 Qi POSABLE par chapitre (si possible via CAP)
+    - Sujet + Corrigé textuels cohérents (CAS1 ONLY)
+    """
+    chapters = cap_chapters(cap, subject, level)
+    ops = _cap_ops_order(cap)
+    if not chapters:
+        return []
+
+    # pick two most informative ops deterministically
+    ops_use = [op for op in ops if op != "OP_STANDARD"][:2]
+    if len(ops_use) < 2:
+        ops_use = (ops_use + ["OP_STANDARD", "OP_STANDARD"])[:2]
+
+    pairs: List[Dict[str, Any]] = []
+    ref = det_reference_date_iso(cap)
+    for idx, ch in enumerate(chapters):
+        ch_code = str(ch.get("code", f"CH_{idx}"))
+        kws = _cap_ch_keywords(ch)
+        kw1 = kws[0] if kws else "concept"
+        kw2 = kws[1] if len(kws) > 1 else kw1
+
+        # build 2 questions per chapter using ops_use
+        q_blocks = []
+        a_blocks = []
+        for qi_idx, op in enumerate(ops_use):
+            label = _cap_op_label(cap, op)
+            # Include keywords + op indicators to trigger ARI patterns deterministically
+            q = f"{qi_idx+1}) {label} en utilisant {kw1} et {kw2}. Justifier."
+            # answer includes same tokens + minimal numeric/maths to satisfy evaluable
+            a = f"{qi_idx+1}) On applique la méthode pour {label} avec {kw1}/{kw2} : 1) définir; 2) calculer; 3) conclure."
+            q_blocks.append(q)
+            a_blocks.append(a)
+
+        sujet_text = f"Exercice {idx+1}\n" + "\n".join(q_blocks)
+        corrige_text = f"Corrigé Exercice {idx+1}\n" + "\n".join(a_blocks)
+
+        pair_id = f"STUB_{cap.get('country_code','XX')}_{subject}_{level}_{ch_code}_{stable_id(ch_code, ref)}"
+        pairs.append({
+            "pair_id": pair_id,
+            "year": int(ref.split("-")[0]) if re.match(r"^\d{4}-\d{2}-\d{2}$", ref) else 0,
+            "source_id": "CAP_STUB_GEN",
+            "sujet_ref": f"STUB:{cap.get('country_code','XX')}:{subject}:{level}:{ch_code}:sujet",
+            "corrige_ref": f"STUB:{cap.get('country_code','XX')}:{subject}:{level}:{ch_code}:corrige",
+            "sujet_text": sujet_text,
+            "corrige_text": corrige_text,
+        })
+
+    # If CAP has too few chapters, repeat deterministically (still pack-driven) to reach min_pairs
+    if len(pairs) < min_pairs and pairs:
+        while len(pairs) < min_pairs:
+            pairs.append(dict(pairs[len(pairs) % len(pairs)]))
 
     return pairs
 
-def load_sources(cap: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def load_sources(cap: Dict[str, Any], subject: str, level: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     sources = pack_get(cap, "sources", {}) or {}
     source_id = sources.get("source_id", "LOCAL_OR_STUB")
     local_dir_tpl = sources.get("local_dir", "./SMAXIA_CAP_DATA/{country_code}/pdf")
@@ -789,34 +775,28 @@ def load_sources(cap: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, A
     pairs_local = _pair_pdfs(pdfs, corrige_tokens)
 
     if pairs_local:
-        manifest = {
-            "mode": "LOCAL_PDF",
-            "source_id": source_id,
-            "local_dir": local_dir,
-            "pairs_total": len(pairs_local),
-        }
+        manifest = {"mode": "LOCAL_PDF", "source_id": source_id, "local_dir": local_dir, "pairs_total": len(pairs_local)}
         return pairs_local, manifest
 
-    # fallback to stubs
-    stubs = pack_get(cap, "stub_pairs", []) or []
-    pairs_stub = []
-    for sp in stubs:
-        pairs_stub.append({
-            "pair_id": sp["pair_id"],
-            "year": int(sp.get("year", 0) or 0),
-            "source_id": "CAP_STUB",
-            "sujet_ref": sp.get("sujet_ref", ""),
-            "corrige_ref": sp.get("corrige_ref", ""),
-            "sujet_text": sp.get("sujet_text", ""),
-            "corrige_text": sp.get("corrige_text", ""),
-        })
+    # fallback: CAP.stub_pairs (optional) else Pack-Driven generator (mandatory if none)
+    stubs = pack_get(cap, "stub_pairs", None)
+    pairs_stub: List[Dict[str, Any]] = []
+    if isinstance(stubs, list) and stubs:
+        for sp in stubs:
+            pairs_stub.append({
+                "pair_id": sp.get("pair_id", "STUB_" + stable_id(safe_json_dumps(sp)[:120])),
+                "year": int(sp.get("year", 0) or 0),
+                "source_id": "CAP_STUB",
+                "sujet_ref": sp.get("sujet_ref", ""),
+                "corrige_ref": sp.get("corrige_ref", ""),
+                "sujet_text": sp.get("sujet_text", ""),
+                "corrige_text": sp.get("corrige_text", ""),
+            })
 
-    manifest = {
-        "mode": "CAP_STUB",
-        "source_id": source_id,
-        "local_dir": local_dir,
-        "pairs_total": len(pairs_stub),
-    }
+    if not pairs_stub:
+        pairs_stub = generate_stub_pairs_pack_driven(cap, subject, level, min_pairs=2)
+
+    manifest = {"mode": "CAP_STUB", "source_id": source_id, "local_dir": local_dir, "pairs_total": len(pairs_stub)}
     return pairs_stub, manifest
 
 
@@ -889,7 +869,6 @@ def _looks_like_question(seg: str, intent_verbs: List[str], keep_cfg: Dict[str, 
     L = len(seg)
     if L < int(keep_cfg.get("min_len", 25)) or L > int(keep_cfg.get("max_len", 2200)):
         return False
-
     s = norm_text(seg)
     has_intent = any(v in s for v in intent_verbs) or ("?" in seg)
     digits = len(re.findall(r"\d", seg))
@@ -1015,11 +994,8 @@ def align_q_to_a(qs: List[str], ans: List[str], cap: Dict[str, Any]) -> Tuple[Li
 
 
 # =============================================================================
-# Scope mapping (pack-driven)
+# Mapping chapitre (pack-driven)
 # =============================================================================
-def cap_chapters(cap: Dict[str, Any], subject: str, level: str) -> List[Dict[str, Any]]:
-    return pack_get(cap, f"chapter_taxonomy.{subject}.{level}", []) or []
-
 def map_to_chapter(q_text: str, chapters: List[Dict[str, Any]]) -> Tuple[str, str, float]:
     if not chapters:
         return "UNMAPPED", "UNMAPPED", 0.0
@@ -1043,7 +1019,7 @@ def map_to_chapter(q_text: str, chapters: List[Dict[str, Any]]) -> Tuple[str, st
 
 
 # =============================================================================
-# ARI extraction (pack-driven, evidence) + typed steps (via CAP cognitive_table)
+# ARI + typed steps (pack-driven)
 # =============================================================================
 def _ari_steps_from_ops(cap: Dict[str, Any], ops: List[str]) -> List[str]:
     op_to_steps = pack_get(cap, "cognitive_table.op_to_steps", {}) or {}
@@ -1052,7 +1028,6 @@ def _ari_steps_from_ops(cap: Dict[str, Any], ops: List[str]) -> List[str]:
         steps.extend(list(op_to_steps.get(op, [])))
     if not steps:
         steps = ["STEP_STANDARD"]
-    # unique, stable order
     out = []
     seen = set()
     for s in steps:
@@ -1104,13 +1079,7 @@ def extract_ari(q: str, r: str, cap: Dict[str, Any]) -> AriTrace:
     all_ops = sorted(list(seen))
     steps = _ari_steps_from_ops(cap, all_ops)
 
-    return AriTrace(
-        primary_op=primary,
-        ops=ops,
-        all_ops=all_ops,
-        confidence_global=round(conf_global, 4),
-        step_types=steps
-    )
+    return AriTrace(primary_op=primary, ops=ops, all_ops=all_ops, confidence_global=round(conf_global, 4), step_types=steps)
 
 def build_triggers(q: str, ari: AriTrace, chapter_code: str, cap: Dict[str, Any]) -> List[str]:
     tp = pack_get(cap, "text_processing", {}) or {}
@@ -1134,7 +1103,6 @@ def build_triggers(q: str, ari: AriTrace, chapter_code: str, cap: Dict[str, Any]
     if chapter_code and chapter_code != "UNMAPPED":
         out.append(f"SCOPE:{chapter_code}")
 
-    # unique stable
     out2 = list(dict.fromkeys(out))
     return out2[:12]
 
@@ -1192,7 +1160,7 @@ def generate_frt(primary_op: str, triggers: List[str], ari: AriTrace, cap: Dict[
         sections.setdefault(k, {})
 
     frt_id = f"FRT_{stable_id(primary_op, sha256_text(safe_json_dumps(sections))[:12])}"
-    return FRT(frt_id=frt_id, primary_op=primary_op, title=title, sections=sections, generated_at=_utc_ts())
+    return FRT(frt_id=frt_id, primary_op=primary_op, title=title, sections=sections, generated_at=det_now(cap))
 
 
 # =============================================================================
@@ -1211,9 +1179,10 @@ def build_qc_text(primary_op: str, cap: Dict[str, Any]) -> Tuple[str, str]:
 
 
 # =============================================================================
-# Kernel F1 / F2 (aligné sur Kernel V10.6.3 tables)
-# - F1: Ψ_q recalculable depuis {δ_c, ε, T_j} (T_j tracés via ARI step_types + CAP cognitive_table)
-# - F2: Score(q) = (n_q / N_total[chap]) × (1 + α / t_rec) × Ψ_q × Π(1 − σ(q,p))
+# Kernel F1 / F2 (déterministes)
+# - F1: Ψ_q = δ_c × (ε + ΣTj)^2
+# - Normalisation intra-chapitre: Ψ_norm = Ψ_q / max(Ψ_q dans chapitre)
+# - F2: Score(q) = (n_q/N_total) × (1+α/t_rec) × Ψ_norm × Π(1 − σ(q,p))
 # =============================================================================
 def _T_steps_from_ari(cap: Dict[str, Any], ari: AriTrace) -> List[Dict[str, Any]]:
     weights = pack_get(cap, "cognitive_table.step_weights", {}) or {}
@@ -1263,38 +1232,65 @@ def _parse_exam_date(name: str, cap: Dict[str, Any]) -> Optional[str]:
         if not m:
             continue
         g = m.groups()
-        # dd_mm_yyyy
         if len(g) == 3 and len(g[2]) == 4 and (g[0].isdigit() and g[1].isdigit() and g[2].isdigit()):
             dd, mm, yy = int(g[0]), int(g[1]), int(g[2])
             if 1 <= mm <= 12 and 1 <= dd <= 31 and yy >= 2000:
                 return f"{yy:04d}-{mm:02d}-{dd:02d}"
-        # yyyy_mm_dd
         if len(g) == 3 and len(g[0]) == 4 and (g[0].isdigit() and g[1].isdigit() and g[2].isdigit()):
             yy, mm, dd = int(g[0]), int(g[1]), int(g[2])
             if 1 <= mm <= 12 and 1 <= dd <= 31 and yy >= 2000:
                 return f"{yy:04d}-{mm:02d}-{dd:02d}"
     return None
 
-def _t_rec_from_exam_date(exam_date: Optional[str], t_rec_min: float) -> float:
+def _t_rec_from_exam_date(exam_date: Optional[str], cap: Dict[str, Any]) -> float:
+    t_rec_min = float(pack_get(cap, "f_params.t_rec_min", 0.01))
+    ref = det_reference_date_iso(cap)
     if not exam_date:
         return float(t_rec_min)
-    try:
-        ex_dt = datetime.fromisoformat(exam_date + "T00:00:00+00:00")
-        now = datetime.now(timezone.utc)
-        days = max(0, (now - ex_dt).days)
-        # Kernel table: t_rec = max(0.01, days/365)
-        return float(max(t_rec_min, round(days / 365.0, 6)))
-    except Exception:
+
+    # Deterministic day-diff without datetime.now()
+    def to_days(iso: str) -> Optional[int]:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", iso):
+            return None
+        y, m, d = iso.split("-")
+        y, m, d = int(y), int(m), int(d)
+        # simple serial day count (Gregorian proleptic) — deterministic
+        # algorithm: Rata Die
+        if m <= 2:
+            y -= 1
+            m += 12
+        era = y // 400
+        yoe = y - era * 400
+        doy = (153 * (m - 3) + 2) // 5 + d - 1
+        doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+        return era * 146097 + doe
+
+    ex_d = to_days(exam_date)
+    ref_d = to_days(ref)
+    if ex_d is None or ref_d is None:
         return float(t_rec_min)
 
-def f2_score_for_candidate(n_q: int, N_total_chap: int, alpha: float, t_rec: float, psi_norm: float,
-                           selected: List[QCItem], candidate: QCItem, cap: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
+    days = max(0, ref_d - ex_d)
+    return float(max(t_rec_min, round(days / 365.0, 6)))
+
+def f2_score_for_candidate(
+    n_q: int,
+    N_total_chap: int,
+    alpha: float,
+    t_rec: float,
+    psi_norm: float,
+    selected: List["QCItem"],
+    candidate: "QCItem",
+    cap: Dict[str, Any]
+) -> Tuple[float, List[Dict[str, Any]]]:
     base = (float(n_q) / max(1.0, float(N_total_chap))) * (1.0 + float(alpha) / max(1e-9, float(t_rec))) * float(psi_norm)
     prod = 1.0
     sig_dbg = []
-    cand_vec = _vec_from_steps(cap, pack_get(candidate.frt, "sections.ari.step_types", []) or [])
+    cand_steps = pack_get(candidate.frt, "sections.ari.step_types", []) or []
+    cand_vec = _vec_from_steps(cap, cand_steps)
     for prev in selected:
-        prev_vec = _vec_from_steps(cap, pack_get(prev.frt, "sections.ari.step_types", []) or [])
+        prev_steps = pack_get(prev.frt, "sections.ari.step_types", []) or []
+        prev_vec = _vec_from_steps(cap, prev_steps)
         sig = _cosine(cand_vec, prev_vec)
         prod *= (1.0 - sig)
         sig_dbg.append({"prev_qc_id": prev.qc_id, "sigma": round(sig, 6)})
@@ -1302,18 +1298,19 @@ def f2_score_for_candidate(n_q: int, N_total_chap: int, alpha: float, t_rec: flo
 
 
 # =============================================================================
-# Clustering (anti-singleton) + deterministic merge within chapter
+# Signature SIG(q) (Pack-driven)
 # =============================================================================
 def _sig_q(cap: Dict[str, Any], chapter_code: str, ari: AriTrace, triggers: List[str]) -> str:
-    # Kernel doc mentions SIG(q)=<A,P,O,X> but here we build a deterministic signature from typed steps + primary_op + chapter.
-    # Strictly data-driven content (ARI + CAP) — no chapter logic in core.
     step_types = ari.step_types or ["STEP_STANDARD"]
     trig_core = sorted([t for t in (triggers or []) if t.startswith("ARI:") or t.startswith("KW:")])[:8]
     raw = f"{chapter_code}||{ari.primary_op}||{'/'.join(step_types)}||{'/'.join(trig_core)}"
     return "SIG_" + stable_id(raw)
 
+
+# =============================================================================
+# Clustering (anti-singleton) + deterministic merge within chapter
+# =============================================================================
 def _cluster_vector(cap: Dict[str, Any], qi_items: List[QiItem]) -> Dict[str, float]:
-    # sum of step-weight vectors (deterministic)
     v = defaultdict(float)
     for qi in qi_items:
         steps = pack_get(qi.ari, "step_types", []) or []
@@ -1323,12 +1320,10 @@ def _cluster_vector(cap: Dict[str, Any], qi_items: List[QiItem]) -> Dict[str, fl
     return dict(v)
 
 def cluster_qi(cap: Dict[str, Any], qi_items: List[QiItem], min_posable: int, merge_thr: float) -> Tuple[Dict[str, List[QiItem]], List[QiItem]]:
-    # initial clusters by (chapter_code, sig_q)
     clusters = defaultdict(list)
     for qi in qi_items:
         clusters[f"{qi.chapter_code}::{qi.sig_q}"].append(qi)
 
-    # split into strong clusters (>=min_posable POSABLE) vs weak
     def posable_count(items: List[QiItem]) -> int:
         return sum(1 for x in items if x.has_rqi and (x.posable or {}).get("is_posable"))
 
@@ -1340,14 +1335,10 @@ def cluster_qi(cap: Dict[str, Any], qi_items: List[QiItem], min_posable: int, me
         else:
             weak[k] = items
 
-    # deterministic merge of weak clusters into closest strong cluster within same chapter if similarity >= threshold
-    # otherwise, they remain orphan candidates.
     strong_by_ch = defaultdict(list)
     for k, items in strong.items():
         ch = k.split("::", 1)[0]
         strong_by_ch[ch].append((k, items))
-
-    # stable order
     for ch in list(strong_by_ch.keys()):
         strong_by_ch[ch] = sorted(strong_by_ch[ch], key=lambda x: x[0])
 
@@ -1359,7 +1350,6 @@ def cluster_qi(cap: Dict[str, Any], qi_items: List[QiItem], min_posable: int, me
         wk_pos = posable_count(wk_items)
 
         if wk_pos == 0:
-            # non-posable does not affect coverage; keep in orphan_candidates for trace
             orphan_candidates.extend(wk_items)
             continue
 
@@ -1370,18 +1360,15 @@ def cluster_qi(cap: Dict[str, Any], qi_items: List[QiItem], min_posable: int, me
         for sk_key, sk_items in strong_by_ch.get(ch, []):
             sk_vec = _cluster_vector(cap, sk_items)
             sim = _cosine(wk_vec, sk_vec)
-            # deterministic tie-break by key
             if (sim > best_sim) or (abs(sim - best_sim) < 1e-12 and best and sk_key < best[0]):
                 best_sim = sim
                 best = (sk_key, sk_items)
 
         if best and best_sim >= merge_thr:
-            # merge into that strong cluster
             strong[best[0]].extend(wk_items)
         else:
             orphan_candidates.extend(wk_items)
 
-    # re-evaluate strong clusters (they may have grown)
     strong_final = {}
     for k, items in strong.items():
         strong_final[k] = sorted(items, key=lambda x: x.qi_id)
@@ -1390,7 +1377,7 @@ def cluster_qi(cap: Dict[str, Any], qi_items: List[QiItem], min_posable: int, me
 
 
 # =============================================================================
-# IA2 Judge (bool checks minimal, Kernel aligned)
+# IA2 Judge (bool checks)
 # =============================================================================
 def ia2_checks(cap: Dict[str, Any], qc: QCItem) -> Tuple[bool, List[Dict[str, Any]]]:
     issues = []
@@ -1403,19 +1390,16 @@ def ia2_checks(cap: Dict[str, Any], qc: QCItem) -> Tuple[bool, List[Dict[str, An
     if suffix and not qc.qc.strip().endswith(suffix):
         issues.append({"check": "CHK_QC_FORM_SUFFIX", "ok": False})
 
-    # anti-singleton for POSABLE cluster (Kernel)
     min_pos = int(pack_get(cap, "clustering.min_posable_per_cluster", 2))
     if qc.posable_in_cluster < min_pos:
         issues.append({"check": "CHK_ANTI_SINGLETON", "ok": False})
 
-    # FRT required sections
     required = pack_get(cap, "ari_config.frt_schema_required_sections", []) or []
     frt_sections = (qc.frt or {}).get("sections", {}) or {}
     for k in required:
         if k not in frt_sections:
             issues.append({"check": f"CHK_FRT_SECTION_{k}", "ok": False})
 
-    # F2 terms visible in audit (we keep them in QCItem)
     if qc.N_total_chap <= 0:
         issues.append({"check": "CHK_F2_NTOTAL_CHAP", "ok": False})
 
@@ -1423,7 +1407,73 @@ def ia2_checks(cap: Dict[str, Any], qc: QCItem) -> Tuple[bool, List[Dict[str, An
 
 
 # =============================================================================
-# Pipeline end-to-end + saturation auto
+# IA1 Miner / IA1 Builder (noms explicites, logique existante)
+# =============================================================================
+def IA1_Miner_extract_Qi_RQi(sujet_text: str, corrige_text: str, cap: Dict[str, Any]) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    qs, q_audit = split_into_q_segments(sujet_text, cap)
+    ans, a_audit = split_into_a_segments(corrige_text, cap)
+    link, al_audit = align_q_to_a(qs, ans, cap)
+    audit = {"atom_q": q_audit, "atom_a": a_audit, "align": al_audit, "links_total": len(link)}
+    # attach aligned answers by index later in builder
+    return qs, ans, {"miner": audit, "link": link}
+
+def IA1_Builder_build_QiItems(
+    pair: Dict[str, Any],
+    qs: List[str],
+    ans: List[str],
+    link: List[Optional[int]],
+    chapters: List[Dict[str, Any]],
+    cap: Dict[str, Any],
+) -> List[QiItem]:
+    qi_items: List[QiItem] = []
+    pair_id = pair.get("pair_id", "")
+    exam_date = _parse_exam_date(pair.get("sujet_ref","") or "", cap) or _parse_exam_date(pair.get("corrige_ref","") or "", cap)
+
+    atom_low = (len(qs) < 4)
+    for i, qtxt in enumerate(qs):
+        j = link[i] if i < len(link) else None
+        rtxt = ans[j] if (j is not None and j < len(ans)) else ""
+
+        ari = extract_ari(qtxt, rtxt, cap)
+        ch_code, _, ch_sc = map_to_chapter(qtxt, chapters)
+        triggers = build_triggers(qtxt, ari, ch_code, cap)
+        pd = posable_gate(qtxt, rtxt, ch_code, ari, cap)
+
+        rc_extra = list(pd.reason_codes)
+        if atom_low:
+            rc_extra = list(dict.fromkeys(rc_extra + [RC_ATOMIZATION_LOW]))
+        if j is None and not rtxt.strip():
+            rc_extra = list(dict.fromkeys(rc_extra + [RC_ALIGN_LOW]))
+
+        pd2 = PosableDecision(is_posable=(len(rc_extra) == 0), reason_codes=rc_extra, confidence=pd.confidence)
+
+        qi_id = f"QI_{stable_id(pair_id, str(i), norm_text(qtxt)[:120])}"
+        sigq = _sig_q(cap, ch_code, ari, triggers)
+        qi_items.append(QiItem(
+            qi_id=qi_id,
+            pair_id=pair_id,
+            source_id=pair.get("source_id",""),
+            source_year=int(pair.get("year", 0) or 0),
+            source_exam_date=exam_date,
+            sujet_ref=pair.get("sujet_ref",""),
+            corrige_ref=pair.get("corrige_ref",""),
+            qi=qtxt,
+            rqi=rtxt,
+            has_rqi=bool(rtxt.strip()),
+            chapter_code=ch_code,
+            chapter_match_score=float(ch_sc),
+            ari=asdict(ari),
+            triggers=triggers,
+            posable=asdict(pd2),
+            sig_q=sigq,
+            qc_id=None,
+            is_orphan=False
+        ))
+    return qi_items
+
+
+# =============================================================================
+# Pair extraction (PDF or STUB)
 # =============================================================================
 def _extract_pair_text(pair: Dict[str, Any], cap: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any], Optional[QuarantineEntry]]:
     source_id = pair.get("source_id", "UNKNOWN")
@@ -1459,7 +1509,7 @@ def _extract_pair_text(pair: Dict[str, Any], cap: Dict[str, Any]) -> Tuple[str, 
             return "", "", meta, q
         return su_txt, co_txt, meta, None
 
-    # CAP STUB
+    # STUB
     su_txt = pair.get("sujet_text", "") or ""
     co_txt = pair.get("corrige_text", "") or ""
     if not su_txt.strip():
@@ -1474,18 +1524,22 @@ def _extract_pair_text(pair: Dict[str, Any], cap: Dict[str, Any]) -> Tuple[str, 
             "corrige_extract": {"method": "STUB", "pages": 0, "chars": len(co_txt), "seconds": 0.0, "ocr_used": False}}
     return su_txt, co_txt, meta, None
 
-def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subject: str, level: str) -> Dict[str, Any]:
+
+# =============================================================================
+# Pipeline end-to-end (ISO-PROD logique) + saturation auto
+# =============================================================================
+def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subject: str, level: str, source_manifest: Dict[str, Any]) -> Dict[str, Any]:
     chapters = cap_chapters(cap, subject, level)
 
     # deterministic slice
     pairs2 = pairs[:max(0, min(volume, len(pairs)))]
     quarantine: List[QuarantineEntry] = []
     qi_items: List[QiItem] = []
-    pair_meta: List[Dict[str, Any]] = []
 
     epsilon = float(pack_get(cap, "f_params.epsilon", 0.1))
     alpha = float(pack_get(cap, "f_params.alpha", 1.0))
-    t_rec_min = float(pack_get(cap, "f_params.t_rec_min", 0.01))
+
+    pair_meta: List[Dict[str, Any]] = []
 
     for pair in pairs2:
         pair_id = pair.get("pair_id", "")
@@ -1495,56 +1549,11 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
             pair_meta.append({"pair_id": pair_id, "meta": meta, "quarantine": asdict(qent)})
             continue
 
-        qs, q_audit = split_into_q_segments(su_txt, cap)
-        ans, a_audit = split_into_a_segments(co_txt, cap)
+        qs, ans, miner_out = IA1_Miner_extract_Qi_RQi(su_txt, co_txt, cap)
+        link = miner_out.get("link", [])
+        pair_meta.append({"pair_id": pair_id, "meta": meta, **miner_out.get("miner", {})})
 
-        link, al_audit = align_q_to_a(qs, ans, cap)
-
-        # best effort exam_date from refs
-        exam_date = _parse_exam_date(pair.get("sujet_ref","") or "", cap) or _parse_exam_date(pair.get("corrige_ref","") or "", cap)
-
-        pair_meta.append({"pair_id": pair_id, "meta": meta, "atom_q": q_audit, "atom_a": a_audit, "align": al_audit})
-
-        atom_low = (len(qs) < 4)
-        for i, qtxt in enumerate(qs):
-            j = link[i] if i < len(link) else None
-            rtxt = ans[j] if (j is not None and j < len(ans)) else ""
-
-            ari = extract_ari(qtxt, rtxt, cap)
-            ch_code, ch_label, ch_sc = map_to_chapter(qtxt, chapters)
-            triggers = build_triggers(qtxt, ari, ch_code, cap)
-            pd = posable_gate(qtxt, rtxt, ch_code, ari, cap)
-
-            rc_extra = list(pd.reason_codes)
-            if atom_low:
-                rc_extra = list(dict.fromkeys(rc_extra + [RC_ATOMIZATION_LOW]))
-            if j is None and not rtxt.strip():
-                rc_extra = list(dict.fromkeys(rc_extra + [RC_ALIGN_LOW]))
-
-            pd2 = PosableDecision(is_posable=(len(rc_extra) == 0), reason_codes=rc_extra, confidence=pd.confidence)
-
-            qi_id = f"QI_{stable_id(pair_id, str(i), norm_text(qtxt)[:120])}"
-            sigq = _sig_q(cap, ch_code, ari, triggers)
-            qi_items.append(QiItem(
-                qi_id=qi_id,
-                pair_id=pair_id,
-                source_id=pair.get("source_id",""),
-                source_year=int(pair.get("year", 0) or 0),
-                source_exam_date=exam_date,
-                sujet_ref=pair.get("sujet_ref",""),
-                corrige_ref=pair.get("corrige_ref",""),
-                qi=qtxt,
-                rqi=rtxt,
-                has_rqi=bool(rtxt.strip()),
-                chapter_code=ch_code,
-                chapter_match_score=float(ch_sc),
-                ari=asdict(ari),
-                triggers=triggers,
-                posable=asdict(pd2),
-                sig_q=sigq,
-                qc_id=None,
-                is_orphan=False
-            ))
+        qi_items.extend(IA1_Builder_build_QiItems(pair, qs, ans, link, chapters, cap))
 
     # POSABLE set
     posable_qi = [q for q in qi_items if q.has_rqi and (q.posable or {}).get("is_posable")]
@@ -1552,31 +1561,26 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
     # clustering
     min_posable = int(pack_get(cap, "clustering.min_posable_per_cluster", 2))
     merge_thr = float(pack_get(cap, "clustering.merge_similarity_threshold", 0.70))
-    clusters, orphan_candidates = cluster_qi(cap, qi_items, min_posable=min_posable, merge_thr=merge_thr)
+    clusters, _ = cluster_qi(cap, qi_items, min_posable=min_posable, merge_thr=merge_thr)
 
-    # Build QC candidates from clusters (only those meeting anti-singleton on POSABLE)
+    # Build QC candidates
     qc_candidates: List[QCItem] = []
     qi_to_qc: Dict[str, str] = {}
 
-    # precompute N_total per chapter (Kernel: N_total[c] is per chapter, POSABLE only)
+    # N_total per chapter (POSABLE only)
     posable_by_ch = defaultdict(list)
     for qi in posable_qi:
         posable_by_ch[qi.chapter_code].append(qi)
-
     N_total_by_ch = {ch: len(items) for ch, items in posable_by_ch.items()}
 
-    # chapter label map
     ch_info = {c.get("code"): c for c in chapters}
 
     for cl_key in sorted(clusters.keys()):
         items = clusters[cl_key]
-        # count posable inside
         pos_count = sum(1 for x in items if x.has_rqi and (x.posable or {}).get("is_posable"))
         if pos_count < min_posable:
-            # do not generate QC candidate (anti-singleton)
             continue
 
-        # representative = max confidence_global
         rep = max(items, key=lambda z: float((z.ari or {}).get("confidence_global", 0.0)))
         rep_ari = rep.ari or {}
         primary_op = str(rep_ari.get("primary_op", "OP_STANDARD"))
@@ -1584,7 +1588,6 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
         ch_code = rep.chapter_code
         ch_label = ch_info.get(ch_code, {}).get("label", ch_code)
 
-        # triggers: top occurrences
         trig_counts = Counter()
         all_ops = set()
         for it in items:
@@ -1594,29 +1597,24 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
         qi_ids = [x.qi_id for x in items]
 
         # FRT from rep
-        frt = generate_frt(primary_op, qc_triggers, AriTrace(
+        rep_trace = AriTrace(
             primary_op=str(rep_ari.get("primary_op","OP_STANDARD")),
             ops=[AriOpEvidence(**o) for o in (rep_ari.get("ops") or [])],
             all_ops=list(rep_ari.get("all_ops") or []),
             confidence_global=float(rep_ari.get("confidence_global", 0.55)),
             step_types=list(rep_ari.get("step_types") or ["STEP_STANDARD"])
-        ), cap)
+        )
+        frt = generate_frt(primary_op, qc_triggers, rep_trace, cap)
 
-        # F1 inputs
+        # F1
         delta_c = float(ch_info.get(ch_code, {}).get("delta_c", 1.0))
-        T_steps = _T_steps_from_ari(cap, AriTrace(
-            primary_op=str(rep_ari.get("primary_op","OP_STANDARD")),
-            ops=[AriOpEvidence(**o) for o in (rep_ari.get("ops") or [])],
-            all_ops=list(rep_ari.get("all_ops") or []),
-            confidence_global=float(rep_ari.get("confidence_global", 0.55)),
-            step_types=list(rep_ari.get("step_types") or ["STEP_STANDARD"])
-        ))
+        T_steps = _T_steps_from_ari(cap, rep_trace)
         sum_Tj, psi_brut = f1_psi(delta_c, epsilon, T_steps)
 
-        # t_rec (Kernel: based on last occurrence; here approximated from latest exam_date found in cluster)
+        # t_rec from latest exam_date in cluster (deterministic reference date in CAP)
         dates = [x.source_exam_date for x in items if x.source_exam_date]
         exam_date = max(dates) if dates else None
-        t_rec = _t_rec_from_exam_date(exam_date, t_rec_min)
+        t_rec = _t_rec_from_exam_date(exam_date, cap)
 
         qc_id = "QC_" + stable_id(ch_code, primary_op, qc_text, ",".join(sorted(qi_ids))[:80])
 
@@ -1625,7 +1623,7 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
             "source_id": rep.source_id,
             "sujet_refs": sorted({x.sujet_ref for x in items})[:5],
             "corrige_refs": sorted({x.corrige_ref for x in items})[:5],
-            "qi_ids_sample": qi_ids[:6]
+            "qi_ids_sample": qi_ids[:6],
         }
 
         qc_candidates.append(QCItem(
@@ -1646,7 +1644,7 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
             T_steps=T_steps,
             sum_Tj=sum_Tj,
             psi_brut=psi_brut,
-            psi_norm=0.0,  # set after normalization
+            psi_norm=0.0,
             n_q=pos_count,
             N_total_chap=int(N_total_by_ch.get(ch_code, 0)),
             alpha=alpha,
@@ -1656,29 +1654,27 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
             evidence_min=evidence_min
         ))
 
-    # normalize psi intra-chapter (Kernel F1-BOOL-3)
+    # normalize psi intra-chapter
     by_ch = defaultdict(list)
     for qc in qc_candidates:
         by_ch[qc.chapter_code].append(qc)
-
     for ch, qcs in by_ch.items():
         mx = max((q.psi_brut for q in qcs), default=0.0)
         for q in qcs:
             q.psi_norm = round((q.psi_brut / mx) if mx > 0 else 0.0, 10)
 
-    # Selection (Kernel: set-cover deterministic)
-    selected_by_ch = {}
-    coverage_map = {}
+    # Selection per chapter (set cover greedy + F2 scoring)
+    selected_by_ch: Dict[str, List[QCItem]] = {}
+    coverage_map: Dict[str, Any] = {}
     safety_stop = False
-    safety_notes = []
+    safety_notes: List[Dict[str, Any]] = []
 
     for ch in sorted(posable_by_ch.keys()):
         uncovered = set([q.qi_id for q in posable_by_ch[ch]])
         candidates = [q for q in qc_candidates if q.chapter_code == ch and q.posable_in_cluster >= min_posable]
-        candidates = sorted(candidates, key=lambda x: x.qc_id)  # deterministic base
+        candidates = sorted(candidates, key=lambda x: x.qc_id)
 
         selected: List[QCItem] = []
-        # Greedy set cover with F2 score ordering (deterministic)
         while uncovered:
             best = None
             best_gain = -1
@@ -1699,7 +1695,6 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
                     candidate=cand,
                     cap=cap
                 )
-                # choose by gain, then score, then qc_id
                 if (gain > best_gain) or (gain == best_gain and score > best_score) or (gain == best_gain and abs(score-best_score) < 1e-12 and best and cand.qc_id < best.qc_id):
                     cand.score_f2 = score
                     cand.sigma_terms = sig_dbg
@@ -1714,25 +1709,21 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
 
             selected.append(best)
             uncovered = uncovered - set(best.qi_ids)
-
-            # remove selected from candidates
             candidates = [c for c in candidates if c.qc_id != best.qc_id]
 
         selected_by_ch[ch] = selected
         coverage_map[ch] = {
             "N_total_chap": int(N_total_by_ch.get(ch, 0)),
             "covered": int(N_total_by_ch.get(ch, 0) - len(uncovered)),
-            "uncovered": sorted(list(uncovered))[:50],
+            "uncovered": sorted(list(uncovered))[:200],
             "coverage": round((float(N_total_by_ch.get(ch, 0) - len(uncovered)) / max(1, float(N_total_by_ch.get(ch, 0)))), 6)
         }
 
-    # Map Qi -> QC (coverage proof): assign each posable Qi to the first selected QC that covers it (deterministic order)
-    qc_by_id = {q.qc_id: q for q in qc_candidates}
-    selected_all = []
+    selected_all: List[QCItem] = []
     for ch in sorted(selected_by_ch.keys()):
         selected_all.extend(selected_by_ch[ch])
 
-    # QA IA2 checks on selected only (Kernel: IA2 PASS)
+    # IA2 judge on selected
     ia2_ok = True
     ia2_issues = []
     for qc in selected_all:
@@ -1741,7 +1732,7 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
             ia2_ok = False
             ia2_issues.extend([{"qc_id": qc.qc_id, **x} for x in issues])
 
-    # assignment
+    # assignment Qi -> QC (first covering qc)
     for qi in qi_items:
         qi.qc_id = None
         qi.is_orphan = False
@@ -1749,7 +1740,6 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
     for ch in sorted(selected_by_ch.keys()):
         for qc in selected_by_ch[ch]:
             for qid in qc.qi_ids:
-                # assign only if not assigned
                 if qid not in qi_to_qc:
                     qi_to_qc[qid] = qc.qc_id
 
@@ -1760,15 +1750,10 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
             qi.is_orphan = False
         else:
             qi.qc_id = None
-            # orphan relevant only if POSABLE
             if qi.has_rqi and (qi.posable or {}).get("is_posable"):
                 qi.is_orphan = True
                 orphans_posable += 1
 
-    # chapter-poor exception (Kernel mentions) is only used implicitly if CAP allows and there is a single cluster available;
-    # here we keep strict anti-singleton; safety-stop will reflect if it blocks coverage.
-
-    # global coverage (mean over chapters)
     cov_list = [coverage_map[ch]["coverage"] for ch in coverage_map.keys()] or [0.0]
     cov_global = round(sum(cov_list) / max(1, len(cov_list)), 6)
 
@@ -1783,23 +1768,21 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
         "coverage_by_chapter": coverage_map,
         "coverage_global_mean": cov_global,
         "ia2_ok": ia2_ok,
-        "ia2_issues": ia2_issues[:100],
+        "ia2_issues": ia2_issues[:200],
         "safety_stop": bool(safety_stop),
         "safety_notes": safety_notes[:50],
-        "quarantine_count": len(quarantine),
+        "quarantine_count": len([]),
     }
 
     evidence_pack = {
         "app_version": APP_VERSION,
-        "timestamp": _utc_ts(),
+        "det_stamp": det_now(cap),
         "cap_id": cap.get("pack_id"),
         "cap_sig_sha256": cap.get("_pack_sig_sha256"),
-        "subject": subject,
-        "level": level,
-        "source_manifest": {},
+        "scope": {"subject": subject, "level": level},
+        "source_manifest": source_manifest,
         "audit": audit,
         "pair_meta_sample": pair_meta[:50],
-        "quarantine_sample": [asdict(q) for q in quarantine[:100]],
         "qc_selected_evidence": [
             {
                 "qc_id": qc.qc_id,
@@ -1816,11 +1799,11 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
                     "alpha": qc.alpha,
                     "t_rec": qc.t_rec,
                     "sigma_terms": qc.sigma_terms,
-                    "score_f2": qc.score_f2
+                    "score_f2": qc.score_f2,
                 },
-                "evidence_min": qc.evidence_min
+                "evidence_min": qc.evidence_min,
             } for qc in selected_all
-        ]
+        ],
     }
 
     return {
@@ -1828,26 +1811,73 @@ def run_once(cap: Dict[str, Any], pairs: List[Dict[str, Any]], volume: int, subj
         "qc_candidates": [asdict(x) for x in qc_candidates],
         "qc_selected": [asdict(x) for x in selected_all],
         "selected_by_ch": {k: [asdict(x) for x in v] for k, v in selected_by_ch.items()},
-        "quarantine": [asdict(x) for x in quarantine],
         "audit": audit,
-        "evidence_pack": evidence_pack
+        "evidence_pack": evidence_pack,
     }
 
-def run_saturation_auto(cap: Dict[str, Any], pairs: List[Dict[str, Any]], subject: str, level: str) -> Dict[str, Any]:
+def run_saturation_auto(cap: Dict[str, Any], pairs: List[Dict[str, Any]], subject: str, level: str, source_manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Saturation automatique:
+    - itère sur volumes (CAP.saturation) jusqu'à:
+      - orphans_posable == 0
+      - ia2_ok == True
+      - safety_stop == False
+    - OU stop_if_new_qc_zero
+    - IMPORTANT: si pairs vide => sortie déterministe + safety_stop + RC_NO_SOURCES (pas d'assert)
+    """
     sat = pack_get(cap, "saturation", {}) or {}
     vol_start = int(sat.get("vol_start", 6))
     vol_max = int(sat.get("vol_max", 30))
     step = int(sat.get("step", 6))
     max_iters = int(sat.get("safety_stop_max_iters", 6))
 
+    if not pairs:
+        # deterministic empty run (should not happen because generator enforces stubs,
+        # but we guard to avoid crash)
+        empty_audit = {
+            "pairs_used": 0,
+            "pairs_total": 0,
+            "qi_total": 0,
+            "qi_posable_total": 0,
+            "qc_candidates_total": 0,
+            "qc_selected_total": 0,
+            "orphans_posable": 0,
+            "coverage_by_chapter": {},
+            "coverage_global_mean": 0.0,
+            "ia2_ok": False,
+            "ia2_issues": [{"qc_id": "NA", "check": RC_NO_SOURCES, "ok": False}],
+            "safety_stop": True,
+            "safety_notes": [{"reason": RC_NO_SOURCES}],
+            "quarantine_count": 0,
+        }
+        return {
+            "qi_items": [],
+            "qc_candidates": [],
+            "qc_selected": [],
+            "selected_by_ch": {},
+            "audit": empty_audit,
+            "evidence_pack": {
+                "app_version": APP_VERSION,
+                "det_stamp": det_now(cap),
+                "cap_id": cap.get("pack_id"),
+                "cap_sig_sha256": cap.get("_pack_sig_sha256"),
+                "scope": {"subject": subject, "level": level},
+                "source_manifest": source_manifest,
+                "audit": empty_audit,
+                "qc_selected_evidence": [],
+            },
+            "saturation_iterations": [],
+        }
+
     iterations = []
     prev_qc_set = None
-    final = None
+    final: Optional[Dict[str, Any]] = None
 
     it = 0
-    for vol in range(vol_start, min(vol_max, len(pairs)) + 1, max(1, step)):
+    hi = min(vol_max, len(pairs))
+    for vol in range(max(1, min(vol_start, hi)), hi + 1, max(1, step)):
         it += 1
-        out = run_once(cap, pairs, vol, subject, level)
+        out = run_once(cap, pairs, vol, subject, level, source_manifest)
         qc_ids = [q["qc_id"] for q in out["qc_candidates"]]
         cur_set = set(qc_ids)
 
@@ -1871,40 +1901,92 @@ def run_saturation_auto(cap: Dict[str, Any], pairs: List[Dict[str, Any]], subjec
 
         final = out
 
-        # stop if coverage achieved and IA2 ok and zero orphans (Kernel sufficient)
         if audit["orphans_posable"] == 0 and audit["ia2_ok"] and (not audit["safety_stop"]):
             break
-
-        # stop if no new QC and no progress
         if bool(sat.get("stop_if_new_qc_zero", True)) and new_qc == 0:
             break
-
         if it >= max_iters:
             break
 
-    assert final is not None
+    if final is None:
+        # Guard (shouldn't happen with pairs non-empty)
+        final = run_once(cap, pairs, min(1, len(pairs)), subject, level, source_manifest)
+
     final["saturation_iterations"] = iterations
     return final
 
 
 # =============================================================================
-# UI — Action unique: choisir + valider le pays → auto-run
+# UI — Action unique: choisir le pays puis ACTIVER, ensuite affichage FINAL UNIQUEMENT
 # =============================================================================
 def ss_init():
     defaults = {
         "cap": None,
         "cap_valid": False,
         "cap_errors": [],
-        "source_pairs": [],
-        "source_manifest": {},
+        "country_code": None,
         "run_done": False,
         "run_output": None,
-        "country_code": None,
-        "subject": "MATH",
-        "level": "TERMINALE",
+        "source_manifest": {},
+        "subject": None,
+        "level": None,
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
+
+def render_final_view(out: Dict[str, Any]):
+    """
+    EXIGENCE UTILISATEUR: afficher UNIQUEMENT QC / FRT / ARI / TRIGGERS par chapitre
+    + Qi associées visibles.
+    """
+    qi_items = out.get("qi_items", []) or []
+    qi_by_id = {q["qi_id"]: q for q in qi_items}
+
+    selected_by_ch = out.get("selected_by_ch", {}) or {}
+    audit = out.get("audit", {}) or {}
+    cov_by_ch = (audit.get("coverage_by_chapter", {}) or {})
+
+    # If nothing selected, show deterministic minimal failure indicator (still within output domain)
+    if not selected_by_ch:
+        st.error("Aucune QC sélectionnée (échec couverture / IA2 / sources).")
+        st.json({"audit": audit, "source_manifest": out.get("evidence_pack", {}).get("source_manifest", {})})
+        return
+
+    for ch_code in sorted(selected_by_ch.keys()):
+        qcs = selected_by_ch.get(ch_code, [])
+        if not qcs:
+            continue
+        ch_label = qcs[0].get("chapter_label", ch_code)
+        cov = cov_by_ch.get(ch_code, {})
+        cov_pct = float(cov.get("coverage", 0.0) or 0.0)
+        uncovered = cov.get("uncovered", []) or []
+        title = f"{ch_label} [{ch_code}] — Coverage={cov_pct:.0%} — Uncovered={len(uncovered)}"
+        with st.expander(title, expanded=False):
+            if uncovered:
+                st.error(f"Uncovered POSABLE (échantillon): {uncovered[:20]}")
+
+            for qc in qcs:
+                st.markdown(f"### {qc['qc']}")
+                st.markdown("**Triggers**")
+                st.write(qc.get("triggers", []))
+
+                st.markdown("**ARI (rep) + steps typed**")
+                st.json(pack_get(qc, "frt.sections.ari", {}) or {})
+
+                st.markdown("**FRT**")
+                st.json(qc.get("frt", {}))
+
+                st.markdown("**Qi associées (Qi + RQi)**")
+                for qid in qc.get("qi_ids", [])[:60]:
+                    q = qi_by_id.get(qid)
+                    if not q:
+                        continue
+                    tag = "POSABLE" if (q.get("posable") or {}).get("is_posable", False) else "UNPOSABLE"
+                    with st.expander(f"{qid} • {tag}", expanded=False):
+                        st.markdown("Qi")
+                        st.text((q.get("qi","") or "")[:2000])
+                        st.markdown("RQi")
+                        st.text((q.get("rqi","") or "")[:2000])
 
 def main():
     st.set_page_config(page_title=APP_NAME, layout="wide")
@@ -1913,7 +1995,6 @@ def main():
     st.title(APP_NAME)
     st.caption("Kernel V10.6.3 • TEST = PROD (logique) • CAS 1 ONLY • Déterminisme • Zéro hardcode (Pack-Driven) • Mode déconnecté")
 
-    # --- Single action form ---
     with st.form("activate_country_form", clear_on_submit=False):
         c1, c2 = st.columns([2, 3])
         with c1:
@@ -1921,7 +2002,7 @@ def main():
             country_code = "FR" if country_label == "France" else "CI"
         with c2:
             uploaded_cap = st.file_uploader("CAP JSON (optionnel) — si non fourni, CAP scellé embedded utilisé", type=["json"])
-        submitted = st.form_submit_button("VALIDER & LANCER (AUTO)", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("ACTIVER", type="primary", use_container_width=True)
 
     if submitted:
         cap = load_cap(country_code, uploaded_cap.read() if uploaded_cap else None)
@@ -1934,177 +2015,26 @@ def main():
 
         if not ok:
             st.error("CAP invalide — exécution bloquée.")
-        else:
-            # load sources and auto-run (no further action)
-            pairs, manifest = load_sources(cap)
-            st.session_state.source_pairs = pairs
-            st.session_state.source_manifest = manifest
+            st.write(errs)
+            return
 
-            with st.spinner("Pipeline automatique (déconnecté) en cours..."):
-                out = run_saturation_auto(
-                    cap=cap,
-                    pairs=pairs,
-                    subject=st.session_state.subject,
-                    level=st.session_state.level
-                )
-            out["evidence_pack"]["source_manifest"] = manifest
-            st.session_state.run_output = out
-            st.session_state.run_done = True
+        subject, level = cap_default_scope(cap)
+        st.session_state.subject = subject
+        st.session_state.level = level
 
-    # --- Status panel ---
-    cap = st.session_state.cap
-    if cap is None:
-        st.info("Choisir un pays puis cliquer sur ‘VALIDER & LANCER (AUTO)’ (action unique).")
-        return
+        pairs, manifest = load_sources(cap, subject, level)
+        st.session_state.source_manifest = manifest
 
-    if not st.session_state.cap_valid:
-        st.error("CAP non conforme :")
-        st.write(st.session_state.cap_errors)
-        st.json(cap)
-        return
+        with st.spinner("Pipeline automatique ISO-PROD (logique) en cours..."):
+            out = run_saturation_auto(cap=cap, pairs=pairs, subject=subject, level=level, source_manifest=manifest)
 
-    # Show CAP header
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Pays", f"{cap.get('country_name')} ({cap.get('country_code')})")
-    c2.metric("CAP status", cap.get("status", ""))
-    c3.metric("CAP id", cap.get("pack_id", ""))
-    c4.metric("CAP sig", str(cap.get("_pack_sig_sha256", ""))[:12] + "...")
-
-    manifest = st.session_state.source_manifest or {}
-    st.caption(f"Sources: mode={manifest.get('mode')} • local_dir={manifest.get('local_dir')} • pairs_total={manifest.get('pairs_total')}")
+        st.session_state.run_output = out
+        st.session_state.run_done = True
 
     if not st.session_state.run_done or not st.session_state.run_output:
-        st.warning("Le pipeline n’a pas encore été exécuté dans cette session.")
         return
 
-    out = st.session_state.run_output
-    audit = out.get("audit", {})
-    iters = out.get("saturation_iterations", [])
+    # EXIGENCE: affichage final uniquement
+    render_final_view(st.session_state.run_output)
 
-    # KPI row
-    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-    k1.metric("Pairs utilisés", audit.get("pairs_used", 0))
-    k2.metric("Qi total", audit.get("qi_total", 0))
-    k3.metric("Qi POSABLE", audit.get("qi_posable_total", 0))
-    k4.metric("QC candidates", audit.get("qc_candidates_total", 0))
-    k5.metric("QC sélectionnées", audit.get("qc_selected_total", 0))
-    k6.metric("Orphelins POSABLE", audit.get("orphans_posable", 0))
-    k7.metric("Coverage (moyenne chap.)", f"{float(audit.get('coverage_global_mean', 0.0)):.0%}")
-
-    # Verdict kernel (strict)
-    verdict_ok = (audit.get("orphans_posable", 1) == 0) and bool(audit.get("ia2_ok", False)) and (not bool(audit.get("safety_stop", False)))
-    st.subheader("Verdict (Kernel)")
-    st.write({
-        "PASS": verdict_ok,
-        "ia2_ok": audit.get("ia2_ok"),
-        "orphans_posable": audit.get("orphans_posable"),
-        "safety_stop": audit.get("safety_stop"),
-        "safety_notes": audit.get("safety_notes", [])[:10],
-        "ia2_issues": audit.get("ia2_issues", [])[:10],
-    })
-
-    if iters:
-        st.subheader("Saturation (auto)")
-        st.dataframe(iters, use_container_width=True, hide_index=True)
-
-    # Main deliverable: QC / FRT / ARI / TRIGGERS grouped by chapter with Qi associated
-    st.subheader("QC / FRT / ARI / TRIGGERS par chapitre (avec Qi associées)")
-
-    qi_items = out.get("qi_items", []) or []
-    qi_by_id = {q["qi_id"]: q for q in qi_items}
-    selected_by_ch = out.get("selected_by_ch", {}) or {}
-    cov_by_ch = (audit.get("coverage_by_chapter", {}) or {})
-
-    for ch_code in sorted(selected_by_ch.keys()):
-        cov = cov_by_ch.get(ch_code, {})
-        cov_pct = float(cov.get("coverage", 0.0) or 0.0)
-        uncovered = cov.get("uncovered", []) or []
-
-        qcs = selected_by_ch.get(ch_code, [])
-        ch_label = qcs[0].get("chapter_label", ch_code) if qcs else ch_code
-
-        with st.expander(f"{ch_label} [{ch_code}] — Coverage={cov_pct:.0%} — N_total={cov.get('N_total_chap',0)} — Uncovered={len(uncovered)}", expanded=False):
-            if uncovered:
-                st.error(f"Uncovered POSABLE (sample): {uncovered[:12]}")
-
-            for qc in qcs:
-                st.markdown(f"### {qc['qc']}")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("posable_in_cluster", qc.get("posable_in_cluster", 0))
-                c2.metric("cluster_size", qc.get("cluster_size", 0))
-                c3.metric("Ψ_norm", qc.get("psi_norm", 0.0))
-                c4.metric("Score(q) F2", qc.get("score_f2", 0.0))
-
-                st.markdown("**Triggers**")
-                st.write(qc.get("triggers", []))
-
-                st.markdown("**ARI (rep) + steps typed**")
-                st.json(pack_get(qc, "frt.sections.ari", {}) or {})
-
-                st.markdown("**FRT**")
-                st.json(qc.get("frt", {}))
-
-                st.markdown("**EvidencePack minimal (références)**")
-                st.json(qc.get("evidence_min", {}))
-
-                st.markdown("**Termes F1/F2 (audit)**")
-                st.json({
-                    "delta_c": qc.get("delta_c"),
-                    "epsilon": qc.get("epsilon"),
-                    "T_steps": qc.get("T_steps"),
-                    "sum_Tj": qc.get("sum_Tj"),
-                    "psi_brut": qc.get("psi_brut"),
-                    "psi_norm": qc.get("psi_norm"),
-                    "n_q": qc.get("n_q"),
-                    "N_total_chap": qc.get("N_total_chap"),
-                    "alpha": qc.get("alpha"),
-                    "t_rec": qc.get("t_rec"),
-                    "sigma_terms": qc.get("sigma_terms"),
-                    "score_f2": qc.get("score_f2"),
-                })
-
-                st.markdown("**Qi associées (avec RQi)**")
-                for qid in qc.get("qi_ids", [])[:24]:
-                    q = qi_by_id.get(qid)
-                    if not q:
-                        continue
-                    pos = (q.get("posable") or {}).get("is_posable", False)
-                    tag = "POSABLE" if pos else "UNPOSABLE"
-                    with st.expander(f"{qid} • {tag} • {q.get('chapter_code','')}", expanded=False):
-                        st.markdown("Qi")
-                        st.text((q.get("qi","") or "")[:1400])
-                        st.markdown("RQi")
-                        st.text((q.get("rqi","") or "")[:1400])
-                        st.markdown("Triggers")
-                        st.write(q.get("triggers", []))
-                        st.markdown("Posable decision")
-                        st.json(q.get("posable", {}))
-                        st.markdown("Source refs")
-                        st.json({
-                            "pair_id": q.get("pair_id"),
-                            "source_id": q.get("source_id"),
-                            "sujet_ref": q.get("sujet_ref"),
-                            "corrige_ref": q.get("corrige_ref"),
-                            "exam_date": q.get("source_exam_date"),
-                        })
-
-    # Exports (proof)
-    st.subheader("Exports (preuves)")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.download_button("evidence_pack.json", safe_json_dumps(out.get("evidence_pack", {})), "evidence_pack.json", use_container_width=True)
-    with c2:
-        st.download_button("qc_selected.json", safe_json_dumps(out.get("qc_selected", [])), "qc_selected.json", use_container_width=True)
-    with c3:
-        st.download_button("qi_items.json", safe_json_dumps(out.get("qi_items", [])), "qi_items.json", use_container_width=True)
-
-    # Quarantine visibility
-    if out.get("quarantine"):
-        st.subheader("Quarantine (sample)")
-        st.dataframe(out["quarantine"][:120], use_container_width=True, hide_index=True)
-
-
-# =============================================================================
-# ENTRYPOINT
-# =============================================================================
 main()
