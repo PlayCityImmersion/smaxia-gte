@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """
-SMAXIA GTE V14.3 — ADMIN COMMAND CENTER — FULL AUTO — ISO-PROD
+SMAXIA GTE V14.3.1.1 — ADMIN COMMAND CENTER — FULL AUTO — ISO-PROD
 streamlit run smaxia_gte_v14_3_admin_final.py
 
-# ── CHANGELOG V14.2 → V14.3 ──────────────────────────────
-# [FIX-SDA0] LIVE/REPLAY: full HTTP+HTML+PDF cache. 4 strategies
-#   S1=DDG, S2=Wikipedia/Wikidata edu discovery, S3=BFS crawl,
-#   S4=open directory fallback. Diagnostic artifacts mandatory.
-# [FIX-F1F2] Integrated deterministic formulas (Doc A2). No
-#   remote registry required. IA2 recalcul checks in-code.
-# [FIX-QC] qc_text="COMMENT ... ?" format enforced. rqi_map
-#   added. GATE_QC_FORMAT mandatory.
-# [FIX-GATES] Zero permissive PASS: QC=0→FAIL, atoms=0→FAIL
-#   if extracted>0, extracted=0→FAIL if pairs>0.
-# [ADD-GATE] GATE_OBJECTIVE_FINAL: QC>=1 + FORMAT + F1F2 +
-#   FRT_ARI_TRIGGERS all PASS + no orphan qi/rqi.
-# [ADD-DIAG] SDA0_HTTP_DIAG, SDA0_STRATEGY_LOG, DA1_DOWNLOAD_DIAG.
-# [FIX-FRT] FRT/ARI/Triggers produced from F1/F2 results linked
-#   to qc_ids with 100% coverage check.
-# [PRESERVED] All V14.2: Artifacts tab, ZIP, typeahead, UI tabs.
+# ── CHANGELOG V14.3 → V14.3.1 (HOTFIX) ──────────────────
+# [FIX-S1] DDG 202/403/429 → Bing fallback. Accept 200-299.
+# [FIX-S2] Accept 200-299 for Wikipedia subcrawl.
+# [FIX-S3] BFS from ALL discovered domains (not just score≥60)
+#   + depth-2 following exam-keyword links.
+# [FIX-S4] Language-driven exam repos (sujetdebac, labolycee,
+#   apmep, annabac) + depth-2 crawl on exam paths.
+# [FIX-DA1] PDF magic bytes validation (%PDF-). Reject non-PDF
+#   downloads with INVALID_PDF_MAGIC quarantine reason.
+# [FIX-HTTP] Accept 200-299 range globally. Store content-type.
+# [FIX-PARSE] Search result parser handles Bing + generic HTML.
 # ────────────────────────────────────────────────────────────
 """
 import streamlit as st
@@ -29,7 +24,7 @@ from copy import deepcopy
 from collections import OrderedDict
 from urllib.parse import urljoin,urlparse,quote_plus
 
-VERSION="GTE-V14.3-ADMIN-FINAL"
+VERSION="GTE-V14.3.1-ADMIN-FINAL"
 PACKS_DIR=Path("packs")
 RUNS_DIR=Path("run")
 FORMULA_PACK_DIR=Path("formula_packs")
@@ -103,7 +98,7 @@ def _http_diag():
     diag["any_connectivity"]=any(c["ok"] for c in diag["connectivity"])
     return diag
 
-def _http_get(url,timeout=SDA0_TIMEOUT,binary=False):
+def _http_get(url,timeout=SDA0_TIMEOUT,binary=False,accept_range=True):
     ck=sha(url); ext=".bin" if binary else ".html"
     cp=edir(WEB_CACHE_DIR)/f"{ck}{ext}"; cm=edir(WEB_CACHE_DIR)/f"{ck}.meta"
     if cp.exists() and cm.exists():
@@ -117,11 +112,13 @@ def _http_get(url,timeout=SDA0_TIMEOUT,binary=False):
     import requests
     try:
         r=requests.get(url,timeout=timeout,headers={"User-Agent":SDA0_UA},allow_redirects=True)
-        r.raise_for_status()
+        sc=r.status_code; ok=(200<=sc<300) if accept_range else (sc==200)
+        if not ok: return None,sc,False
         if binary: data=r.content; cp.write_bytes(data)
         else: data=r.text; cp.write_text(data,encoding="utf-8")
-        cm.write_text(json.dumps({"url":url,"status":r.status_code,"fetch_ts":now_iso(),"size":len(data)}))
-        return data,r.status_code,False
+        ct=r.headers.get("content-type","")
+        cm.write_text(json.dumps({"url":url,"status":sc,"fetch_ts":now_iso(),"size":len(data),"content_type":ct}))
+        return data,sc,False
     except Exception as e: return None,-1,False
 
 def _http_get_safe(url,timeout=SDA0_TIMEOUT,binary=False):
@@ -209,11 +206,20 @@ class SDA0:
         t0=time.time(); found=0
         tmpls=_STPL.get(self.lang,_STPL["en"])
         for t in tmpls[:3]:
-            q=t.format(c=self.cn); url=f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
+            q=t.format(c=self.cn)
+            # Try DDG first
+            url=f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
             html,sc,cached,err=_http_get_safe(url)
-            self.http_diag_entries.append({"strategy":"S1","url":url[:200],"status":sc,"cached":cached,
+            self.http_diag_entries.append({"strategy":"S1_DDG","url":url[:200],"status":sc,"cached":cached,
                 "size":len(html) if html else 0,"error":err})
-            if html and sc==200: n=self._parse_sr(html,q); found+=n
+            if html and 200<=sc<300: n=self._parse_sr(html,q); found+=n
+            elif sc in (202,403,429,-1):
+                # DDG rate-limited or blocked — try Bing as fallback
+                burl=f"https://www.bing.com/search?q={quote_plus(q)}"
+                bhtml,bsc,bcached,berr=_http_get_safe(burl)
+                self.http_diag_entries.append({"strategy":"S1_BING","url":burl[:200],"status":bsc,
+                    "cached":bcached,"size":len(bhtml) if bhtml else 0,"error":berr})
+                if bhtml and 200<=bsc<300: n=self._parse_sr(bhtml,q); found+=n
         self.strat_log.append({"strategy":"S1_DDG","elapsed_ms":int((time.time()-t0)*1000),
             "urls_found":found,"pdf_links":len(self.pdf_links),"status":"OK" if found>0 else "EMPTY"})
     def _s2_wiki(self):
@@ -223,7 +229,7 @@ class SDA0:
             html,sc,cached,err=_http_get_safe(wurl)
             self.http_diag_entries.append({"strategy":"S2","url":wurl[:200],"status":sc,"cached":cached,
                 "size":len(html) if html else 0,"error":err})
-            if html and sc==200:
+            if html and 200<=sc<300:
                 links=_extract_pdf_links(html,wurl)
                 _,hb=_check_libs()
                 if hb:
@@ -237,7 +243,7 @@ class SDA0:
                             if dom and "wikipedia" not in dom:
                                 self._ensure_src(dom,a.get_text(strip=True)[:200],href)
                                 ph,ps,_,_=_http_get_safe(href)
-                                if ph and ps==200:
+                                if ph and 200<=ps<300:
                                     pl=_extract_pdf_links(ph,href)
                                     for l in pl[:10]:
                                         l["domain"]=urlparse(l["url"]).netloc.lower()
@@ -251,45 +257,94 @@ class SDA0:
             "urls_found":found,"status":"OK" if found>0 else "EMPTY"})
     def _s3_bfs(self):
         t0=time.time(); found=0; visited=set()
-        seed_domains=[s.get("domain","") for s in self.sources if s.get("authority_score",0)>=60]
-        for dom in seed_domains[:5]:
-            if dom in visited: continue
+        # BFS from ALL discovered domains, not just high-score ones
+        seed_domains=[s.get("domain","") for s in self.sources if s.get("domain")]
+        for dom in seed_domains[:8]:
+            if dom in visited or not dom: continue
             visited.add(dom)
             burl=f"https://{dom}"
             html,sc,cached,err=_http_get_safe(burl,timeout=8)
             self.http_diag_entries.append({"strategy":"S3","url":burl[:200],"status":sc,"cached":cached,
                 "size":len(html) if html else 0,"error":err})
-            if html and sc==200:
+            if html and sc in range(200,300):
                 links=_extract_pdf_links(html,burl)
                 for l in links[:SDA0_MAX_PDFS]:
                     l["domain"]=dom; l["source_query"]=f"bfs:{dom}"; l["direct"]=False
                     self.pdf_links.append(l); found+=1
+                # BFS depth-2: follow exam-relevant internal links
+                _,hb=_check_libs()
+                if hb:
+                    from bs4 import BeautifulSoup
+                    soup=BeautifulSoup(html,"html.parser")
+                    for a in soup.find_all("a",href=True):
+                        href=a.get("href",""); full=urljoin(burl,href)
+                        if urlparse(full).netloc.lower()!=dom: continue
+                        low=href.lower()+(a.get_text(strip=True) or "").lower()
+                        if any(k in low for k in ["annal","sujet","examen","epreuve","bac","corrig","paper"]):
+                            if full not in visited:
+                                visited.add(full)
+                                ph,ps,_,_=_http_get_safe(full,timeout=8)
+                                if ph and ps in range(200,300):
+                                    pl=_extract_pdf_links(ph,full)
+                                    for l in pl[:SDA0_MAX_PDFS]:
+                                        l["domain"]=dom; l["source_query"]=f"bfs_d2:{dom}"; l["direct"]=False
+                                        self.pdf_links.append(l); found+=1
         self.strat_log.append({"strategy":"S3_BFS","elapsed_ms":int((time.time()-t0)*1000),
             "urls_found":found,"status":"OK" if found>0 else "EMPTY"})
     def _s4_fallback(self):
         t0=time.time(); found=0
-        repos=[f"https://www.education.gouv.fr/annales",f"https://eduscol.education.fr/annales",
-            f"https://www.annabac.com/"]
+        # Language-driven exam repositories (NOT country branching — same pattern as _STPL)
+        _EXAM_REPOS={"fr":["https://www.sujetdebac.fr/","https://www.annabac.com/",
+            "https://labolycee.org/","https://www.apmep.fr/",
+            "https://eduscol.education.fr/annales",
+            "https://www.education.gouv.fr/annales"],
+            "en":["https://www.exampapers.org.uk/","https://pastpapers.co/"],
+            "es":["https://www.examenesdepau.com/"],"pt":[],"de":[],"ar":[]}
+        repos=_EXAM_REPOS.get(self.lang,[])+_EXAM_REPOS.get("en",[])
         for url in repos:
             html,sc,cached,err=_http_get_safe(url)
             self.http_diag_entries.append({"strategy":"S4","url":url[:200],"status":sc,"cached":cached,
                 "size":len(html) if html else 0,"error":err})
-            if html and sc==200:
+            if html and sc in range(200,300):
                 links=_extract_pdf_links(html,url)
                 for l in links[:SDA0_MAX_PDFS]:
                     l["domain"]=urlparse(l["url"]).netloc.lower()
-                    l["source_query"]=f"fallback:{url[:40]}"; l["direct"]=False
+                    l["source_query"]=f"repo:{urlparse(url).netloc[:30]}"; l["direct"]=False
                     self.pdf_links.append(l); found+=1
-                if links: self._ensure_src(urlparse(url).netloc.lower(),f"Repo:{url}",url)
+                if links: self._ensure_src(urlparse(url).netloc.lower(),f"Repo:{urlparse(url).netloc}",url)
+                # Depth-2: follow links containing exam keywords to find deeper PDF pages
+                _,hb=_check_libs()
+                if hb:
+                    from bs4 import BeautifulSoup
+                    soup=BeautifulSoup(html,"html.parser")
+                    exam_paths=[]
+                    for a in soup.find_all("a",href=True):
+                        href=a.get("href","").strip(); txt=(a.get_text(strip=True) or "").lower()
+                        if not href: continue
+                        full=urljoin(url,href); dom=urlparse(full).netloc.lower()
+                        if dom!=urlparse(url).netloc.lower(): continue
+                        low=href.lower()+txt
+                        if any(k in low for k in ["annal","sujet","examen","epreuve","terminale",
+                            "bac","corrig","paper","past","math","physi"]):
+                            exam_paths.append(full)
+                    for ep in exam_paths[:10]:
+                        ph,ps,_,_=_http_get_safe(ep,timeout=8)
+                        if ph and ps in range(200,300):
+                            pl=_extract_pdf_links(ph,ep)
+                            for l in pl[:SDA0_MAX_PDFS]:
+                                l["domain"]=urlparse(l["url"]).netloc.lower()
+                                l["source_query"]=f"repo_d2:{urlparse(url).netloc[:20]}"; l["direct"]=False
+                                self.pdf_links.append(l); found+=1
         self.strat_log.append({"strategy":"S4_FALLBACK","elapsed_ms":int((time.time()-t0)*1000),
-            "urls_found":found,"status":"OK" if found>0 else "EMPTY"})
+            "urls_found":found,"repos_tried":len(repos),"status":"OK" if found>0 else "EMPTY"})
     def _parse_sr(self,html,query):
         _,hb=_check_libs()
         if not hb: return 0
         from bs4 import BeautifulSoup; soup=BeautifulSoup(html,"html.parser"); ct=0
-        for a in soup.select("a.result__a,a.result__url,a[href]"):
+        # Handle DDG, Bing, and generic HTML result pages
+        for a in soup.select("a.result__a,a.result__url,a[href],h2 a,li a"):
             href=a.get("href","")
-            if not href or "duckduckgo" in href: continue
+            if not href or "duckduckgo" in href or "bing.com" in href or "microsoft.com" in href: continue
             if "uddg=" in href:
                 from urllib.parse import parse_qs,urlparse as up
                 try: href=parse_qs(up(href).query).get("uddg",[href])[0]
@@ -305,7 +360,7 @@ class SDA0:
             self.pdf_links.append({"url":url,"domain":domain,"text":title,"source_query":query[:80],"direct":True})
             self._ensure_src(domain,title,url); return
         html,sc,_,_=_http_get_safe(url)
-        if not html or sc!=200: return
+        if not html or sc not in range(200,300): return
         links=_extract_pdf_links(html,url)
         for l in links[:SDA0_MAX_PDFS]:
             l["domain"]=urlparse(l["url"]).netloc.lower(); l["source_query"]=query[:80]; l["direct"]=False
@@ -418,17 +473,23 @@ class DA1Auto:
         self._smap={s.get("source_id"):s for s in sources}; self.dllog=[]
     def harvest(self):
         pd=edir(HARVEST_DIR/self.ck/"pdfs"); seen_sha=set(); dl=0
-        for link in self.pdf_links[:SDA0_MAX_PDFS*2]:
+        for link in self.pdf_links[:SDA0_MAX_PDFS*3]:
             url=link.get("url","")
             if not url: continue
             try:
                 data,sc,cached,err=_http_get_safe(url,timeout=SDA0_TIMEOUT,binary=True)
                 entry={"url":url[:200],"status":sc,"cached":cached,"size":len(data) if data else 0,"error":err}
-                if not data or sc!=200 or len(data)<1024:
-                    entry["accept"]=False; entry["reason"]=f"DL_FAIL:{sc}" if not data else f"TOO_SMALL:{len(data)}"
+                if not data or sc not in range(200,300):
+                    entry["accept"]=False; entry["reason"]=f"DL_FAIL:{sc}"
                     self.dllog.append(entry); self.quarantine.append({"url":url[:200],"reason":entry["reason"]}); continue
-                ct=None
-                if hasattr(data,'headers') if False else True: pass
+                if len(data)<1024:
+                    entry["accept"]=False; entry["reason"]=f"TOO_SMALL:{len(data)}"
+                    self.dllog.append(entry); continue
+                # PDF magic bytes validation: %PDF-
+                if not data[:5].startswith(b'%PDF-'):
+                    entry["accept"]=False; entry["reason"]="INVALID_PDF_MAGIC"
+                    self.dllog.append(entry)
+                    self.quarantine.append({"url":url[:200],"reason":"NOT_A_PDF_FILE"}); continue
                 fsha=sha_b(data)
                 if fsha in seen_sha: entry["accept"]=False; entry["reason"]="DUPLICATE_SHA"; self.dllog.append(entry); continue
                 seen_sha.add(fsha)
@@ -1006,13 +1067,13 @@ def pipeline(ck,rd,rid):
 
 # ━━ UI ━━
 def main():
-    st.set_page_config(page_title="SMAXIA GTE V14.3",page_icon="🔬",layout="wide")
+    st.set_page_config(page_title="SMAXIA GTE V14.3.1",page_icon="🔬",layout="wide")
     st.markdown("""<style>.mh{font-size:1.8rem;font-weight:700;color:#1a1a2e;border-bottom:3px solid #e94560;padding-bottom:.4rem;margin-bottom:1rem}.gp{color:#00b894;font-weight:700}.gf{color:#e74c3c;font-weight:700}.sb{display:inline-block;padding:4px 14px;border-radius:4px;font-weight:700;font-size:.9rem}.sp{background:#00b894;color:#fff}.sf{background:#e74c3c;color:#fff}.fix{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin:8px 0}.miss{background:#f8d7da;border:1px solid #f5c6cb;border-radius:6px;padding:10px;margin:8px 0;color:#721c24}.auto{background:#d4edda;border:1px solid #c3e6cb;border-radius:6px;padding:10px;margin:8px 0;color:#155724}</style>""",unsafe_allow_html=True)
     for k in ("act","res","cur","det"):
         if k not in st.session_state: st.session_state[k]={} if k!="cur" else None
     CDB,_=_build_country_index()  # UI-ONLY
     with st.sidebar:
-        st.markdown('<div class="mh">🔬 SMAXIA GTE V14.3</div>',unsafe_allow_html=True)
+        st.markdown('<div class="mh">🔬 SMAXIA GTE V14.3.1</div>',unsafe_allow_html=True)
         st.markdown(f"**Version:** `{VERSION}`")
         st.markdown('<div class="auto">🤖 FULL AUTO — ISO-PROD</div>',unsafe_allow_html=True)
         st.divider(); st.markdown("### ACTIVATE COUNTRY")
@@ -1055,7 +1116,7 @@ def main():
         return json.loads(p.read_text()) if p.exists() else None
     tabs=st.tabs(["🏠 Home","📦 CAP","🔍 DA0","📋 CEP","📄 SOE/OCR","🧬 Qi/RQi","📊 Coverage","🔎 QC Explorer","🚦 Gates","🎯 Holdout","📁 Artifacts"])
     with tabs[0]:
-        st.markdown('<div class="mh">Admin Command Center — V14.3</div>',unsafe_allow_html=True)
+        st.markdown('<div class="mh">Admin Command Center — V14.3.1.1</div>',unsafe_allow_html=True)
         if not act_cc: st.info("👈 Type a country → select → ACTIVATE. Everything is automatic.")
         else:
             info=st.session_state["act"][act_cc]; c1,c2,c3,c4=st.columns(4)
