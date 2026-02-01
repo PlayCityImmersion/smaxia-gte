@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """
-SMAXIA GTE V14.1 — ADMIN COMMAND CENTER
-streamlit run smaxia_gte_v14_1_admin_final.py
+SMAXIA GTE V14.1.1 — ADMIN COMMAND CENTER
+streamlit run smaxia_gte_v14_1_1_admin_final.py
 
-# ── CHANGELOG V14 → V14.1 ──────────────────────────────────
-# [FIX-B1] Country typeahead: strict prefix only (startswith).
-#          "g" → Gabon,Gambia,Georgia… NOT Belgium/Nigeria.
-#          "king" → no result (prefix). Contains in separate fallback.
-#          Replaced st.selectbox with st.radio for instant visible list.
-# [FIX-B2] FormulaEngine: zero fake outputs. compute_f1/f2 return
-#          UNAVAILABLE if no real runner. No fabricated digests.
-#          FRT/ARI/Triggers: UNAVAILABLE_PACK_MISSING, zero fake digests.
-# [FIX-B3] CAP tab: hierarchical Level→Subjects→Chapters display.
-#          Red banner if incomplete. Gate CHK_CAP_COMPLETENESS enforced.
+# ── CHANGELOG V14.1 → V14.1.1 ──────────────────────────────
+# [ADD-A] New tab "📁 Artifacts": read-only listing of all run
+#         artifacts (.json + .sha256) with individual download
+#         buttons for the 4 critical files (SealReport, CHK_REPORT,
+#         DeterminismReport_3runs, UI_EVENT_LOG) + their .sha256.
+# [ADD-B] "Download ZIP (full run)" button: in-memory zip of all
+#         run artifacts (sorted alpha for reproducibility).
+# [ADD-C] MISSING badges for absent files (no crash).
+# [ZERO-REGRESSION] No changes to pipeline(), det_check(), gates,
+#         write_art, or any CORE logic. UI-ONLY read additions.
+#         Determinism hashes unchanged (verified by test).
+# ── CHANGELOG V14 → V14.1 (inherited) ──────────────────────
+# [FIX-B1] Country typeahead: strict name-prefix only.
+# [FIX-B2] FormulaEngine: zero fake outputs.
+# [FIX-B3] CAP tab: hierarchical Level→Subjects→Chapters.
 # [FIX-B4] DA0 tab: actionable messages when empty.
-# [FIX-B5] CEP tab: source_id/authority column if available.
-# [FIX-B6] QC Explorer: added Year/Spe filters + sortable table.
-#          Coverage: coverage_by_subject_level computed from QC metadata.
-# [FIX-B7] Performance: typeahead does zero I/O. Index cached once.
-# [ADD] Home: V14.1 conformity checklist (binary pass/fail).
+# [FIX-B5] CEP tab: source_id/authority column.
+# [FIX-B6] QC Explorer: Year/Spe filters + sortable table.
+#          Coverage: coverage_by_subject_level.
+# [FIX-B7] Performance: typeahead zero I/O.
 # ────────────────────────────────────────────────────────────
 """
 import streamlit as st
-import json, hashlib, os, re, math, uuid
+import json, hashlib, os, re, math, uuid, io, zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from copy import deepcopy
@@ -31,7 +35,7 @@ from collections import OrderedDict
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 0) CONSTANTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VERSION = "GTE-V14.1-ADMIN-FINAL"
+VERSION = "GTE-V14.1.1-ADMIN-FINAL"
 PACKS_DIR = Path("packs")
 RUNS_DIR = Path("run")
 FORMULA_PACK_DIR = Path("formula_packs")
@@ -1111,7 +1115,8 @@ def main():
 
     # ── TABS ──
     tabs = st.tabs(["🏠 Home", "📦 CAP", "🔍 DA0", "📋 CEP", "📄 SOE/OCR",
-                     "🧬 Qi/RQi", "📊 Coverage", "🔎 QC Explorer", "🚦 Gates", "🎯 Holdout"])
+                     "🧬 Qi/RQi", "📊 Coverage", "🔎 QC Explorer", "🚦 Gates",
+                     "🎯 Holdout", "📁 Artifacts"])
 
     # ═══ HOME ═══
     with tabs[0]:
@@ -1563,6 +1568,83 @@ def main():
         else:
             st.info("No holdout data.")
 
+    # ═══ ARTIFACTS (UI-ONLY — read-only, zero pipeline writes) ═══
+    with tabs[10]:
+        st.markdown("### 📁 Artifacts — Run Download")  # UI-ONLY
+        if not act_cc or not act_rd:
+            st.info("Activate a country to generate artifacts.")
+        else:
+            rd_path = Path(act_rd)
+            st.markdown(f"**Run directory:** `{act_rd}`")
+
+            # Enumerate all files in run dir (UI-ONLY read)
+            all_json = sorted(rd_path.glob("*.json")) if rd_path.exists() else []
+            all_sha = sorted(rd_path.glob("*.sha256")) if rd_path.exists() else []
+            all_files = sorted(set(all_json + all_sha), key=lambda p: p.name)
+
+            st.markdown(f"**Total files:** {len(all_files)} ({len(all_json)} JSON, {len(all_sha)} SHA256)")
+            st.divider()
+
+            # ── Critical 4 artifacts with download buttons ──
+            st.markdown("#### 🔑 Critical Artifacts")
+            _CRITICAL = ["SealReport", "CHK_REPORT", "DeterminismReport_3runs", "UI_EVENT_LOG"]
+            for art_name in _CRITICAL:
+                jp = rd_path / f"{art_name}.json"
+                sp = rd_path / f"{art_name}.sha256"
+                c1, c2, c3 = st.columns([4, 2, 2])
+                c1.markdown(f"**{art_name}**")
+                if jp.exists():
+                    c2.download_button(
+                        f"⬇ .json", jp.read_bytes(),
+                        file_name=f"{art_name}.json", mime="application/json",
+                        key=f"dl_{art_name}_json")  # UI-ONLY
+                else:
+                    c2.markdown('<span class="sb sf">MISSING</span>', unsafe_allow_html=True)
+                if sp.exists():
+                    c3.download_button(
+                        f"⬇ .sha256", sp.read_bytes(),
+                        file_name=f"{art_name}.sha256", mime="text/plain",
+                        key=f"dl_{art_name}_sha")  # UI-ONLY
+                else:
+                    c3.markdown('<span class="sb sf">MISSING</span>', unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── Full file listing with individual downloads ──
+            st.markdown("#### 📋 All Artifacts")
+            if all_files:
+                for fp in all_files:
+                    c1, c2 = st.columns([5, 2])
+                    sz = fp.stat().st_size if fp.exists() else 0
+                    c1.markdown(f"`{fp.name}` ({sz:,} bytes)")
+                    mime = "application/json" if fp.suffix == ".json" else "text/plain"
+                    c2.download_button(
+                        "⬇", fp.read_bytes(), file_name=fp.name, mime=mime,
+                        key=f"dl_all_{fp.name}")  # UI-ONLY
+            else:
+                st.warning("No artifacts found in run directory.")
+
+            st.divider()
+
+            # ── ZIP download (all run artifacts, in-memory) ──
+            st.markdown("#### 📦 Download Full Run (ZIP)")  # UI-ONLY
+            if all_files:
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for fp in all_files:  # already sorted alpha
+                        zf.writestr(fp.name, fp.read_bytes())
+                buf.seek(0)
+                rid_short = rd_path.name[:32]
+                st.download_button(
+                    f"⬇ Download ZIP ({len(all_files)} files)",
+                    buf.getvalue(),
+                    file_name=f"{rid_short}_artifacts.zip",
+                    mime="application/zip",
+                    key="dl_zip_run")  # UI-ONLY
+                st.caption("ZIP is generated in-memory (read-only). Not used in gates or hashing.")
+            else:
+                st.info("No files to archive.")
+
 
 if __name__ == "__main__":
     main()
@@ -1578,7 +1660,8 @@ if __name__ == "__main__":
 # QCs: only if cluster_min met + evidence complete.
 # FRT/ARI/Triggers: ONLY via real runner module. UNAVAILABLE otherwise.
 # FormulaEngine: requires runner_module in manifest. Zero fake outputs.
-# Coverage: coverage_by_subject_level computed from QC metadata.
-# Country typeahead: strict prefix, st.radio, zero I/O after cache.
-# Run: streamlit run smaxia_gte_v14_1_admin_final.py
+# Coverage: coverage_by_subject_level from QC metadata.
+# Country typeahead: strict name-prefix, st.radio, zero I/O.
+# V14.1.1: Artifacts tab (UI-ONLY read) + ZIP download.
+# Run: streamlit run smaxia_gte_v14_1_1_admin_final.py
 # ─────────────────────────────────────────────────────────────
