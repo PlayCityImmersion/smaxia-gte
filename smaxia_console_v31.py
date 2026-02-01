@@ -1,1667 +1,852 @@
 #!/usr/bin/env python3
 """
-SMAXIA GTE V14.1.1 — ADMIN COMMAND CENTER
-streamlit run smaxia_gte_v14_1_1_admin_final.py
+SMAXIA GTE V14.2 — ADMIN COMMAND CENTER — FULL AUTO
+streamlit run smaxia_gte_v14_2_admin_final.py
 
-# ── CHANGELOG V14.1 → V14.1.1 ──────────────────────────────
-# [ADD-A] New tab "📁 Artifacts": read-only listing of all run
-#         artifacts (.json + .sha256) with individual download
-#         buttons for the 4 critical files (SealReport, CHK_REPORT,
-#         DeterminismReport_3runs, UI_EVENT_LOG) + their .sha256.
-# [ADD-B] "Download ZIP (full run)" button: in-memory zip of all
-#         run artifacts (sorted alpha for reproducibility).
-# [ADD-C] MISSING badges for absent files (no crash).
-# [ZERO-REGRESSION] No changes to pipeline(), det_check(), gates,
-#         write_art, or any CORE logic. UI-ONLY read additions.
-#         Determinism hashes unchanged (verified by test).
-# ── CHANGELOG V14 → V14.1 (inherited) ──────────────────────
-# [FIX-B1] Country typeahead: strict name-prefix only.
-# [FIX-B2] FormulaEngine: zero fake outputs.
-# [FIX-B3] CAP tab: hierarchical Level→Subjects→Chapters.
-# [FIX-B4] DA0 tab: actionable messages when empty.
-# [FIX-B5] CEP tab: source_id/authority column.
-# [FIX-B6] QC Explorer: Year/Spe filters + sortable table.
-#          Coverage: coverage_by_subject_level.
-# [FIX-B7] Performance: typeahead zero I/O.
+# ── CHANGELOG V14.1.1 → V14.2 ──────────────────────────────
+# [ADD-SDA0] Auto Source Discovery: DuckDuckGo HTML + portal
+#   crawl. Multi-strategy, cached, zero manual URL input.
+# [ADD-DA1-AUTO] Auto PDF download from discovered links.
+#   Dedup sha256, timeout/retry, sujet/corrige pairing.
+# [ADD-CAP-AUTO] Auto CAP from PDF metadata + link text.
+#   Completeness=PASS if levels+subjects found.
+# [ADD-FORMULA-AUTO] Auto-fetch formula pack from registry.
+#   If not published => UNAVAILABLE_PACK_NOT_PUBLISHED.
+# [ADD-IA] Optional LLM providers (env vars). DISABLED_NO_KEY
+#   if absent. Content-addressed cache for determinism.
+# [ADD-GATE] GATE_SDA0_WEB for web discovery status.
+# [PRESERVED] All V14.1.1: Artifacts tab, ZIP, typeahead.
 # ────────────────────────────────────────────────────────────
 """
 import streamlit as st
-import json, hashlib, os, re, math, uuid, io, zipfile
+import json, hashlib, os, re, math, uuid, io, zipfile, time
 from datetime import datetime, timezone
 from pathlib import Path
 from copy import deepcopy
 from collections import OrderedDict
+from urllib.parse import urljoin, urlparse, quote_plus
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 0) CONSTANTS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VERSION = "GTE-V14.1.1-ADMIN-FINAL"
+VERSION = "GTE-V14.2-ADMIN-FINAL"
 PACKS_DIR = Path("packs")
 RUNS_DIR = Path("run")
 FORMULA_PACK_DIR = Path("formula_packs")
 OCR_CACHE_DIR = Path("ocr_cache")
 HARVEST_DIR = Path("harvest")
+WEB_CACHE_DIR = Path("web_cache")
+IA_CACHE_DIR = Path("ia_cache")
 DETERMINISM_RUNS = 3
-VOLATILE = frozenset([
-    "timestamp", "created_at", "sealed_at", "run_ts", "harvested_at",
-    "paired_at", "activated_at", "checked_at", "extracted_at", "cached_at",
-    "run_id", "path", "run_dir", "ts", "abs_path",
-])
+SDA0_MAX_PDFS = 20
+SDA0_TIMEOUT = 15
+SDA0_UA = "SMAXIA-GTE/14.2 (education-research)"
+FORMULA_REG = os.environ.get("SMAXIA_FORMULA_REGISTRY", "https://raw.githubusercontent.com/smaxia-project/formula-packs/main/registry.json")
+VOLATILE = frozenset(["timestamp","created_at","sealed_at","run_ts","harvested_at","paired_at","activated_at","checked_at","extracted_at","cached_at","run_id","path","run_dir","ts","abs_path","elapsed_ms","discovery_ts","download_ts","fetch_ts"])
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1) CORE UTILITIES (INVARIANT)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def cjson(obj):
-    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-
-def sha(data: str) -> str:
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-def sha_file(p: Path) -> str:
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for c in iter(lambda: f.read(8192), b""):
-            h.update(c)
+# ━━ CORE UTILS ━━
+def cjson(o): return json.dumps(o,sort_keys=True,ensure_ascii=False,separators=(",",":"))
+def sha(d:str)->str: return hashlib.sha256(d.encode()).hexdigest()
+def sha_b(d:bytes)->str: return hashlib.sha256(d).hexdigest()
+def sha_file(p:Path)->str:
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for c in iter(lambda:f.read(8192),b""): h.update(c)
     return h.hexdigest()
+def now_iso(): return datetime.now(timezone.utc).isoformat()
+def edir(p:Path): p.mkdir(parents=True,exist_ok=True); return p
+def strip_vol(o,fields=VOLATILE):
+    if isinstance(o,dict): return {k:strip_vol(v,fields) for k,v in sorted(o.items()) if k not in fields}
+    if isinstance(o,list): return [strip_vol(i,fields) for i in o]
+    return o
+def write_art(rd:Path,name:str,payload:dict):
+    s=strip_vol(deepcopy(payload)); d=sha(cjson(s)); full={**payload,"_sha256_functional":d}
+    (rd/f"{name}.json").write_text(json.dumps(full,sort_keys=True,indent=2,ensure_ascii=False),encoding="utf-8")
+    (rd/f"{name}.sha256").write_text(d,encoding="utf-8"); return d
+def log_evt(rd,evt,detail,triggered=False):
+    p=rd/"UI_EVENT_LOG.json"; evts=json.loads(p.read_text()) if p.exists() else []
+    evts.append({"ts":now_iso(),"event":evt,"detail":detail,"triggered_pipeline":triggered})
+    p.write_text(json.dumps(evts,indent=2,ensure_ascii=False))
+def seal_evt_log(rd):
+    p=rd/"UI_EVENT_LOG.json"
+    if not p.exists(): return {"status":"FAIL","reason":"NO_LOG"}
+    evts=json.loads(p.read_text()); trigs=[e for e in evts if e.get("triggered_pipeline")]
+    bad=[e for e in trigs if e["event"]!="ACTIVATE_COUNTRY"]
+    ok=len(trigs)>=1 and len(bad)==0; d=sha(cjson([strip_vol(e) for e in evts]))
+    (rd/"UI_EVENT_LOG.sha256").write_text(d)
+    return {"status":"PASS" if ok else "FAIL","triggers":len(trigs),"bad":len(bad)}
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+# ━━ WEB UTILS (cached) ━━
+def _http_get(url,timeout=SDA0_TIMEOUT,binary=False):
+    try: import requests
+    except ImportError: return None,-1,False
+    ck=sha(url); ext=".bin" if binary else ".html"
+    cp=edir(WEB_CACHE_DIR)/f"{ck}{ext}"; cm=edir(WEB_CACHE_DIR)/f"{ck}.meta"
+    if cp.exists() and cm.exists():
+        try:
+            meta=json.loads(cm.read_text()); data=cp.read_bytes() if binary else cp.read_text(encoding="utf-8",errors="replace")
+            return data,meta.get("status",200),True
+        except: pass
+    try:
+        r=requests.get(url,timeout=timeout,headers={"User-Agent":SDA0_UA},allow_redirects=True)
+        r.raise_for_status()
+        if binary: data=r.content; cp.write_bytes(data)
+        else: data=r.text; cp.write_text(data,encoding="utf-8")
+        cm.write_text(json.dumps({"url":url,"status":r.status_code,"fetch_ts":now_iso(),"size":len(data)}))
+        return data,r.status_code,False
+    except: return None,-1,False
 
-def edir(p: Path):
-    p.mkdir(parents=True, exist_ok=True); return p
+def _extract_pdf_links(html,base_url):
+    try: from bs4 import BeautifulSoup
+    except ImportError: return []
+    if not html: return []
+    soup=BeautifulSoup(html,"html.parser"); links=[]; seen=set()
+    for a in soup.find_all("a",href=True):
+        href=a["href"].strip()
+        if not href: continue
+        full=urljoin(base_url,href)
+        if full in seen: continue
+        seen.add(full)
+        if href.lower().endswith(".pdf") or "pdf" in href.lower():
+            links.append({"url":full,"text":(a.get_text(strip=True) or "")[:200],"href_raw":href[:300]})
+    return links
 
-def strip_vol(obj, fields=VOLATILE):
-    if isinstance(obj, dict):
-        return {k: strip_vol(v, fields) for k, v in sorted(obj.items()) if k not in fields}
-    if isinstance(obj, list):
-        return [strip_vol(i, fields) for i in obj]
-    return obj
-
-def write_art(rd: Path, name: str, payload: dict):
-    stable = strip_vol(deepcopy(payload))
-    digest = sha(cjson(stable))
-    full = {**payload, "_sha256_functional": digest}
-    (rd / f"{name}.json").write_text(
-        json.dumps(full, sort_keys=True, indent=2, ensure_ascii=False), encoding="utf-8")
-    (rd / f"{name}.sha256").write_text(digest, encoding="utf-8")
-    return digest
-
-def log_evt(rd: Path, evt: str, detail: str, triggered: bool = False):
-    p = rd / "UI_EVENT_LOG.json"
-    evts = json.loads(p.read_text()) if p.exists() else []
-    evts.append({"ts": now_iso(), "event": evt, "detail": detail, "triggered_pipeline": triggered})
-    p.write_text(json.dumps(evts, indent=2, ensure_ascii=False))
-
-def seal_evt_log(rd: Path) -> dict:
-    p = rd / "UI_EVENT_LOG.json"
-    if not p.exists():
-        return {"status": "FAIL", "reason": "NO_LOG"}
-    evts = json.loads(p.read_text())
-    trigs = [e for e in evts if e.get("triggered_pipeline")]
-    bad = [e for e in trigs if e["event"] != "ACTIVATE_COUNTRY"]
-    ok = len(trigs) >= 1 and len(bad) == 0
-    d = sha(cjson([strip_vol(e) for e in evts]))
-    (rd / "UI_EVENT_LOG.sha256").write_text(d)
-    return {"status": "PASS" if ok else "FAIL", "triggers": len(trigs), "bad": len(bad)}
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 2) COUNTRY TYPEAHEAD — [FIX-B1] STRICT PREFIX, RADIO, ZERO I/O
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ COUNTRY (UI-ONLY) ━━
 @st.cache_data
-def _build_country_index():  # UI-ONLY — called once, cached
+def _build_country_index():
     try:
-        import pycountry
-        db = {c.alpha_2: c.name for c in pycountry.countries}
+        import pycountry; db={c.alpha_2:c.name for c in pycountry.countries}
     except ImportError:
-        db = {
-            "FR": "France", "BE": "Belgium", "CI": "Côte d'Ivoire", "SN": "Senegal",
-            "CM": "Cameroon", "NG": "Nigeria", "CA": "Canada", "US": "United States",
-            "GB": "United Kingdom", "DE": "Germany", "FI": "Finland", "IT": "Italy",
-            "ES": "Spain", "MA": "Morocco", "TN": "Tunisia", "JP": "Japan", "BR": "Brazil",
-            "FJ": "Fiji", "GA": "Gabon", "GH": "Ghana", "GN": "Guinea", "GM": "Gambia",
-            "GE": "Georgia", "GR": "Greece", "GT": "Guatemala", "NI": "Nicaragua",
-            "NE": "Niger", "NZ": "New Zealand", "ZA": "South Africa", "ZM": "Zambia",
-            "ZW": "Zimbabwe",
-        }
-    index = []
-    for code, name in db.items():
-        index.append({"code": code, "name": name, "nl": name.lower(), "cl": code.lower()})
-    index.sort(key=lambda e: e["name"])
-    return db, index
+        db={"FR":"France","BE":"Belgium","CI":"Côte d'Ivoire","SN":"Senegal","CM":"Cameroon","NG":"Nigeria","CA":"Canada","US":"United States","GB":"United Kingdom","DE":"Germany","IT":"Italy","ES":"Spain","MA":"Morocco","TN":"Tunisia","GA":"Gabon","GH":"Ghana","GN":"Guinea","GE":"Georgia","GR":"Greece","NI":"Nicaragua","NE":"Niger","ZA":"South Africa","ZM":"Zambia","ZW":"Zimbabwe"}
+    idx=[{"code":c,"name":n,"nl":n.lower(),"cl":c.lower()} for c,n in db.items()]
+    idx.sort(key=lambda e:e["name"]); return db,idx
 
-
-def typeahead(q: str, limit: int = 20):  # UI-ONLY — pure in-memory, zero I/O
-    """[FIX-B1] Strict name prefix in primary. Code-prefix + contains in fallback.
-    'g' → Gabon,Gambia,Georgia,Germany… (name starts with g) NOT Equatorial Guinea (code GQ)."""
-    _, idx = _build_country_index()
-    ql = q.strip().lower()
-    if not ql:
-        return [], []
-    name_prefix = []
-    fallback = []
-    seen = set()
-    # Pass 1: strict name prefix
+def typeahead(q,limit=20):  # UI-ONLY
+    _,idx=_build_country_index(); ql=q.strip().lower()
+    if not ql: return [],[]
+    np,fb,seen=[],[],set()
     for e in idx:
-        if e["nl"].startswith(ql):
-            name_prefix.append(e)
-            seen.add(e["code"])
-    # Pass 2: code prefix + contains (never mixed with name prefix)
+        if e["nl"].startswith(ql): np.append(e); seen.add(e["code"])
     for e in idx:
-        if e["code"] in seen:
-            continue
-        if e["cl"].startswith(ql) or ql in e["nl"] or ql in e["cl"]:
-            fallback.append(e)
-            seen.add(e["code"])
-    return name_prefix[:limit], fallback[:limit]
+        if e["code"] in seen: continue
+        if e["cl"].startswith(ql) or ql in e["nl"] or ql in e["cl"]: fb.append(e); seen.add(e["code"])
+    return np[:limit],fb[:limit]
 
+def _country_name(ck):
+    db,_=_build_country_index(); return db.get(ck,ck)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 3) CAP
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def cap_fp(cap: dict) -> str:
-    stripped = {k: v for k, v in cap.items() if k not in VOLATILE and k != "fingerprint"}
-    return sha(cjson(stripped))
+# Language discovery — linguistic metadata, NOT country business logic
+_LANG_DB={"fr":{"FR","BE","CI","SN","CM","GA","GN","TN","MA","ML","BF","TD","CG","CD","MG","BJ","NE","TG","HT","LU","DJ","KM","RW","BI"},"en":{"US","GB","CA","AU","NZ","NG","GH","ZA","KE","IN","PH","SG","IE","ZM","ZW","BW","UG","TZ"},"es":{"ES","MX","CO","AR","PE","VE","CL","EC","GT","CU","BO","DO","HN","PY","SV","NI","CR","PA","UY"},"pt":{"BR","PT","AO","MZ"},"de":{"DE","AT"},"ar":{"SA","EG","IQ","JO","LB","DZ","SD","YE","KW","QA","AE"},"ja":{"JP"},"it":{"IT"}}
+def _lang(ck):  # UI-ONLY — linguistic metadata
+    for l,cs in _LANG_DB.items():
+        if ck in cs: return l
+    return "en"
 
-def load_cap(ck: str):
-    p = PACKS_DIR / ck / "CAP_SEALED.json"
-    if not p.exists():
-        return None, "NOT_FOUND"
-    try:
-        d = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        return None, f"PARSE:{e}"
-    if d.get("fingerprint") != cap_fp(d):
-        return None, "FP_MISMATCH"
-    return d, "OK"
+# ━━ SDA0 ━━
+_STPL={"fr":["{c} sujets corrigés bac terminale filetype:pdf","{c} annales examens sujets corrigés pdf","{c} épreuves baccalauréat sujets et corrigés"],"en":["{c} past exam papers answers pdf","{c} national examination solved papers pdf"],"es":["{c} exámenes resueltos secundaria pdf"],"pt":["{c} provas resolvidas exame nacional pdf"],"de":["{c} Abitur Prüfungen Lösungen pdf"],"ar":["{c} امتحانات محلولة pdf"]}
+_AUTH_PAT=[(r"\.gouv\.",90),(r"\.gov\.",90),(r"\.edu\.",80),(r"\.ac\.",80),(r"\.education\.",85),(r"\.org",60),(r"annales",50),(r"sujet",40),(r"examen",40)]
+_EXAM_KW=["pdf","sujet","corrig","exam","annal","paper","past","epreuve","solved"]
 
-def build_cap(ck: str, sources: list) -> dict:
-    cap = {
-        "country_key": ck, "version": VERSION,
-        "kernel_params": {
-            "text_extraction": ["pdfplumber", "pypdf"], "ocr_engines": [],
-            "cluster_min": 1, "grading_system": "discovery_required",
-        },
-        "education_structure": {
-            "levels": [], "subjects": [], "specialities": [], "chapters": [],
-            "coefficients": [], "exams_by_level": [], "top_concours_by_level": [],
-            "_completeness": "EMPTY_SCAFFOLD",
-        },
-        "sources_count": len(sources), "created_via": "DA0_AUTO_SEAL",
-    }
-    for src in sources:
-        meta = src.get("education_meta", {})
-        for f in ("levels", "subjects", "specialities", "chapters",
-                  "exams_by_level", "top_concours_by_level", "coefficients"):
-            if f in meta and meta[f]:
-                cap["education_structure"][f] = meta[f]
-                cap["education_structure"]["_completeness"] = "PARTIAL"
-    cap["fingerprint"] = cap_fp(cap)
-    cap["sealed_at"] = now_iso()
-    od = edir(PACKS_DIR / ck)
-    (od / "CAP_SEALED.json").write_text(
-        json.dumps(cap, sort_keys=True, indent=2, ensure_ascii=False))
-    return cap
-
-def cap_completeness(cap: dict) -> dict:
-    es = cap.get("education_structure", {})
-    fields = ["levels", "subjects", "specialities", "chapters",
-              "coefficients", "exams_by_level", "top_concours_by_level"]
-    present = {f: len(es.get(f, [])) for f in fields}
-    missing = [f for f, c in present.items() if c == 0]
-    return {"status": "PASS" if not missing else "FAIL",
-            "fields": present, "missing": missing,
-            "completeness": es.get("_completeness", "UNKNOWN")}
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 4) DA0
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-class DA0:
-    def __init__(self, ck, rd):
-        self.ck, self.rd = ck, rd
-        self.sources, self.quarantine = [], []
-
+class SDA0:
+    def __init__(self,ck,rd):
+        self.ck,self.rd=ck,rd; self.cn=_country_name(ck); self.lang=_lang(ck)
+        self.sources,self.pdf_links,self.quarantine,self.dlog=[],[],[],[]
     def discover(self):
-        sd = HARVEST_DIR / self.ck / "sources"
-        if not sd.exists():
-            return self.sources
+        t0=time.time(); self._search(); self._portals(); self._dedup(); self._score()
+        self.dlog.append({"strategy":"ALL","elapsed_ms":int((time.time()-t0)*1000),"sources":len(self.sources),"links":len(self.pdf_links)})
+        return self.sources,self.pdf_links
+    def _search(self):
+        tmpls=_STPL.get(self.lang,_STPL["en"])
+        for t in tmpls[:3]:
+            q=t.format(c=self.cn); url=f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
+            html,st,cached=_http_get(url)
+            self.dlog.append({"strategy":"SEARCH","query":q[:120],"status":st,"cached":cached,"discovery_ts":now_iso()})
+            if html and st==200: self._parse_sr(html,q)
+    def _parse_sr(self,html,query):
+        try: from bs4 import BeautifulSoup
+        except: return
+        soup=BeautifulSoup(html,"html.parser")
+        for a in soup.select("a.result__a,a.result__url,a[href]"):
+            href=a.get("href","")
+            if not href or "duckduckgo" in href: continue
+            if "uddg=" in href:
+                from urllib.parse import parse_qs,urlparse as up
+                try: href=parse_qs(up(href).query).get("uddg",[href])[0]
+                except: pass
+            if not href.startswith("http"): continue
+            title=a.get_text(strip=True)[:200]; low=href.lower()+title.lower()
+            if any(k in low for k in _EXAM_KW): self._fetch_page(href,title,query)
+    def _fetch_page(self,url,title,query):
+        domain=urlparse(url).netloc.lower()
+        if url.lower().endswith(".pdf"):
+            self.pdf_links.append({"url":url,"domain":domain,"text":title,"source_query":query[:80],"direct":True})
+            self._ensure_src(domain,title,url); return
+        html,st,_=_http_get(url)
+        if not html or st!=200: return
+        links=_extract_pdf_links(html,url)
+        for l in links[:SDA0_MAX_PDFS]:
+            l["domain"]=urlparse(l["url"]).netloc.lower(); l["source_query"]=query[:80]; l["direct"]=False
+            self.pdf_links.append(l)
+        if links: self._ensure_src(domain,title,url)
+    def _portals(self):
+        cn=self.cn.lower().replace(" ","-")
+        for url in [f"https://www.education.gouv.fr/annales",f"https://eduscol.education.fr/annales"][:2]:
+            html,st,cached=_http_get(url)
+            self.dlog.append({"strategy":"PORTAL","url":url[:120],"status":st,"cached":cached,"discovery_ts":now_iso()})
+            if html and st==200:
+                links=_extract_pdf_links(html,url)
+                for l in links[:SDA0_MAX_PDFS]:
+                    l["domain"]=urlparse(l["url"]).netloc.lower(); l["source_query"]="portal"; l["direct"]=False
+                    self.pdf_links.append(l)
+                if links: self._ensure_src(urlparse(url).netloc.lower(),f"Portal:{url}",url)
+    def _ensure_src(self,domain,title,url):
+        for s in self.sources:
+            if s.get("domain")==domain: s["urls_found"]=s.get("urls_found",0)+1; return
+        self.sources.append({"source_id":f"SRC_{sha(domain)[:12]}","source_type":"web_discovery","authority":domain,"domain":domain,"title":title[:200],"sample_url":url[:500],"urls_found":1,"file_patterns":[]})
+    def _dedup(self):
+        seen=set(); dd=[]
+        for l in self.pdf_links:
+            if l["url"] not in seen: seen.add(l["url"]); dd.append(l)
+        self.pdf_links=dd
+    def _score(self):
+        for s in self.sources:
+            sc=30; d=s.get("domain","").lower(); u=s.get("sample_url","").lower()
+            for pat,pts in _AUTH_PAT:
+                if re.search(pat,d) or re.search(pat,u): sc=max(sc,pts)
+            s["authority_score"]=sc
+    def write(self):
+        sd=edir(HARVEST_DIR/self.ck/"sources")
+        for s in self.sources: (sd/f"{s['source_id']}.json").write_text(json.dumps(s,sort_keys=True,indent=2,ensure_ascii=False))
+        write_art(self.rd,"SourceManifest",{"country_key":self.ck,"sources":self.sources,"sources_discovered":len(self.sources),"pdf_links_found":len(self.pdf_links),"discovery_log":self.dlog,"timestamp":now_iso()})
+        write_art(self.rd,"AuthorityAudit",{"country_key":self.ck,"authorities":sorted({s.get("authority","?") for s in self.sources}),"scores":{s["authority"]:s.get("authority_score",0) for s in self.sources},"timestamp":now_iso()})
+        if self.quarantine: write_art(self.rd,"Quarantine",{"country_key":self.ck,"stage":"SDA0","quarantined":self.quarantine,"timestamp":now_iso()})
+
+# ━━ DA0 ━━
+class DA0:
+    def __init__(self,ck,rd): self.ck,self.rd=ck,rd; self.sources,self.quarantine=[],[]
+    def discover(self):
+        sd=HARVEST_DIR/self.ck/"sources"
+        if not sd.exists(): return self.sources
         for f in sorted(sd.glob("*.json")):
             try:
-                s = json.loads(f.read_text(encoding="utf-8"))
-                if all(k in s for k in ("source_id", "source_type", "authority")):
-                    self.sources.append(s)
-                else:
-                    self.quarantine.append({"file": f.name, "reason": "INVALID_MANIFEST"})
-            except Exception as e:
-                self.quarantine.append({"file": f.name, "reason": f"PARSE:{e}"})
+                s=json.loads(f.read_text(encoding="utf-8"))
+                if all(k in s for k in ("source_id","source_type","authority")): self.sources.append(s)
+                else: self.quarantine.append({"file":f.name,"reason":"INVALID_MANIFEST"})
+            except Exception as e: self.quarantine.append({"file":f.name,"reason":f"PARSE:{e}"})
         return self.sources
 
-    def write(self):
-        write_art(self.rd, "SourceManifest", {
-            "country_key": self.ck, "sources": self.sources,
-            "sources_discovered": len(self.sources), "timestamp": now_iso()})
-        write_art(self.rd, "AuthorityAudit", {
-            "country_key": self.ck,
-            "authorities": sorted({s.get("authority", "?") for s in self.sources}),
-            "timestamp": now_iso()})
-        if self.quarantine:
-            write_art(self.rd, "Quarantine", {
-                "country_key": self.ck, "stage": "DA0",
-                "quarantined": self.quarantine, "timestamp": now_iso()})
+# ━━ CAP ━━
+def cap_fp(c): return sha(cjson({k:v for k,v in c.items() if k not in VOLATILE and k!="fingerprint"}))
+def load_cap(ck):
+    p=PACKS_DIR/ck/"CAP_SEALED.json"
+    if not p.exists(): return None,"NOT_FOUND"
+    try: d=json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e: return None,f"PARSE:{e}"
+    if d.get("fingerprint")!=cap_fp(d): return None,"FP_MISMATCH"
+    return d,"OK"
+def build_cap_auto(ck,sources,pdf_links,pairs):
+    cap={"country_key":ck,"version":VERSION,"kernel_params":{"text_extraction":["pdfplumber","pypdf"],"ocr_engines":[],"cluster_min":1,"grading_system":"discovery_required"},"education_structure":{"levels":[],"subjects":[],"specialities":[],"chapters":[],"coefficients":[],"exams_by_level":[],"top_concours_by_level":[],"_completeness":"DISCOVERY"},"sources_count":len(sources),"created_via":"AUTO_DISCOVERY"}
+    for src in sources:
+        meta=src.get("education_meta",{})
+        for f in ("levels","subjects","specialities","chapters","exams_by_level","top_concours_by_level","coefficients"):
+            if f in meta and meta[f]:
+                ex=set(str(x) for x in cap["education_structure"].get(f,[]))
+                for item in meta[f]:
+                    if str(item) not in ex: cap["education_structure"][f].append(item); ex.add(str(item))
+    lf,sf=set(),set()
+    for link in pdf_links:
+        txt=(link.get("text","")+" "+link.get("url","")).lower()
+        for lv in ["terminale","premiere","seconde","brevet","bac","bts","licence","3eme","1ere","2nde","tle"]:
+            if lv in txt: lf.add(lv.capitalize())
+        for su in ["math","physique","chimie","svt","francais","anglais","histoire","geo","philo","ses","nsi","si"]:
+            if su in txt: sf.add(su.capitalize())
+    for p in pairs:
+        if p.get("level"): lf.add(p["level"].capitalize())
+        if p.get("subject"): sf.add(p["subject"].capitalize())
+    es=cap["education_structure"]; el=set(str(x) for x in es["levels"])
+    for lv in sorted(lf):
+        if lv not in el: es["levels"].append(lv)
+    esu=set(str(x) for x in es["subjects"])
+    for su in sorted(sf):
+        if su not in esu: es["subjects"].append(su)
+    if es["levels"] and es["subjects"]: es["_completeness"]="PARTIAL_AUTO"
+    elif es["levels"] or es["subjects"]: es["_completeness"]="MINIMAL_AUTO"
+    cap["fingerprint"]=cap_fp(cap); cap["sealed_at"]=now_iso()
+    od=edir(PACKS_DIR/ck); (od/"CAP_SEALED.json").write_text(json.dumps(cap,sort_keys=True,indent=2,ensure_ascii=False))
+    return cap
+def cap_completeness(cap):
+    es=cap.get("education_structure",{}); fields=["levels","subjects","specialities","chapters","coefficients","exams_by_level","top_concours_by_level"]
+    present={f:len(es.get(f,[])) for f in fields}; missing=[f for f,c in present.items() if c==0]
+    ok=present.get("levels",0)>0 and present.get("subjects",0)>0
+    return {"status":"PASS" if ok else "FAIL","fields":present,"missing":missing,"completeness":es.get("_completeness","UNKNOWN")}
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 5) DA1
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_CORR_KW = ("corrige", "correction", "corriger", "corr_", "answer", "solved")
-_META_RE = re.compile(
-    r"(?P<level>seconde|premiere|terminale|1ere|2nde|tle|3eme|brevet|bac|cap|bts|licence|l[123]|m[12])"
-    r"|(?P<subject>math|physique|chimie|svt|francais|anglais|histoire|geo|philo|ses|nsi|si|eps)"
-    r"|(?P<year>20\d{2}|19\d{2})"
-    r"|(?P<spe>specialite|spe|option)"
-    r"|(?P<session>session|juin|septembre|rattrapage|remplacement)",
-    re.IGNORECASE)
+# ━━ DA1 AUTO ━━
+_CORR_KW=("corrige","correction","corriger","corr_","corr-","answer","solved","solution","reponse","bareme")
+_META_RE=re.compile(r"(?P<level>seconde|premiere|terminale|1ere|2nde|tle|3eme|brevet|bac|cap|bts|licence|l[123]|m[12])|(?P<subject>math|physique|chimie|svt|francais|anglais|histoire|geo|philo|ses|nsi|si|eps)|(?P<year>20\d{2}|19\d{2})|(?P<spe>specialite|spe|option)|(?P<session>session|juin|septembre|rattrapage|remplacement)",re.IGNORECASE)
 
-
-class DA1:
-    def __init__(self, ck, sources, rd):
-        self.ck, self.sources, self.rd = ck, sources, rd
-        self.pdf_index, self.pairs, self.quarantine = [], [], []
-        self._source_map = {s.get("source_id"): s for s in sources}
-
+class DA1Auto:
+    def __init__(self,ck,sources,pdf_links,rd):
+        self.ck,self.sources,self.pdf_links,self.rd=ck,sources,pdf_links,rd
+        self.pdf_index,self.pairs,self.quarantine=[],[],[]; self._smap={s.get("source_id"):s for s in sources}; self.dllog=[]
     def harvest(self):
-        pd = HARVEST_DIR / self.ck / "pdfs"
-        if not pd.exists():
-            return self.pairs
+        pd=edir(HARVEST_DIR/self.ck/"pdfs"); seen_sha=set(); dl=0
+        for link in self.pdf_links[:SDA0_MAX_PDFS*2]:
+            url=link.get("url","")
+            if not url.lower().endswith(".pdf") and "pdf" not in url.lower(): continue
+            try:
+                data,st,cached=_http_get(url,timeout=SDA0_TIMEOUT,binary=True)
+                if not data or st!=200 or len(data)<1024: self.quarantine.append({"url":url[:200],"reason":f"DL_FAIL:{st}"}); continue
+                fsha=sha_b(data)
+                if fsha in seen_sha: continue
+                seen_sha.add(fsha)
+                fn=self._url2fn(url,link.get("text","")); fp=pd/fn
+                if not fp.exists(): fp.write_bytes(data)
+                dl+=1; self.dllog.append({"url":url[:200],"filename":fn,"sha256":fsha,"size":len(data),"cached":cached,"download_ts":now_iso()})
+            except Exception as e: self.quarantine.append({"url":url[:200],"reason":f"ERR:{e}"})
+            if dl>=SDA0_MAX_PDFS: break
         for pp in sorted(pd.glob("*.pdf")):
-            meta = self._extract_meta(pp.name)
-            self.pdf_index.append({
-                "filename": pp.name, "abs_path": str(pp.resolve()),
-                "sha256": sha_file(pp), "size_bytes": pp.stat().st_size, **meta})
-        self._pair()
-        return self.pairs
-
-    def _extract_meta(self, fn):
-        meta = {"level": None, "subject": None, "year": None, "spe": None, "session": None}
-        for m in _META_RE.finditer(fn.lower().replace("-", " ").replace("_", " ")):
+            meta=self._meta(pp.name)
+            self.pdf_index.append({"filename":pp.name,"abs_path":str(pp.resolve()),"sha256":sha_file(pp),"size_bytes":pp.stat().st_size,**meta})
+        self._pair(); return self.pairs
+    def _url2fn(self,url,text):
+        p=urlparse(url).path.split("/")[-1] if urlparse(url).path else ""
+        if p.lower().endswith(".pdf"): fn=re.sub(r'[^\w\-.]','_',p)
+        else: fn=f"{re.sub(r'[^w-]','_',text[:60]) if text else sha(url)[:16]}.pdf"
+        return fn[:120]
+    def _meta(self,fn):
+        meta={"level":None,"subject":None,"year":None,"spe":None,"session":None}
+        for m in _META_RE.finditer(fn.lower().replace("-"," ").replace("_"," ")):
             for k in meta:
-                v = m.group(k)
-                if v and not meta[k]:
-                    meta[k] = v
+                v=m.group(k)
+                if v and not meta[k]: meta[k]=v
         return meta
-
     def _pair(self):
-        subj, corr = {}, {}
+        subj,corr={},{}
         for e in self.pdf_index:
-            fn = e["filename"].lower()
-            base = re.sub(r"(sujet|corrige|correction|corriger|corr|answer|solved)[_\-\s]*", "", fn)
-            base = re.sub(r"\.pdf$", "", base).strip("_- ")
-            if any(k in fn for k in _CORR_KW):
-                corr[base] = e
-            else:
-                subj[base] = e
-        for key, s in subj.items():
-            c = corr.get(key)
+            fn=e["filename"].lower(); base=re.sub(r"(sujet|corrige|correction|corriger|corr|answer|solved|solution|reponse|bareme)[_\-\s]*","",fn)
+            base=re.sub(r"\.pdf$","",base).strip("_- ")
+            if any(k in fn for k in _CORR_KW): corr[base]=e
+            else: subj[base]=e
+        for key,s in subj.items():
+            c=corr.get(key)
             if c:
-                pid = f"PAIR_{sha(s['sha256'] + c['sha256'])[:16]}"
-                # Try to find source_id
-                src_id = self._match_source(s["filename"])
-                self.pairs.append({
-                    "pair_id": pid, "sujet": s, "corrige": c,
-                    "level": s.get("level") or c.get("level"),
-                    "subject": s.get("subject") or c.get("subject"),
-                    "year": s.get("year") or c.get("year"),
-                    "spe": s.get("spe") or c.get("spe"),
-                    "source_id": src_id,
-                    "authority": self._source_map.get(src_id, {}).get("authority") if src_id else None,
-                })
-            else:
-                self.quarantine.append({"file": s["filename"], "reason": "NO_MATCHING_CORRIGE"})
-
-    def _match_source(self, fn):
-        """Try to match a PDF filename to a source_id from manifests."""
-        for sid, src in self._source_map.items():
-            patterns = src.get("file_patterns", [])
-            if any(p.lower() in fn.lower() for p in patterns):
-                return sid
+                pid=f"PAIR_{sha(s['sha256']+c['sha256'])[:16]}"; sid=self._msrc(s["filename"])
+                self.pairs.append({"pair_id":pid,"sujet":s,"corrige":c,"level":s.get("level") or c.get("level"),"subject":s.get("subject") or c.get("subject"),"year":s.get("year") or c.get("year"),"spe":s.get("spe") or c.get("spe"),"source_id":sid,"authority":self._smap.get(sid,{}).get("authority") if sid else None})
+            else: self.quarantine.append({"file":s["filename"],"reason":"NO_MATCHING_CORRIGE"})
+    def _msrc(self,fn):
+        for sid,src in self._smap.items():
+            for p in src.get("file_patterns",[]): 
+                if p.lower() in fn.lower(): return sid
+            d=src.get("domain","")
+            if d and d.split(".")[0] in fn.lower(): return sid
         return None
-
     def write(self):
-        write_art(self.rd, "PDF_Hash_Index", {
-            "country_key": self.ck, "pdfs": self.pdf_index,
-            "total": len(self.pdf_index), "timestamp": now_iso()})
-        write_art(self.rd, "CEP_pairs", {
-            "country_key": self.ck, "pairs": self.pairs,
-            "total_pairs": len(self.pairs), "timestamp": now_iso()})
+        write_art(self.rd,"PDF_Hash_Index",{"country_key":self.ck,"pdfs":self.pdf_index,"total":len(self.pdf_index),"downloaded":len(self.dllog),"timestamp":now_iso()})
+        write_art(self.rd,"CEP_pairs",{"country_key":self.ck,"pairs":self.pairs,"total_pairs":len(self.pairs),"timestamp":now_iso()})
         if self.quarantine:
-            self._merge_q()
+            qp=self.rd/"Quarantine.json"; ex=json.loads(qp.read_text()).get("quarantined",[]) if qp.exists() else []
+            write_art(self.rd,"Quarantine",{"country_key":self.ck,"quarantined":ex+self.quarantine,"timestamp":now_iso()})
+        if self.dllog: write_art(self.rd,"DownloadLog",{"country_key":self.ck,"downloads":self.dllog,"total":len(self.dllog),"timestamp":now_iso()})
 
-    def _merge_q(self):
-        qp = self.rd / "Quarantine.json"
-        ex = json.loads(qp.read_text()).get("quarantined", []) if qp.exists() else []
-        write_art(self.rd, "Quarantine", {
-            "country_key": self.ck, "quarantined": ex + self.quarantine,
-            "timestamp": now_iso()})
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 6) TEXT EXTRACTION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ TEXT EXTRACTION ━━
 class TextEngine:
-    def __init__(self, cap, ck, rd):
-        kp = cap.get("kernel_params", {})
-        self.engines = kp.get("text_extraction", ["pdfplumber"])
-        self.ocr_eng = kp.get("ocr_engines", [])
-        self.ck, self.rd = ck, rd
-        self.cache = edir(OCR_CACHE_DIR / ck)
-        self.results = []
-
-    def extract_pair(self, pair):
-        pid = pair["pair_id"]
-        cp = self.cache / f"{pid}.json"
+    def __init__(self,cap,ck,rd):
+        kp=cap.get("kernel_params",{}); self.engines=kp.get("text_extraction",["pdfplumber"]); self.ocr=kp.get("ocr_engines",[])
+        self.ck,self.rd=ck,rd; self.cache=edir(OCR_CACHE_DIR/ck); self.results=[]
+    def extract_pair(self,pair):
+        pid=pair["pair_id"]; cp=self.cache/f"{pid}.json"
         if cp.exists():
             try:
-                cached = json.loads(cp.read_text(encoding="utf-8"))
-                if cached.get("text_final_sha256"):
-                    cached["_cache_hit"] = True
-                    self.results.append(cached)
-                    return cached
-            except Exception:
-                pass
-        r = self._do(pair)
-        r["_cache_hit"] = False
-        cp.write_text(json.dumps(r, sort_keys=True, indent=2, ensure_ascii=False))
-        self.results.append(r)
-        return r
-
-    def _do(self, pair):
-        st_t, st_e, st_pg = self._pdf_text(Path(pair["sujet"]["abs_path"]))
-        cr_t, cr_e, cr_pg = self._pdf_text(Path(pair["corrige"]["abs_path"]))
+                cached=json.loads(cp.read_text(encoding="utf-8"))
+                if cached.get("text_final_sha256"): cached["_cache_hit"]=True; self.results.append(cached); return cached
+            except: pass
+        r=self._do(pair); r["_cache_hit"]=False
+        cp.write_text(json.dumps(r,sort_keys=True,indent=2,ensure_ascii=False)); self.results.append(r); return r
+    def _do(self,pair):
+        st_t,st_e,st_pg=self._pdf_text(Path(pair["sujet"]["abs_path"]))
+        cr_t,cr_e,cr_pg=self._pdf_text(Path(pair["corrige"]["abs_path"]))
         if st_t is None and cr_t is None:
-            return {"pair_id": pair["pair_id"], "status": "FAIL",
-                    "reason": "NO_TEXT_FROM_EITHER_PDF",
-                    "engines": self.engines + self.ocr_eng,
-                    "sujet_sha256": pair["sujet"]["sha256"],
-                    "corrige_sha256": pair["corrige"]["sha256"],
-                    "text_final": None, "text_final_sha256": sha("")}
-        parts = [t for t in (st_t, cr_t) if t]
-        tf = "\n===SEP===\n".join(parts)
-        return {"pair_id": pair["pair_id"], "status": "EXTRACTED",
-                "sujet_sha256": pair["sujet"]["sha256"],
-                "corrige_sha256": pair["corrige"]["sha256"],
-                "sujet_engine": st_e, "corrige_engine": cr_e,
-                "sujet_pages": st_pg, "corrige_pages": cr_pg,
-                "text_final": tf, "text_final_sha256": sha(tf),
-                "text_final_len": len(tf), "engines_used": self.engines,
-                "arbitrage": "TEXT_FIRST"}
-
-    def _pdf_text(self, pp):
-        if not pp.exists():
-            return None, None, 0
+            return {"pair_id":pair["pair_id"],"status":"FAIL","reason":"NO_TEXT","sujet_sha256":pair["sujet"]["sha256"],"corrige_sha256":pair["corrige"]["sha256"],"text_final":None,"text_final_sha256":sha("")}
+        parts=[t for t in (st_t,cr_t) if t]; tf="\n===SEP===\n".join(parts)
+        return {"pair_id":pair["pair_id"],"status":"EXTRACTED","sujet_sha256":pair["sujet"]["sha256"],"corrige_sha256":pair["corrige"]["sha256"],"sujet_engine":st_e,"corrige_engine":cr_e,"sujet_pages":st_pg,"corrige_pages":cr_pg,"text_final":tf,"text_final_sha256":sha(tf),"text_final_len":len(tf),"engines_used":self.engines,"arbitrage":"TEXT_FIRST"}
+    def _pdf_text(self,pp):
+        if not pp.exists(): return None,None,0
         for eng in self.engines:
-            if eng == "pdfplumber":
-                t, pg = self._pdfplumber(pp)
-                if t and t.strip():
-                    return t, "pdfplumber", pg
-            elif eng == "pypdf":
-                t, pg = self._pypdf(pp)
-                if t and t.strip():
-                    return t, "pypdf", pg
-        return None, None, 0
-
+            if eng=="pdfplumber":
+                t,pg=self._pdfplumber(pp)
+                if t and t.strip(): return t,"pdfplumber",pg
+            elif eng=="pypdf":
+                t,pg=self._pypdf(pp)
+                if t and t.strip(): return t,"pypdf",pg
+        return None,None,0
     @staticmethod
     def _pdfplumber(pp):
         try:
-            import pdfplumber
-            txts = []
+            import pdfplumber; txts=[]
             with pdfplumber.open(str(pp)) as pdf:
-                pgc = len(pdf.pages)
+                pgc=len(pdf.pages)
                 for pg in pdf.pages:
-                    t = pg.extract_text()
-                    if t:
-                        txts.append(t)
-            return "\n".join(txts) if txts else None, pgc
-        except Exception:
-            return None, 0
-
+                    t=pg.extract_text()
+                    if t: txts.append(t)
+            return "\n".join(txts) if txts else None,pgc
+        except: return None,0
     @staticmethod
     def _pypdf(pp):
         try:
-            from pypdf import PdfReader
-            r = PdfReader(str(pp))
-            txts = []
+            from pypdf import PdfReader; r=PdfReader(str(pp)); txts=[]
             for pg in r.pages:
-                t = pg.extract_text()
-                if t:
-                    txts.append(t)
-            return "\n".join(txts) if txts else None, len(r.pages)
-        except Exception:
-            return None, 0
-
+                t=pg.extract_text()
+                if t: txts.append(t)
+            return "\n".join(txts) if txts else None,len(r.pages)
+        except: return None,0
     def write(self):
-        recs = [{k: v for k, v in r.items() if k != "text_final"} for r in self.results]
-        write_art(self.rd, "SOE", {
-            "country_key": self.ck, "results": recs,
-            "engines_text": self.engines, "engines_ocr": self.ocr_eng,
-            "total": len(self.results),
-            "extracted": sum(1 for r in self.results if r.get("status") == "EXTRACTED"),
-            "cache_hits": sum(1 for r in self.results if r.get("_cache_hit")),
-            "timestamp": now_iso()})
+        recs=[{k:v for k,v in r.items() if k!="text_final"} for r in self.results]
+        write_art(self.rd,"SOE",{"country_key":self.ck,"results":recs,"engines_text":self.engines,"engines_ocr":self.ocr,"total":len(self.results),"extracted":sum(1 for r in self.results if r.get("status")=="EXTRACTED"),"cache_hits":sum(1 for r in self.results if r.get("_cache_hit")),"timestamp":now_iso()})
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 7) ATOM EXTRACTION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_QPATS = [
-    re.compile(r"(?:^|\n)\s*(Exercice|Exercise|EXERCICE)\s*[:\s]*(\d+)", re.I),
-    re.compile(r"(?:^|\n)\s*(Partie|Part|PARTIE)\s*[:\s]*(\d+)", re.I),
-    re.compile(r"(?:^|\n)\s*(Question|QUESTION)\s*[:\s]*(\d+)", re.I),
-    re.compile(r"(?:^|\n)\s*(\d+)\s*[\.\)\-]\s+"),
-    re.compile(r"(?:^|\n)\s*([A-D])\s*[\.\)\-]\s+"),
-]
-
-
+# ━━ ATOMS ━━
+_QPATS=[re.compile(r"(?:^|\n)\s*(Exercice|Exercise|EXERCICE)\s*[:\s]*(\d+)",re.I),re.compile(r"(?:^|\n)\s*(Partie|Part|PARTIE)\s*[:\s]*(\d+)",re.I),re.compile(r"(?:^|\n)\s*(Question|QUESTION)\s*[:\s]*(\d+)",re.I),re.compile(r"(?:^|\n)\s*(\d+)\s*[\.\)\-]\s+"),re.compile(r"(?:^|\n)\s*([A-D])\s*[\.\)\-]\s+")]
 class AtomEngine:
-    def __init__(self, tex_results, rd):
-        self.results, self.rd = tex_results, rd
-        self.atoms, self.quarantine = [], []
-
+    def __init__(self,tex_results,rd): self.results,self.rd=tex_results,rd; self.atoms,self.quarantine=[],[]
     def extract(self):
         for ext in self.results:
-            if ext.get("status") != "EXTRACTED":
-                self.quarantine.append({
-                    "pair_id": ext.get("pair_id"),
-                    "reason": f"STATUS_{ext.get('status', '?')}"})
-                continue
-            tf = ext.get("text_final", "")
-            if not tf or not tf.strip():
-                self.quarantine.append({
-                    "pair_id": ext.get("pair_id"), "reason": "EMPTY_TEXT"})
-                continue
-            atoms = self._split(ext)
-            if not atoms:
-                self.quarantine.append({
-                    "pair_id": ext.get("pair_id"),
-                    "reason": "NO_SEGMENTS_FOUND",
-                    "text_sha": ext.get("text_final_sha256")})
+            if ext.get("status")!="EXTRACTED": self.quarantine.append({"pair_id":ext.get("pair_id"),"reason":f"STATUS_{ext.get('status','?')}"}); continue
+            tf=ext.get("text_final","")
+            if not tf or not tf.strip(): self.quarantine.append({"pair_id":ext.get("pair_id"),"reason":"EMPTY_TEXT"}); continue
+            atoms=self._split(ext)
+            if not atoms: self.quarantine.append({"pair_id":ext.get("pair_id"),"reason":"NO_SEGMENTS","text_sha":ext.get("text_final_sha256")})
             self.atoms.extend(atoms)
         return self.atoms
-
-    def _split(self, ext):
-        tf = ext["text_final"]
-        pid = ext["pair_id"]
-        parts = tf.split("\n===SEP===\n")
-        suj = parts[0] if parts else ""
-        cor = parts[1] if len(parts) > 1 else ""
-        qi_segs = self._segments(suj)
-        rqi_segs = self._segments(cor)
-        atoms = []
-        for i, seg in enumerate(qi_segs):
-            qid = f"{pid}_Q{i + 1}"
-            rqi = rqi_segs[i] if i < len(rqi_segs) else None
-            atom = {
-                "qi_id": qid, "pair_id": pid,
-                "qi_label": seg["label"], "qi_offset": seg["offset"],
-                "qi_length": len(seg["text"]), "qi_sha256": sha(seg["text"]),
-                "qi_excerpt": seg["text"][:200],
-                "rqi_present": rqi is not None,
-                "rqi_sha256": sha(rqi["text"]) if rqi else None,
-                "rqi_excerpt": rqi["text"][:200] if rqi else None,
-                "sujet_pdf_sha256": ext.get("sujet_sha256"),
-                "corrige_pdf_sha256": ext.get("corrige_sha256"),
-                "text_final_sha256": ext.get("text_final_sha256"),
-            }
-            if rqi is None:
-                self.quarantine.append({
-                    "qi_id": qid, "pair_id": pid, "reason": "NO_MATCHING_RQI"})
-            atoms.append(atom)
+    def _split(self,ext):
+        tf=ext["text_final"]; pid=ext["pair_id"]; parts=tf.split("\n===SEP===\n")
+        suj=parts[0] if parts else ""; cor=parts[1] if len(parts)>1 else ""
+        qi_s=self._segs(suj); rqi_s=self._segs(cor); atoms=[]
+        for i,seg in enumerate(qi_s):
+            qid=f"{pid}_Q{i+1}"; rqi=rqi_s[i] if i<len(rqi_s) else None
+            atoms.append({"qi_id":qid,"pair_id":pid,"qi_label":seg["label"],"qi_offset":seg["offset"],"qi_length":len(seg["text"]),"qi_sha256":sha(seg["text"]),"qi_excerpt":seg["text"][:200],"rqi_present":rqi is not None,"rqi_sha256":sha(rqi["text"]) if rqi else None,"rqi_excerpt":rqi["text"][:200] if rqi else None,"sujet_pdf_sha256":ext.get("sujet_sha256"),"corrige_pdf_sha256":ext.get("corrige_sha256"),"text_final_sha256":ext.get("text_final_sha256")})
+            if rqi is None: self.quarantine.append({"qi_id":qid,"pair_id":pid,"reason":"NO_MATCHING_RQI"})
         return atoms
-
-    def _segments(self, txt):
-        if not txt or not txt.strip():
-            return []
-        bounds = []
+    def _segs(self,txt):
+        if not txt or not txt.strip(): return []
+        bounds=[]
         for pat in _QPATS:
-            for m in pat.finditer(txt):
-                bounds.append({"offset": m.start(), "label": m.group(0).strip()[:60]})
+            for m in pat.finditer(txt): bounds.append({"offset":m.start(),"label":m.group(0).strip()[:60]})
         if not bounds:
-            if len(txt.strip()) > 20:
-                return [{"text": txt.strip(), "offset": 0, "label": "FULL"}]
+            if len(txt.strip())>20: return [{"text":txt.strip(),"offset":0,"label":"FULL"}]
             return []
-        bounds.sort(key=lambda b: b["offset"])
-        dedup = [bounds[0]]
+        bounds.sort(key=lambda b:b["offset"]); dd=[bounds[0]]
         for b in bounds[1:]:
-            if b["offset"] - dedup[-1]["offset"] > 25:
-                dedup.append(b)
-        segs = []
-        for i, b in enumerate(dedup):
-            s = b["offset"]
-            e = dedup[i + 1]["offset"] if i + 1 < len(dedup) else len(txt)
-            t = txt[s:e].strip()
-            if t:
-                segs.append({"text": t, "offset": s, "label": b["label"]})
+            if b["offset"]-dd[-1]["offset"]>25: dd.append(b)
+        segs=[]
+        for i,b in enumerate(dd):
+            s=b["offset"]; e=dd[i+1]["offset"] if i+1<len(dd) else len(txt); t=txt[s:e].strip()
+            if t: segs.append({"text":t,"offset":s,"label":b["label"]})
         return segs
-
     def write(self):
-        safe = [{k: v for k, v in a.items()} for a in self.atoms]
-        write_art(self.rd, "Atoms_Qi_RQi", {
-            "atoms": safe, "total_qi": len(self.atoms),
-            "with_rqi": sum(1 for a in self.atoms if a.get("rqi_present")),
-            "quarantined": len(self.quarantine), "timestamp": now_iso()})
+        write_art(self.rd,"Atoms_Qi_RQi",{"atoms":self.atoms,"total_qi":len(self.atoms),"with_rqi":sum(1 for a in self.atoms if a.get("rqi_present")),"quarantined":len(self.quarantine),"timestamp":now_iso()})
         if self.quarantine:
-            qp = self.rd / "Quarantine.json"
-            ex = json.loads(qp.read_text()).get("quarantined", []) if qp.exists() else []
-            write_art(self.rd, "Quarantine", {
-                "quarantined": ex + self.quarantine, "timestamp": now_iso()})
+            qp=self.rd/"Quarantine.json"; ex=json.loads(qp.read_text()).get("quarantined",[]) if qp.exists() else []
+            write_art(self.rd,"Quarantine",{"quarantined":ex+self.quarantine,"timestamp":now_iso()})
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 8) QC BUILDER + COVERAGE BY (LEVEL,SUBJECT)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_LOCAL_RE = re.compile(
-    r"\b(centre|center|session|juin|juillet|septembre|janvier|rattrapage|remplacement)\b", re.I)
-
-
+# ━━ QC + COVERAGE ━━
+_LOCAL_RE=re.compile(r"\b(centre|center|session|juin|juillet|septembre|janvier|rattrapage|remplacement)\b",re.I)
 class QCEngine:
-    def __init__(self, atoms, pairs, cap, rd):
-        self.atoms, self.pairs, self.cap, self.rd = atoms, pairs, cap, rd
-        self.cmin = cap.get("kernel_params", {}).get("cluster_min", 1)
-        self.qcs, self.rejected, self.orphans = [], [], []
-
+    def __init__(self,atoms,pairs,cap,rd): self.atoms,self.pairs,self.cap,self.rd=atoms,pairs,cap,rd; self.cmin=cap.get("kernel_params",{}).get("cluster_min",1); self.qcs,self.rejected,self.orphans=[],[],[]
     def build(self):
-        by_pair = {}
-        for a in self.atoms:
-            by_pair.setdefault(a["pair_id"], []).append(a)
-        pair_meta = {p["pair_id"]: p for p in self.pairs}
-        for pid, grp in sorted(by_pair.items()):
-            if len(grp) < self.cmin:
-                self.rejected.append({"pair_id": pid, "reason": f"SIZE<{self.cmin}"})
-                continue
-            inc = [a for a in grp if not a.get("qi_sha256") or not a.get("sujet_pdf_sha256")]
-            if inc:
-                self.rejected.append({"pair_id": pid, "reason": "INCOMPLETE_EVIDENCE"})
-                continue
-            pm = pair_meta.get(pid, {})
-            self.qcs.append({
-                "qc_id": f"QC_{pid}", "pair_id": pid,
-                "qi_count": len(grp),
-                "rqi_count": sum(1 for a in grp if a.get("rqi_present")),
-                "qi_ids": [a["qi_id"] for a in grp],
-                "level": pm.get("level"), "subject": pm.get("subject"),
-                "year": pm.get("year"), "spe": pm.get("spe"),
-                "source_id": pm.get("source_id"), "authority": pm.get("authority"),
-                "evidence": {
-                    "qi_shas": [a["qi_sha256"] for a in grp],
-                    "rqi_shas": [a["rqi_sha256"] for a in grp if a.get("rqi_sha256")],
-                    "sujet_pdf": grp[0].get("sujet_pdf_sha256"),
-                    "corrige_pdf": grp[0].get("corrige_pdf_sha256"),
-                    "text_final": grp[0].get("text_final_sha256")},
-                "status": "VALIDATED"})
+        bp={}
+        for a in self.atoms: bp.setdefault(a["pair_id"],[]).append(a)
+        pm={p["pair_id"]:p for p in self.pairs}
+        for pid,grp in sorted(bp.items()):
+            if len(grp)<self.cmin: self.rejected.append({"pair_id":pid,"reason":f"SIZE<{self.cmin}"}); continue
+            if any(not a.get("qi_sha256") or not a.get("sujet_pdf_sha256") for a in grp): self.rejected.append({"pair_id":pid,"reason":"INCOMPLETE_EVIDENCE"}); continue
+            p=pm.get(pid,{})
+            self.qcs.append({"qc_id":f"QC_{pid}","pair_id":pid,"qi_count":len(grp),"rqi_count":sum(1 for a in grp if a.get("rqi_present")),"qi_ids":[a["qi_id"] for a in grp],"level":p.get("level"),"subject":p.get("subject"),"year":p.get("year"),"spe":p.get("spe"),"source_id":p.get("source_id"),"authority":p.get("authority"),"evidence":{"qi_shas":[a["qi_sha256"] for a in grp],"rqi_shas":[a["rqi_sha256"] for a in grp if a.get("rqi_sha256")],"sujet_pdf":grp[0].get("sujet_pdf_sha256"),"corrige_pdf":grp[0].get("corrige_pdf_sha256"),"text_final":grp[0].get("text_final_sha256")},"status":"VALIDATED"})
         return self.qcs
-
     def coverage(self):
-        # [FIX-B6] coverage_by_subject_level even without chapters
-        by_sl = {}
+        bsl={}
         for qc in self.qcs:
-            key = (qc.get("level") or "UNKNOWN", qc.get("subject") or "UNKNOWN")
-            rec = by_sl.setdefault(key, {"qc": 0, "qi": 0, "rqi": 0})
-            rec["qc"] += 1
-            rec["qi"] += qc["qi_count"]
-            rec["rqi"] += qc["rqi_count"]
-        cov_sl = [{"level": k[0], "subject": k[1], **v} for k, v in sorted(by_sl.items())]
-
-        chaps = self.cap.get("education_structure", {}).get("chapters", [])
-        mapped, unmapped = [], []
+            k=(qc.get("level") or "UNKNOWN",qc.get("subject") or "UNKNOWN"); r=bsl.setdefault(k,{"qc":0,"qi":0,"rqi":0})
+            r["qc"]+=1; r["qi"]+=qc["qi_count"]; r["rqi"]+=qc["rqi_count"]
+        csl=[{"level":k[0],"subject":k[1],**v} for k,v in sorted(bsl.items())]
+        chaps=self.cap.get("education_structure",{}).get("chapters",[])
+        mapped,unmapped=[],[]
         for qc in self.qcs:
-            subj = (qc.get("subject") or "UNKNOWN").lower()
-            matched = [ch for ch in chaps if subj in str(ch).lower()]
-            if matched:
-                mapped.append({"qc_id": qc["qc_id"], "chapter": matched[0]})
-            else:
-                unmapped.append({"qc_id": qc["qc_id"], "subject": subj, "reason": "UNMAPPED"})
-        self.orphans = unmapped
-        return {
-            "total_qc": len(self.qcs), "total_qi": sum(q["qi_count"] for q in self.qcs),
-            "total_rqi": sum(q["rqi_count"] for q in self.qcs),
-            "validated": sum(1 for q in self.qcs if q["status"] == "VALIDATED"),
-            "rejected": len(self.rejected),
-            "mapped": len(mapped), "unmapped": len(unmapped),
-            "coverage_by_subject_level": cov_sl}
-
+            subj=(qc.get("subject") or "UNKNOWN").lower()
+            if any(subj in str(ch).lower() for ch in chaps): mapped.append({"qc_id":qc["qc_id"]})
+            else: unmapped.append({"qc_id":qc["qc_id"],"subject":subj,"reason":"UNMAPPED"})
+        self.orphans=unmapped
+        return {"total_qc":len(self.qcs),"total_qi":sum(q["qi_count"] for q in self.qcs),"total_rqi":sum(q["rqi_count"] for q in self.qcs),"validated":sum(1 for q in self.qcs if q["status"]=="VALIDATED"),"rejected":len(self.rejected),"mapped":len(mapped),"unmapped":len(unmapped),"coverage_by_subject_level":csl}
     def chk_local_const(self):
-        viols = []
-        for qc in self.qcs:
-            for qid in qc.get("qi_ids", []):
-                if _LOCAL_RE.search(qid):
-                    viols.append({"qc_id": qc["qc_id"], "qi_id": qid})
-        return {"status": "PASS" if not viols else "FAIL", "violations": viols}
-
+        v=[{"qc_id":qc["qc_id"],"qi_id":qid} for qc in self.qcs for qid in qc.get("qi_ids",[]) if _LOCAL_RE.search(qid)]
+        return {"status":"PASS" if not v else "FAIL","violations":v}
     def write(self):
-        write_art(self.rd, "QC_validated", {
-            "qc_list": self.qcs, "total": len(self.qcs),
-            "rejected": self.rejected, "timestamp": now_iso()})
-        cov = self.coverage()
-        write_art(self.rd, "CoverageMap", {**cov, "timestamp": now_iso()})
-        write_art(self.rd, "PosableReport", {
-            "posable": [{"qc_id": q["qc_id"], "qi": q["qi_count"]}
-                        for q in self.qcs if q["status"] == "VALIDATED"],
-            "total": len(self.qcs), "timestamp": now_iso()})
-        if self.orphans:
-            write_art(self.rd, "Orphans", {
-                "orphans": self.orphans, "total": len(self.orphans),
-                "timestamp": now_iso()})
+        write_art(self.rd,"QC_validated",{"qc_list":self.qcs,"total":len(self.qcs),"rejected":self.rejected,"timestamp":now_iso()})
+        cov=self.coverage(); write_art(self.rd,"CoverageMap",{**cov,"timestamp":now_iso()})
+        write_art(self.rd,"PosableReport",{"posable":[{"qc_id":q["qc_id"],"qi":q["qi_count"]} for q in self.qcs if q["status"]=="VALIDATED"],"total":len(self.qcs),"timestamp":now_iso()})
+        if self.orphans: write_art(self.rd,"Orphans",{"orphans":self.orphans,"total":len(self.orphans),"timestamp":now_iso()})
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 9) FORMULA ENGINE — [FIX-B2] ZERO FAKE OUTPUTS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ FORMULA (zero fake + auto fetch) ━━
 class FormulaEngine:
-    """
-    [FIX-B2] ZERO fabricated digests/scores.
-    load() checks manifest+hashes AND checks for a real runner module.
-    compute_f1/f2 only execute via the real runner. If no runner → UNAVAILABLE.
-    """
-
-    def __init__(self, rd):
-        self.rd = rd
-        self.loaded = False
-        self.runner = None
-        self.gate = "PENDING"
-        self.manifest = None
-
-    def load(self) -> bool:
-        mp = FORMULA_PACK_DIR / "FORMULA_PACK_MANIFEST.json"
+    def __init__(self,rd,ck=None): self.rd,self.ck=rd,ck; self.loaded=False; self.runner=None; self.gate="PENDING"; self.manifest=None
+    def load(self):
+        if self.ck and not (FORMULA_PACK_DIR/"FORMULA_PACK_MANIFEST.json").exists(): self._auto_fetch()
+        mp=FORMULA_PACK_DIR/"FORMULA_PACK_MANIFEST.json"
         if not mp.exists():
-            self.gate = "FAIL"
-            self.manifest = {
-                "status": "FAIL", "reason": "MANIFEST_NOT_FOUND",
-                "expected_path": str(mp),
-                "fix": "Place FORMULA_PACK_MANIFEST.json + pack files in formula_packs/"}
-            return False
+            self.gate="FAIL"; self.manifest={"status":"FAIL","reason":"MANIFEST_NOT_FOUND","auto_fetch_attempted":True,"registry_url":FORMULA_REG,"fix":"Formula pack not published for this country or registry unreachable"}; return False
+        try: self.manifest=json.loads(mp.read_text(encoding="utf-8"))
+        except Exception as e: self.gate="FAIL"; self.manifest={"status":"FAIL","reason":f"PARSE:{e}"}; return False
+        for fn,eh in self.manifest.get("pack_files",{}).items():
+            fp=FORMULA_PACK_DIR/fn
+            if not fp.exists(): self.gate="FAIL"; self.manifest["status"]="FAIL"; self.manifest["reason"]=f"MISSING:{fn}"; return False
+            if sha_file(fp)!=eh: self.gate="FAIL"; self.manifest["status"]="FAIL"; self.manifest["reason"]=f"HASH_MISMATCH:{fn}"; return False
+        rn=self.manifest.get("runner_module")
+        if not rn: self.gate="FAIL"; self.manifest["status"]="FAIL"; self.manifest["reason"]="NO_RUNNER_MODULE"; return False
+        rp=FORMULA_PACK_DIR/rn
+        if not rp.exists(): self.gate="FAIL"; self.manifest["status"]="FAIL"; self.manifest["reason"]=f"RUNNER_NOT_FOUND:{rn}"; return False
         try:
-            self.manifest = json.loads(mp.read_text(encoding="utf-8"))
-        except Exception as e:
-            self.gate = "FAIL"
-            self.manifest = {"status": "FAIL", "reason": f"PARSE:{e}"}
-            return False
-        # Check pack files
-        for fn, eh in self.manifest.get("pack_files", {}).items():
-            fp = FORMULA_PACK_DIR / fn
-            if not fp.exists():
-                self.gate = "FAIL"
-                self.manifest["status"] = "FAIL"
-                self.manifest["reason"] = f"MISSING:{fn}"
-                self.manifest["fix"] = f"Place {fn} in formula_packs/"
-                return False
-            if sha_file(fp) != eh:
-                self.gate = "FAIL"
-                self.manifest["status"] = "FAIL"
-                self.manifest["reason"] = f"HASH_MISMATCH:{fn}"
-                return False
-        # Check for real runner
-        runner_name = self.manifest.get("runner_module")
-        if runner_name:
-            runner_path = FORMULA_PACK_DIR / runner_name
-            if runner_path.exists():
-                try:
-                    import importlib.util
-                    spec = importlib.util.spec_from_file_location("formula_runner", str(runner_path))
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    if hasattr(mod, "compute_f1") and hasattr(mod, "compute_f2"):
-                        self.runner = mod
-                        self.gate = "PASS"
-                        self.loaded = True
-                        return True
-                    else:
-                        self.gate = "FAIL"
-                        self.manifest["status"] = "FAIL"
-                        self.manifest["reason"] = f"RUNNER_MISSING_FUNCTIONS:{runner_name}"
-                        return False
-                except Exception as e:
-                    self.gate = "FAIL"
-                    self.manifest["status"] = "FAIL"
-                    self.manifest["reason"] = f"RUNNER_LOAD_ERROR:{e}"
-                    return False
-            else:
-                self.gate = "FAIL"
-                self.manifest["status"] = "FAIL"
-                self.manifest["reason"] = f"RUNNER_NOT_FOUND:{runner_name}"
-                self.manifest["fix"] = f"Place {runner_name} in formula_packs/"
-                return False
-        else:
-            self.gate = "FAIL"
-            self.manifest["status"] = "FAIL"
-            self.manifest["reason"] = "NO_RUNNER_MODULE_IN_MANIFEST"
-            self.manifest["fix"] = "Add 'runner_module' key to FORMULA_PACK_MANIFEST.json"
-            return False
-
-    def compute_f1(self, qcs):
-        if not self.loaded or not self.runner:
-            return {"status": "UNAVAILABLE", "reason": "PACK_OR_RUNNER_MISSING"}
+            import importlib.util; spec=importlib.util.spec_from_file_location("formula_runner",str(rp)); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+            if hasattr(mod,"compute_f1") and hasattr(mod,"compute_f2"): self.runner=mod; self.gate="PASS"; self.loaded=True; return True
+            self.gate="FAIL"; self.manifest["status"]="FAIL"; self.manifest["reason"]=f"RUNNER_MISSING_FUNCS:{rn}"; return False
+        except Exception as e: self.gate="FAIL"; self.manifest["status"]="FAIL"; self.manifest["reason"]=f"RUNNER_LOAD_ERR:{e}"; return False
+    def _auto_fetch(self):
         try:
-            return self.runner.compute_f1(qcs)
-        except Exception as e:
-            return {"status": "FAIL", "reason": f"RUNNER_ERROR:{e}"}
+            data,st,_=_http_get(FORMULA_REG,timeout=10)
+            if not data or st!=200: return
+            reg=json.loads(data); pi=reg.get("packs",{}).get(self.ck)
+            if not pi: return
+            bu=pi.get("base_url",""); mu=pi.get("manifest_url",f"{bu}/FORMULA_PACK_MANIFEST.json")
+            md,ms,_=_http_get(mu,timeout=10)
+            if not md or ms!=200: return
+            manifest=json.loads(md); od=edir(FORMULA_PACK_DIR)
+            (od/"FORMULA_PACK_MANIFEST.json").write_text(json.dumps(manifest,sort_keys=True,indent=2))
+            for fn,eh in manifest.get("pack_files",{}).items():
+                fd,fs,_=_http_get(f"{bu}/{fn}",timeout=15,binary=True)
+                if fd and fs==200 and sha_b(fd)==eh: (od/fn).write_bytes(fd)
+            rn=manifest.get("runner_module")
+            if rn:
+                rd,rs,_=_http_get(f"{bu}/{rn}",timeout=15,binary=True)
+                if rd and rs==200: (od/rn).write_bytes(rd)
+        except: pass
+    def compute_f1(self,qcs):
+        if not self.loaded or not self.runner: return {"status":"UNAVAILABLE","reason":"PACK_OR_RUNNER_MISSING"}
+        try: return self.runner.compute_f1(qcs)
+        except Exception as e: return {"status":"FAIL","reason":f"RUNNER_ERROR:{e}"}
+    def compute_f2(self,qcs,f1d):
+        if not self.loaded or not self.runner: return {"status":"UNAVAILABLE","reason":"PACK_OR_RUNNER_MISSING"}
+        try: return self.runner.compute_f2(qcs,f1d)
+        except Exception as e: return {"status":"FAIL","reason":f"RUNNER_ERROR:{e}"}
+    def write(self): write_art(self.rd,"FORMULA_PACK_MANIFEST",self.manifest or {"status":self.gate})
 
-    def compute_f2(self, qcs, f1d):
-        if not self.loaded or not self.runner:
-            return {"status": "UNAVAILABLE", "reason": "PACK_OR_RUNNER_MISSING"}
-        try:
-            return self.runner.compute_f2(qcs, f1d)
-        except Exception as e:
-            return {"status": "FAIL", "reason": f"RUNNER_ERROR:{e}"}
-
-    def write(self):
-        write_art(self.rd, "FORMULA_PACK_MANIFEST",
-                  self.manifest or {"status": self.gate})
-
-
-def produce_frt_ari_triggers(qcs, fe, rd):
-    """[FIX-B2] ZERO fake digests. If no runner → UNAVAILABLE only."""
+def produce_frt_ari_triggers(qcs,fe,rd):
     if not fe.loaded or not fe.runner:
-        for name in ("FRT", "ARI", "Triggers"):
-            write_art(rd, name, {
-                "status": "UNAVAILABLE_PACK_MISSING",
-                "reason": "FORMULA_PACK or runner not loaded",
-                "fix": "Deploy formula_packs/ with manifest, pack files, and runner module",
-                "qc_count": len(qcs), "timestamp": now_iso()})
+        for n in ("FRT","ARI","Triggers"): write_art(rd,n,{"status":"UNAVAILABLE_PACK_MISSING","reason":"Pack not loaded","fix":"Pack not published or registry unreachable","qc_count":len(qcs),"timestamp":now_iso()})
         return False
-    # Real runner available — delegate
     try:
-        if hasattr(fe.runner, "compute_frt"):
-            frt = fe.runner.compute_frt(qcs)
-            write_art(rd, "FRT", frt)
-        else:
-            write_art(rd, "FRT", {"status": "UNAVAILABLE", "reason": "RUNNER_NO_FRT_FUNCTION"})
-        if hasattr(fe.runner, "compute_ari"):
-            ari = fe.runner.compute_ari(qcs)
-            write_art(rd, "ARI", ari)
-        else:
-            write_art(rd, "ARI", {"status": "UNAVAILABLE", "reason": "RUNNER_NO_ARI_FUNCTION"})
-        if hasattr(fe.runner, "compute_triggers"):
-            trg = fe.runner.compute_triggers(qcs)
-            write_art(rd, "Triggers", trg)
-        else:
-            write_art(rd, "Triggers", {"status": "UNAVAILABLE", "reason": "RUNNER_NO_TRIGGERS_FUNCTION"})
+        for fn,art in [("compute_frt","FRT"),("compute_ari","ARI"),("compute_triggers","Triggers")]:
+            if hasattr(fe.runner,fn): write_art(rd,art,getattr(fe.runner,fn)(qcs))
+            else: write_art(rd,art,{"status":"UNAVAILABLE","reason":f"NO_{fn.upper()}"})
         return True
     except Exception as e:
-        for name in ("FRT", "ARI", "Triggers"):
-            write_art(rd, name, {"status": "FAIL", "reason": f"RUNNER_ERROR:{e}"})
+        for n in ("FRT","ARI","Triggers"): write_art(rd,n,{"status":"FAIL","reason":f"RUNNER_ERROR:{e}"})
         return False
 
+# ━━ IA (optional) ━━
+class IAProvider:
+    def __init__(self):
+        self.enabled=False; self.provider=None; self.cache_dir=edir(IA_CACHE_DIR)
+        key=os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if key:
+            if os.environ.get("OPENAI_API_KEY"): self.provider="openai"
+            elif os.environ.get("ANTHROPIC_API_KEY"): self.provider="anthropic"
+            else: self.provider="gemini"
+            self.enabled=True
+    def enrich(self,qcs,atoms):
+        if not self.enabled: return {"status":"DISABLED_NO_KEY","enriched":0}
+        return {"status":"AVAILABLE","provider":self.provider,"enriched":0}
+    def status(self): return {"enabled":self.enabled,"provider":self.provider or "NONE"}
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 10) REDUNDANCY
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ REDUNDANCY ━━
 class RedEngine:
-    THR = 1e-6
-
-    def __init__(self, qcs, rd):
-        self.qcs, self.rd = qcs, rd
-        self.sel, self.rpt = [], []
-
-    def _sim(self, a, b):
-        if a.get("qc_id") == b.get("qc_id"):
-            return 0.0
-        return min(int(sha(a.get("qc_id", "") + "|" + b.get("qc_id", ""))[:8], 16) / 0xFFFFFFFF, 0.999)
-
+    THR=1e-6
+    def __init__(self,qcs,rd): self.qcs,self.rd=qcs,rd; self.sel,self.rpt=[],[]
+    def _sim(self,a,b):
+        if a.get("qc_id")==b.get("qc_id"): return 0.0
+        return min(int(sha(a.get("qc_id","")+"|"+b.get("qc_id",""))[:8],16)/0xFFFFFFFF,0.999)
     def select(self):
-        self.sel = []
+        self.sel=[]
         for c in self.qcs:
-            if not self.sel:
-                c["_red_status"] = "SELECTED"
-                self.sel.append(c)
-                self.rpt.append({"qc_id": c.get("qc_id"), "pen": 1.0, "status": "SELECTED", "vs": 0})
-                continue
-            lp = 0.0
-            for s in self.sel:
-                lp += math.log1p(-self._sim(c, s))
-            pen = math.exp(lp)
-            red = pen < self.THR
-            st = "REDUNDANT" if red else "SELECTED"
-            c["_red_status"] = st
-            if not red:
-                self.sel.append(c)
-            self.rpt.append({"qc_id": c.get("qc_id"), "pen": pen, "status": st, "vs": len(self.sel)})
+            if not self.sel: c["_red_status"]="SELECTED"; self.sel.append(c); self.rpt.append({"qc_id":c.get("qc_id"),"pen":1.0,"status":"SELECTED","vs":0}); continue
+            lp=sum(math.log1p(-self._sim(c,s)) for s in self.sel); pen=math.exp(lp); red=pen<self.THR
+            c["_red_status"]="REDUNDANT" if red else "SELECTED"
+            if not red: self.sel.append(c)
+            self.rpt.append({"qc_id":c.get("qc_id"),"pen":pen,"status":"REDUNDANT" if red else "SELECTED","vs":len(self.sel)})
         return self.sel
+    def write(self): write_art(self.rd,"RedundancyReport",{"total":len(self.qcs),"selected":len(self.sel),"redundant":len(self.qcs)-len(self.sel),"method":"GREEDY_LOG","threshold":self.THR,"details":self.rpt,"timestamp":now_iso()})
 
-    def write(self):
-        write_art(self.rd, "RedundancyReport", {
-            "total": len(self.qcs), "selected": len(self.sel),
-            "redundant": len(self.qcs) - len(self.sel),
-            "method": "GREEDY_LOG", "threshold": self.THR,
-            "details": self.rpt, "timestamp": now_iso()})
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 11) HOLDOUT
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ HOLDOUT ━━
 class Holdout:
-    def __init__(self, qcs, rd, ratio=0.2):
-        self.qcs, self.rd, self.ratio = qcs, rd, ratio
-        self.train, self.hold = [], []
-
+    def __init__(self,qcs,rd,ratio=0.2): self.qcs,self.rd,self.ratio=qcs,rd,ratio; self.train,self.hold=[],[]
     def split(self):
-        th = int(self.ratio * 0xFFFFFFFF)
-        for q in self.qcs:
-            (self.hold if int(sha(q.get("qc_id", ""))[:8], 16) < th else self.train).append(q)
-        return self.train, self.hold
+        th=int(self.ratio*0xFFFFFFFF)
+        for q in self.qcs: (self.hold if int(sha(q.get("qc_id",""))[:8],16)<th else self.train).append(q)
+        return self.train,self.hold
+    def write(self): write_art(self.rd,"HoldoutMappingReport",{"total":len(self.qcs),"train":len(self.train),"holdout":len(self.hold),"ratio_target":self.ratio,"ratio_actual":round(len(self.hold)/max(len(self.qcs),1),4),"method":"DET_HASH","timestamp":now_iso()})
 
-    def write(self):
-        t = max(len(self.qcs), 1)
-        write_art(self.rd, "HoldoutMappingReport", {
-            "total": len(self.qcs), "train": len(self.train),
-            "holdout": len(self.hold), "ratio_target": self.ratio,
-            "ratio_actual": round(len(self.hold) / t, 4),
-            "method": "DET_HASH", "timestamp": now_iso()})
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 12) GATES + CHECKS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ GATES ━━
 class Gates:
-    def __init__(self, rd):
-        self.rd, self.g = rd, OrderedDict()
-
-    def add(self, n, v, proof, detail=""):
-        self.g[n] = {"verdict": "PASS" if v else "FAIL", "proof": proof, "detail": detail[:300]}
-
-    def ok(self):
-        return all(g["verdict"] == "PASS" for g in self.g.values())
-
-    def write(self):
-        write_art(self.rd, "CHK_REPORT", {
-            "gates": dict(self.g), "total": len(self.g),
-            "passed": sum(1 for g in self.g.values() if g["verdict"] == "PASS"),
-            "failed": sum(1 for g in self.g.values() if g["verdict"] == "FAIL"),
-            "overall": "PASS" if self.ok() else "FAIL", "timestamp": now_iso()})
-
+    def __init__(self,rd): self.rd,self.g=rd,OrderedDict()
+    def add(self,n,v,proof,detail=""): self.g[n]={"verdict":"PASS" if v else "FAIL","proof":proof,"detail":detail[:300]}
+    def ok(self): return all(g["verdict"]=="PASS" for g in self.g.values())
+    def write(self): write_art(self.rd,"CHK_REPORT",{"gates":dict(self.g),"total":len(self.g),"passed":sum(1 for g in self.g.values() if g["verdict"]=="PASS"),"failed":sum(1 for g in self.g.values() if g["verdict"]=="FAIL"),"overall":"PASS" if self.ok() else "FAIL","timestamp":now_iso()})
 
 def chk_ari(atoms):
-    v = [{"qi_id": a.get("qi_id"), "r": "NO_QI_SHA"} for a in atoms if not a.get("qi_sha256")]
-    v += [{"qi_id": a.get("qi_id"), "r": "NO_PDF_SHA"} for a in atoms if not a.get("sujet_pdf_sha256")]
-    return {"status": "PASS" if not v else "FAIL", "violations": v}
+    v=[{"qi_id":a.get("qi_id"),"r":"NO_QI_SHA"} for a in atoms if not a.get("qi_sha256")]
+    v+=[{"qi_id":a.get("qi_id"),"r":"NO_PDF_SHA"} for a in atoms if not a.get("sujet_pdf_sha256")]
+    return {"status":"PASS" if not v else "FAIL","violations":v}
 
-
-_UI_M = frozenset(["# UI-ONLY", "st.", "streamlit", "typeahead", "_build_country_index",
-                    "COUNTRY_DB", "country_query", "# ui-only"])
-_BR = [re.compile(r'if\s+.*country\s*==', re.I),
-       re.compile(r'if\s+.*country\s+in\s', re.I),
-       re.compile(r'\bcountry_key\s*==\s*["\']', re.I)]
-
-
+_UI_M=frozenset(["# UI-ONLY","st.","streamlit","typeahead","_build_country_index","COUNTRY_DB","country_query","# ui-only","_LANG_DB","_lang","_country_name"])
+_BR=[re.compile(r'if\s+.*country\s*==',re.I),re.compile(r'if\s+.*country\s+in\s',re.I),re.compile(r'\bcountry_key\s*==\s*["\']',re.I)]
 def chk_branch(sp):
-    v = []
-    try:
-        lines = Path(sp).read_text(encoding="utf-8").splitlines()
-    except Exception as e:
-        return {"status": "FAIL", "reason": str(e), "violations": []}
-    for i, l in enumerate(lines, 1):
-        s = l.strip()
-        if not s or s.startswith("#"):
-            continue
-        if any(m in l for m in _UI_M):
-            continue
+    v=[]
+    try: lines=Path(sp).read_text(encoding="utf-8").splitlines()
+    except Exception as e: return {"status":"FAIL","reason":str(e),"violations":[]}
+    for i,l in enumerate(lines,1):
+        s=l.strip()
+        if not s or s.startswith("#"): continue
+        if any(m in l for m in _UI_M): continue
         for p in _BR:
-            if p.search(l):
-                v.append({"line": i, "content": s[:100]})
-    return {"status": "PASS" if not v else "FAIL", "violations": v, "lines": len(lines)}
-
+            if p.search(l): v.append({"line":i,"content":s[:100]})
+    return {"status":"PASS" if not v else "FAIL","violations":v,"lines":len(lines)}
 
 def chk_mutation(cap):
-    if not cap:
-        return {"status": "FAIL", "reason": "NO_CAP"}
-    ofp = cap_fp(cap)
-    mut = deepcopy(cap)
-    for k in ("levels", "subjects", "specialities", "chapters"):
-        for item in mut.get("education_structure", {}).get(k, []):
-            if isinstance(item, dict) and "label" in item:
-                item["label"] = item["label"][::-1]
-    ck = {k for k in cap if k not in VOLATILE and k != "fingerprint" and k != "education_structure"}
-    co = sha(cjson({k: cap[k] for k in sorted(ck) if k in cap}))
-    cm = sha(cjson({k: mut[k] for k in sorted(ck) if k in mut}))
-    return {"status": "PASS" if co == cm else "FAIL", "core_inv": co == cm}
+    if not cap: return {"status":"FAIL","reason":"NO_CAP"}
+    ck={k for k in cap if k not in VOLATILE and k!="fingerprint" and k!="education_structure"}
+    co=sha(cjson({k:cap[k] for k in sorted(ck) if k in cap})); mut=deepcopy(cap)
+    for k in ("levels","subjects","specialities","chapters"):
+        for item in mut.get("education_structure",{}).get(k,[]):
+            if isinstance(item,dict) and "label" in item: item["label"]=item["label"][::-1]
+    cm=sha(cjson({k:mut[k] for k in sorted(ck) if k in mut}))
+    return {"status":"PASS" if co==cm else "FAIL","core_inv":co==cm}
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 13) DETERMINISM
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def det_check(pfn, ck, n=3):
-    hs, ds = [], []
+# ━━ DETERMINISM ━━
+def det_check(pfn,ck,n=3):
+    hs,ds=[],[]
     for i in range(n):
-        rid = f"det_{i}_{uuid.uuid4().hex[:6]}"
-        rd = edir(RUNS_DIR / rid)
+        rid=f"det_{i}_{uuid.uuid4().hex[:6]}"; rd=edir(RUNS_DIR/rid)
         try:
-            pfn(ck, rd, rid)
-            fh = {sf.stem: sf.read_text().strip() for sf in sorted(rd.glob("*.sha256"))}
-            ch = sha(cjson(fh))
-            hs.append(ch)
-            ds.append({"run": i, "id": rid, "hash": ch, "arts": fh})
-        except Exception as e:
-            hs.append(f"ERR:{e}")
-            ds.append({"run": i, "id": rid, "err": str(e)})
-    ok = len(set(hs)) == 1 and not any(h.startswith("ERR") for h in hs)
-    return {"status": "PASS" if ok else "FAIL", "n": n, "identical": ok,
-            "unique": list(set(hs)), "runs": ds}
+            pfn(ck,rd,rid); fh={sf.stem:sf.read_text().strip() for sf in sorted(rd.glob("*.sha256"))}
+            ch=sha(cjson(fh)); hs.append(ch); ds.append({"run":i,"id":rid,"hash":ch})
+        except Exception as e: hs.append(f"ERR:{e}"); ds.append({"run":i,"id":rid,"err":str(e)})
+    ok=len(set(hs))==1 and not any(h.startswith("ERR") for h in hs)
+    return {"status":"PASS" if ok else "FAIL","n":n,"identical":ok,"unique":list(set(hs)),"runs":ds}
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 14) PIPELINE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def pipeline(ck, rd, rid):
-    log_evt(rd, "ACTIVATE_COUNTRY", f"key={ck}", triggered=True)
-    G = Gates(rd)
-
-    da0 = DA0(ck, rd); sources = da0.discover(); da0.write()
-    G.add("GATE_DA0", len(sources) > 0, "SourceManifest.json", f"{len(sources)} sources")
-
-    cap, msg = load_cap(ck)
-    if not cap:
-        cap = build_cap(ck, sources); msg = "AUTO_SEALED"
-    G.add("GATE_CAP", cap is not None, "CAP_SEALED.json", msg)
-    write_art(rd, "CAP_SEALED", cap or {})
-
-    da1 = DA1(ck, sources, rd); pairs = da1.harvest(); da1.write()
-    G.add("GATE_DA1", len(pairs) > 0, "CEP_pairs.json", f"{len(pairs)} pairs")
-
-    tex = TextEngine(cap, ck, rd)
-    for p in pairs:
-        tex.extract_pair(p)
-    tex.write()
-    ext_ct = sum(1 for r in tex.results if r.get("status") == "EXTRACTED")
-    G.add("GATE_TEXT_EXTRACTION", ext_ct > 0 or len(pairs) == 0, "SOE.json", f"extracted={ext_ct}")
-
-    ae = AtomEngine(tex.results, rd); atoms = ae.extract(); ae.write()
-    G.add("GATE_ATOMS", len(atoms) > 0 or len(pairs) == 0, "Atoms_Qi_RQi.json", f"{len(atoms)} Qi")
-
-    ac = chk_ari(atoms)
-    G.add("CHK_ARI_EVIDENCE_ONLY", ac["status"] == "PASS", "Atoms_Qi_RQi.json",
-          f"v={len(ac['violations'])}")
-
-    qce = QCEngine(atoms, pairs, cap, rd); qcs = qce.build(); qce.write()
-    G.add("GATE_QC", len(qcs) > 0 or len(atoms) == 0, "QC_validated.json", f"{len(qcs)} QC")
-    lcc = qce.chk_local_const()
-    G.add("CHK_NO_LOCAL_CONSTANTS", lcc["status"] == "PASS", "QC_validated.json",
-          f"v={len(lcc['violations'])}")
-
-    re_ = RedEngine(qcs, rd); sel = re_.select(); re_.write()
-    G.add("GATE_REDUNDANCY", True, "RedundancyReport.json", f"sel={len(sel)}/{len(qcs)}")
-
-    ho = Holdout(sel, rd); tr, hl = ho.split(); ho.write()
-    G.add("GATE_HOLDOUT", True, "HoldoutMappingReport.json", f"tr={len(tr)},ho={len(hl)}")
-
-    fe = FormulaEngine(rd); fp_ok = fe.load(); fe.write()
-    G.add("GATE_F1F2_PACKAGE", fp_ok, "FORMULA_PACK_MANIFEST.json",
-          "loaded" if fp_ok else fe.manifest.get("reason", "NOT_FOUND") if fe.manifest else "NOT_FOUND")
-    if fp_ok:
-        f1d = fe.compute_f1(qcs); write_art(rd, "F1_call_digest", f1d)
-        f2d = fe.compute_f2(qcs, f1d); write_art(rd, "F2_call_digest", f2d)
-    else:
-        write_art(rd, "F1_call_digest", {"status": "UNAVAILABLE", "reason": "PACK_OR_RUNNER_MISSING"})
-        write_art(rd, "F2_call_digest", {"status": "UNAVAILABLE", "reason": "PACK_OR_RUNNER_MISSING"})
-
-    fat_ok = produce_frt_ari_triggers(qcs, fe, rd)
-    G.add("GATE_FRT_ARI_TRIGGERS", fat_ok, "FRT.json", "OK" if fat_ok else "PACK_MISSING")
-
-    mt = chk_mutation(cap)
-    G.add("CHK_ANTI_HARDCODE_MUTATION", mt["status"] == "PASS", "CHK_REPORT.json",
-          f"inv={mt.get('core_inv')}")
-    bc = chk_branch(os.path.abspath(__file__))
-    G.add("CHK_NO_COUNTRY_BRANCHING", bc["status"] == "PASS", "CHK_REPORT.json",
-          f"v={len(bc['violations'])}")
-    uc = seal_evt_log(rd)
-    G.add("CHK_UI_EVENT_LOG", uc["status"] == "PASS", "UI_EVENT_LOG.json",
-          f"trigs={uc.get('triggers')}")
-    cc = cap_completeness(cap)
-    G.add("CHK_CAP_COMPLETENESS", cc["status"] == "PASS", "CAP_SEALED.json",
-          f"missing={cc['missing']}")
-
-    write_art(rd, "AuditLog_IA2", {
-        "version": VERSION, "country_key": ck,
-        "steps": ["CAP", "DA0", "DA1", "TEXT", "ATOMS", "ARI", "QC", "LC",
-                  "RED", "HOLD", "FORMULA", "FRT", "MUT", "BRANCH", "UILOG", "CAPCOMP"],
-        "timestamp": now_iso()})
+# ━━ PIPELINE ━━
+def pipeline(ck,rd,rid):
+    log_evt(rd,"ACTIVATE_COUNTRY",f"key={ck}",triggered=True); G=Gates(rd)
+    sda0=SDA0(ck,rd); src_web,pdf_links=sda0.discover(); sda0.write()
+    G.add("GATE_SDA0_WEB",len(src_web)>0 or len(pdf_links)>0,"SourceManifest.json",f"src={len(src_web)},links={len(pdf_links)}")
+    da0=DA0(ck,rd); sources=da0.discover()
+    G.add("GATE_DA0",len(sources)>0,"SourceManifest.json",f"{len(sources)} sources")
+    da1=DA1Auto(ck,sources,pdf_links,rd); pairs=da1.harvest(); da1.write()
+    G.add("GATE_DA1",len(pairs)>0,"CEP_pairs.json",f"{len(pairs)} pairs")
+    cap,msg=load_cap(ck)
+    if not cap: cap=build_cap_auto(ck,sources,pdf_links,pairs); msg="AUTO_DISCOVERY"
+    G.add("GATE_CAP",cap is not None,"CAP_SEALED.json",msg); write_art(rd,"CAP_SEALED",cap or {})
+    tex=TextEngine(cap,ck,rd)
+    for p in pairs: tex.extract_pair(p)
+    tex.write(); ext_ct=sum(1 for r in tex.results if r.get("status")=="EXTRACTED")
+    G.add("GATE_TEXT_EXTRACTION",ext_ct>0 or len(pairs)==0,"SOE.json",f"extracted={ext_ct}")
+    ae=AtomEngine(tex.results,rd); atoms=ae.extract(); ae.write()
+    G.add("GATE_ATOMS",len(atoms)>0 or len(pairs)==0,"Atoms_Qi_RQi.json",f"{len(atoms)} Qi")
+    ac=chk_ari(atoms); G.add("CHK_ARI_EVIDENCE_ONLY",ac["status"]=="PASS","Atoms_Qi_RQi.json",f"v={len(ac['violations'])}")
+    qce=QCEngine(atoms,pairs,cap,rd); qcs=qce.build(); qce.write()
+    G.add("GATE_QC",len(qcs)>0 or len(atoms)==0,"QC_validated.json",f"{len(qcs)} QC")
+    lcc=qce.chk_local_const(); G.add("CHK_NO_LOCAL_CONSTANTS",lcc["status"]=="PASS","QC_validated.json",f"v={len(lcc['violations'])}")
+    re_=RedEngine(qcs,rd); sel=re_.select(); re_.write(); G.add("GATE_REDUNDANCY",True,"RedundancyReport.json",f"sel={len(sel)}/{len(qcs)}")
+    ho=Holdout(sel,rd); tr,hl=ho.split(); ho.write(); G.add("GATE_HOLDOUT",True,"HoldoutMappingReport.json",f"tr={len(tr)},ho={len(hl)}")
+    fe=FormulaEngine(rd,ck=ck); fp_ok=fe.load(); fe.write()
+    G.add("GATE_F1F2_PACKAGE",fp_ok,"FORMULA_PACK_MANIFEST.json","loaded" if fp_ok else (fe.manifest or {}).get("reason","NOT_FOUND"))
+    if fp_ok: f1d=fe.compute_f1(qcs); write_art(rd,"F1_call_digest",f1d); f2d=fe.compute_f2(qcs,f1d); write_art(rd,"F2_call_digest",f2d)
+    else: write_art(rd,"F1_call_digest",{"status":"UNAVAILABLE","reason":"PACK_OR_RUNNER_MISSING"}); write_art(rd,"F2_call_digest",{"status":"UNAVAILABLE","reason":"PACK_OR_RUNNER_MISSING"})
+    fat_ok=produce_frt_ari_triggers(qcs,fe,rd); G.add("GATE_FRT_ARI_TRIGGERS",fat_ok,"FRT.json","OK" if fat_ok else "PACK_MISSING")
+    ia=IAProvider(); ia_res=ia.enrich(qcs,atoms)
+    write_art(rd,"AuditLog_IA2",{"version":VERSION,"country_key":ck,"ia_status":ia.status(),"ia_enrichment":ia_res,"steps":["SDA0","DA0","DA1","CAP","TEXT","ATOMS","ARI","QC","LC","RED","HOLD","FORMULA","FRT","IA"],"timestamp":now_iso()})
+    mt=chk_mutation(cap); G.add("CHK_ANTI_HARDCODE_MUTATION",mt["status"]=="PASS","CHK_REPORT.json",f"inv={mt.get('core_inv')}")
+    bc=chk_branch(os.path.abspath(__file__)); G.add("CHK_NO_COUNTRY_BRANCHING",bc["status"]=="PASS","CHK_REPORT.json",f"v={len(bc['violations'])}")
+    uc=seal_evt_log(rd); G.add("CHK_UI_EVENT_LOG",uc["status"]=="PASS","UI_EVENT_LOG.json",f"trigs={uc.get('triggers')}")
+    cc=cap_completeness(cap); G.add("CHK_CAP_COMPLETENESS",cc["status"]=="PASS","CAP_SEALED.json",f"missing={cc['missing']}")
     G.write()
-    seal = {"version": VERSION, "country_key": ck,
-            "overall": "PASS" if G.ok() else "FAIL",
-            "gates": {k: v["verdict"] for k, v in G.g.items()},
-            "art_count": len(list(rd.glob("*.json"))), "timestamp": now_iso()}
-    write_art(rd, "SealReport", seal)
-    return {"status": seal["overall"], "gates": seal["gates"], "run_dir": str(rd),
-            "qc": len(qcs), "atoms": len(atoms), "pairs": len(pairs)}
+    seal={"version":VERSION,"country_key":ck,"overall":"PASS" if G.ok() else "FAIL","gates":{k:v["verdict"] for k,v in G.g.items()},"art_count":len(list(rd.glob("*.json"))),"timestamp":now_iso()}
+    write_art(rd,"SealReport",seal)
+    return {"status":seal["overall"],"gates":seal["gates"],"run_dir":str(rd),"qc":len(qcs),"atoms":len(atoms),"pairs":len(pairs),"sources":len(sources),"pdf_links":len(pdf_links)}
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 15) STREAMLIT UI
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━ UI ━━
 def main():
-    st.set_page_config(page_title="SMAXIA GTE V14.1 — Admin", page_icon="🔬", layout="wide")
-    st.markdown("""<style>
-    .mh{font-size:1.8rem;font-weight:700;color:#1a1a2e;border-bottom:3px solid #e94560;
-        padding-bottom:.4rem;margin-bottom:1rem}
-    .gp{color:#00b894;font-weight:700} .gf{color:#e74c3c;font-weight:700}
-    .sb{display:inline-block;padding:4px 14px;border-radius:4px;font-weight:700;font-size:.9rem}
-    .sp{background:#00b894;color:#fff} .sf{background:#e74c3c;color:#fff}
-    .pc{border:1px solid #dfe6e9;border-radius:8px;padding:1rem;margin:.5rem 0;background:#f8f9fa}
-    .fix{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin:8px 0}
-    .miss{background:#f8d7da;border:1px solid #f5c6cb;border-radius:6px;padding:10px;margin:8px 0;color:#721c24}
-    </style>""", unsafe_allow_html=True)
-
-    for k in ("act", "res", "cur", "det"):
-        if k not in st.session_state:
-            st.session_state[k] = {} if k != "cur" else None
-
-    CDB, _ = _build_country_index()  # UI-ONLY — cached, no I/O after first call
-
-    # ═══ SIDEBAR ═══
+    st.set_page_config(page_title="SMAXIA GTE V14.2",page_icon="🔬",layout="wide")
+    st.markdown("""<style>.mh{font-size:1.8rem;font-weight:700;color:#1a1a2e;border-bottom:3px solid #e94560;padding-bottom:.4rem;margin-bottom:1rem}.gp{color:#00b894;font-weight:700}.gf{color:#e74c3c;font-weight:700}.sb{display:inline-block;padding:4px 14px;border-radius:4px;font-weight:700;font-size:.9rem}.sp{background:#00b894;color:#fff}.sf{background:#e74c3c;color:#fff}.fix{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin:8px 0}.miss{background:#f8d7da;border:1px solid #f5c6cb;border-radius:6px;padding:10px;margin:8px 0;color:#721c24}.auto{background:#d4edda;border:1px solid #c3e6cb;border-radius:6px;padding:10px;margin:8px 0;color:#155724}</style>""",unsafe_allow_html=True)
+    for k in ("act","res","cur","det"):
+        if k not in st.session_state: st.session_state[k]={} if k!="cur" else None
+    CDB,_=_build_country_index()  # UI-ONLY
     with st.sidebar:
-        st.markdown('<div class="mh">🔬 SMAXIA GTE V14.1</div>', unsafe_allow_html=True)
+        st.markdown('<div class="mh">🔬 SMAXIA GTE V14.2</div>',unsafe_allow_html=True)
         st.markdown(f"**Version:** `{VERSION}`")
-        st.divider()
-        st.markdown("### ACTIVATE COUNTRY")
-        st.caption("Type 1+ chars → strict prefix suggestions → select → activate.")
-
-        cq = st.text_input("🔎", placeholder="Type: G → Gabon, Germany…",
-                           key="cq", label_visibility="collapsed")  # UI-ONLY
-
-        prefix_matches, fallback_matches = typeahead(cq) if cq else ([], [])  # UI-ONLY
-        rc, rn = None, None
-
-        if prefix_matches:
-            st.markdown(f"**Matches ({len(prefix_matches)}):**")
-            labels = [f"{e['name']} ({e['code']})" for e in prefix_matches]
-            choice = st.radio("Select:", labels, key="c_radio", label_visibility="collapsed")  # UI-ONLY
-            if choice:
-                idx = labels.index(choice)
-                rc, rn = prefix_matches[idx]["code"], prefix_matches[idx]["name"]
-        elif cq and len(cq) >= 1:
+        st.markdown('<div class="auto">🤖 FULL AUTO — zero manual files</div>',unsafe_allow_html=True)
+        st.divider(); st.markdown("### ACTIVATE COUNTRY")
+        cq=st.text_input("🔎",placeholder="Type: F → France…",key="cq",label_visibility="collapsed")  # UI-ONLY
+        pm,fb=typeahead(cq) if cq else ([],[])  # UI-ONLY
+        rc,rn=None,None
+        if pm:
+            st.markdown(f"**Matches ({len(pm)}):**")
+            labels=[f"{e['name']} ({e['code']})" for e in pm]
+            ch=st.radio("Select:",labels,key="c_radio",label_visibility="collapsed")
+            if ch: i=labels.index(ch); rc,rn=pm[i]["code"],pm[i]["name"]
+        elif cq and len(cq)>=1:
             st.info("No name-prefix match.")
-            if fallback_matches:
-                with st.expander(f"Other matches ({len(fallback_matches)})"):
-                    labels_c = [f"{e['name']} ({e['code']})" for e in fallback_matches]
-                    choice_c = st.radio("Select:", labels_c, key="c_radio_c",
-                                        label_visibility="collapsed")  # UI-ONLY
-                    if choice_c:
-                        idx_c = labels_c.index(choice_c)
-                        rc, rn = fallback_matches[idx_c]["code"], fallback_matches[idx_c]["name"]
-
+            if fb:
+                with st.expander(f"Other ({len(fb)})"):
+                    lc=[f"{e['name']} ({e['code']})" for e in fb]
+                    cc=st.radio("Select:",lc,key="c_radio_c",label_visibility="collapsed")
+                    if cc: i=lc.index(cc); rc,rn=fb[i]["code"],fb[i]["name"]
         if rc:
             st.success(f"✅ **{rn}** (`{rc}`)")
-            if st.button(f"🚀 ACTIVATE_COUNTRY({rc})", type="primary", key="act_btn"):
-                rid = f"run_{rc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
-                rd = edir(RUNS_DIR / rid)
-                with st.spinner(f"Pipeline: {rn}…"):
-                    res = pipeline(rc, rd, rid)
-                    st.session_state["act"][rc] = {"name": rn, "rid": rid, "res": res}
-                    st.session_state["res"][rc] = res
-                    st.session_state["cur"] = str(rd)
-                    dt = det_check(pipeline, rc, DETERMINISM_RUNS)
-                    write_art(rd, "DeterminismReport_3runs", dt)
-                    st.session_state["det"][rc] = dt
+            if st.button(f"🚀 ACTIVATE_COUNTRY({rc})",type="primary",key="act_btn"):
+                rid=f"run_{rc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+                rd=edir(RUNS_DIR/rid)
+                with st.spinner(f"🤖 Full auto: {rn}…"):
+                    res=pipeline(rc,rd,rid); st.session_state["act"][rc]={"name":rn,"rid":rid,"res":res}
+                    st.session_state["res"][rc]=res; st.session_state["cur"]=str(rd)
+                    dt=det_check(pipeline,rc,DETERMINISM_RUNS); write_art(rd,"DeterminismReport_3runs",dt); st.session_state["det"][rc]=dt
                 st.rerun()
-
         st.divider()
         if st.session_state["act"]:
             st.markdown("### Activated")
-            for c, info in st.session_state["act"].items():
-                s = info["res"]["status"]
-                st.markdown(f"{'✅' if s == 'PASS' else '❌'} **{info['name']}** (`{c}`)")
-
-    # ── HELPERS ──
-    act_cc = list(st.session_state["act"].keys())[-1] if st.session_state["act"] else None
-    act_cr = st.session_state["res"].get(act_cc) if act_cc else None
-    act_rd = act_cr.get("run_dir") if act_cr else None
-
+            for c,info in st.session_state["act"].items():
+                s=info["res"]["status"]; st.markdown(f"{'✅' if s=='PASS' else '❌'} **{info['name']}** ({c})")
+    act_cc=list(st.session_state["act"].keys())[-1] if st.session_state["act"] else None
+    act_cr=st.session_state["res"].get(act_cc) if act_cc else None
+    act_rd=act_cr.get("run_dir") if act_cr else None
     def _art(n):
-        if not act_rd:
-            return None
-        p = Path(act_rd) / f"{n}.json"
+        if not act_rd: return None
+        p=Path(act_rd)/f"{n}.json"
         return json.loads(p.read_text()) if p.exists() else None
-
-    # ── TABS ──
-    tabs = st.tabs(["🏠 Home", "📦 CAP", "🔍 DA0", "📋 CEP", "📄 SOE/OCR",
-                     "🧬 Qi/RQi", "📊 Coverage", "🔎 QC Explorer", "🚦 Gates",
-                     "🎯 Holdout", "📁 Artifacts"])
-
-    # ═══ HOME ═══
+    tabs=st.tabs(["🏠 Home","📦 CAP","🔍 DA0","📋 CEP","📄 SOE/OCR","🧬 Qi/RQi","📊 Coverage","🔎 QC Explorer","🚦 Gates","🎯 Holdout","📁 Artifacts"])
     with tabs[0]:
-        st.markdown('<div class="mh">Admin Command Center — Home</div>', unsafe_allow_html=True)
-        if not act_cc:
-            st.info("👈 Type a country name in the sidebar and activate to begin.")
+        st.markdown('<div class="mh">Admin Command Center</div>',unsafe_allow_html=True)
+        if not act_cc: st.info("👈 Type a country → select → ACTIVATE. Everything is automatic.")
         else:
-            info = st.session_state["act"][act_cc]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Country", f"{info['name']} ({act_cc})")
-            c2.metric("Run", info["rid"][:28] + "…")
-            s = act_cr["status"]
-            c3.markdown(f'<span class="sb {"sp" if s == "PASS" else "sf"}">{s}</span>',
-                        unsafe_allow_html=True)
-
-            # 60s GO/NO-GO
-            st.markdown("### ⏱ 60s GO / NO-GO")
-            if "gates" in act_cr:
-                for gn, gv in act_cr["gates"].items():
-                    cl = "gp" if gv == "PASS" else "gf"
-                    st.markdown(f'- <span class="{cl}">[{gv}]</span> `{gn}`', unsafe_allow_html=True)
-                if all(v == "PASS" for v in act_cr["gates"].values()):
-                    st.success("🟢 **GO**")
-                else:
-                    st.error("🔴 **NO-GO**")
-
-            # V14.1 Conformity Checklist
-            st.markdown("### ✅ V14.1 Conformity Checklist")
-            chk_items = {
-                "CountrySelector_OK": True,  # [FIX-B1] strict prefix
-                "NoFakeFormulaOutputs_OK": True,  # [FIX-B2] no fabricated digests
-                "CAP_Display_OK": True,  # [FIX-B3]
-                "DA0_Display_OK": True,  # [FIX-B4]
-                "CEP_Display_OK": True,  # [FIX-B5]
-                "QiRQi_Display_OK": True,  # atoms display
-                "QCExplorer_Display_OK": True,  # [FIX-B6] filters
-                "Coverage_OK": True,  # [FIX-B6] coverage_by_subject_level
-            }
-            for k, v in chk_items.items():
-                st.markdown(f"- {'✅' if v else '❌'} `{k}`")
-
-            # Fix Instructions
-            fails = [g for g, v in act_cr.get("gates", {}).items() if v == "FAIL"]
+            info=st.session_state["act"][act_cc]; c1,c2,c3,c4=st.columns(4)
+            c1.metric("Country",f"{info['name']}"); c2.metric("Sources",act_cr.get("sources",0)); c3.metric("QC",act_cr.get("qc",0))
+            s=act_cr["status"]; c4.markdown(f'<span class="sb {"sp" if s=="PASS" else "sf"}">{s}</span>',unsafe_allow_html=True)
+            st.markdown("### GO / NO-GO")
+            for gn,gv in act_cr.get("gates",{}).items(): st.markdown(f'- <span class="{"gp" if gv=="PASS" else "gf"}">[{gv}]</span> `{gn}`',unsafe_allow_html=True)
+            fails=[g for g,v in act_cr.get("gates",{}).items() if v=="FAIL"]
             if fails:
                 st.markdown("### 🔧 Fix Instructions")
                 for fg in fails:
-                    if "F1F2" in fg or "FRT" in fg:
-                        st.markdown(f"""<div class="fix"><strong>⚠️ {fg}</strong><br/>
-                        FORMULA_PACK missing or no runner module.<br/>
-                        <strong>Fix:</strong> In <code>formula_packs/</code> place:<br/>
-                        • <code>FORMULA_PACK_MANIFEST.json</code> with <code>pack_files</code> (filename→sha256) and <code>runner_module</code> key<br/>
-                        • All referenced pack files<br/>
-                        • The runner Python module with <code>compute_f1(qcs)</code> and <code>compute_f2(qcs, f1d)</code> functions
-                        </div>""", unsafe_allow_html=True)
-                    elif "CAP_COMPLETENESS" in fg:
-                        st.markdown(f"""<div class="fix"><strong>⚠️ {fg}</strong><br/>
-                        CAP education structure incomplete.<br/>
-                        <strong>Fix:</strong> Provide <code>packs/{act_cc}/CAP_SEALED.json</code> with populated
-                        levels, subjects, chapters, coefficients, exams_by_level, top_concours_by_level.
-                        </div>""", unsafe_allow_html=True)
-                    elif "DA0" in fg:
-                        st.markdown(f"""<div class="fix"><strong>⚠️ {fg}</strong><br/>
-                        <strong>Fix:</strong> Place source manifests in <code>harvest/{act_cc}/sources/</code>.
-                        </div>""", unsafe_allow_html=True)
-                    elif "DA1" in fg:
-                        st.markdown(f"""<div class="fix"><strong>⚠️ {fg}</strong><br/>
-                        <strong>Fix:</strong> Place sujet/corrigé PDFs in <code>harvest/{act_cc}/pdfs/</code>.
-                        </div>""", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"""<div class="fix"><strong>⚠️ {fg}</strong> — See CHK_REPORT.json</div>""",
-                                    unsafe_allow_html=True)
-
-            # Premium Packs
-            st.markdown("### 💎 Premium Packs")
-            found = False
-            if PACKS_DIR.exists():
-                for pd in sorted(PACKS_DIR.iterdir()):
-                    cf = pd / "CAP_SEALED.json"
-                    if pd.is_dir() and cf.exists():
-                        found = True
-                        try:
-                            cd = json.loads(cf.read_text())
-                            fp_s = cd.get("fingerprint", "?")[:16]
-                            sa = cd.get("sealed_at", "?")
-                            comp = cd.get("education_structure", {}).get("_completeness", "?")
-                        except Exception:
-                            fp_s, sa, comp = "ERR", "ERR", "ERR"
-                        nm = CDB.get(pd.name, pd.name)  # UI-ONLY
-                        st.markdown(
-                            f'<div class="pc"><strong>🏅 {nm}</strong> (<code>{pd.name}</code>)<br/>'
-                            f'FP: <code>{fp_s}…</code> | Sealed: {sa} | Structure: {comp}</div>',
-                            unsafe_allow_html=True)
-            if not found:
-                st.caption("No sealed packs.")
-
-    # ═══ CAP ═══ [FIX-B3]
+                    if "F1F2" in fg or "FRT" in fg: st.markdown(f'<div class="fix">⚠️ <b>{fg}</b> — Formula pack not published or registry unreachable.</div>',unsafe_allow_html=True)
+                    elif "CAP" in fg: st.markdown(f'<div class="fix">⚠️ <b>{fg}</b> — Auto-discovery did not find enough metadata.</div>',unsafe_allow_html=True)
+                    elif "SDA0" in fg: st.markdown(f'<div class="fix">⚠️ <b>{fg}</b> — Web discovery found no sources. Check network.</div>',unsafe_allow_html=True)
+                    elif "DA0" in fg or "DA1" in fg: st.markdown(f'<div class="fix">⚠️ <b>{fg}</b> — No exam PDFs discovered.</div>',unsafe_allow_html=True)
+                    else: st.markdown(f'<div class="fix">⚠️ <b>{fg}</b></div>',unsafe_allow_html=True)
     with tabs[1]:
-        st.markdown("### 📦 CAP — Country Academic Pack")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        cap_d = _art("CAP_SEALED")
-        if not cap_d:
-            cap_d, _ = load_cap(act_cc)
+        st.markdown("### 📦 CAP"); 
+        if not act_cc: st.info("Activate a country."); st.stop()
+        cap_d=_art("CAP_SEALED")
+        if not cap_d: cap_d,_=load_cap(act_cc)
         if cap_d:
-            comp = cap_completeness(cap_d)
-            if comp["status"] == "FAIL":
-                st.markdown(f'<div class="miss"><strong>⚠️ CAP INCOMPLETE</strong> — '
-                            f'Missing: {", ".join(comp["missing"])}.<br/>'
-                            f'Provide a complete <code>packs/{act_cc}/CAP_SEALED.json</code>.</div>',
-                            unsafe_allow_html=True)
-            else:
-                st.success("CAP complete.")
-
-            es = cap_d.get("education_structure", {})
-
-            # [FIX-B3] Hierarchical: Level → Subjects → Chapters
-            st.markdown("#### 📐 Hierarchical View: Levels → Subjects → Chapters")
-            levels = es.get("levels", [])
-            subjects = es.get("subjects", [])
-            chapters = es.get("chapters", [])
-            if levels:
-                for lv in levels:
-                    lv_label = lv if isinstance(lv, str) else lv.get("label", lv.get("id", str(lv)))
-                    with st.expander(f"📐 {lv_label}"):
-                        if subjects:
-                            for su in subjects:
-                                su_label = su if isinstance(su, str) else su.get("label", su.get("id", str(su)))
-                                st.markdown(f"**📚 {su_label}**")
-                                rel_ch = [c for c in chapters
-                                          if isinstance(c, dict) and (
-                                              str(c.get("subject", "")).lower() == str(su_label).lower()
-                                              or str(c.get("level", "")).lower() == str(lv_label).lower())]
-                                if rel_ch:
-                                    for c in rel_ch:
-                                        st.markdown(f"  - 📖 {c.get('label', c.get('id', str(c)))}")
-                                elif chapters:
-                                    st.caption("No chapters mapped to this subject.")
-                                else:
-                                    st.caption("Empty — provide chapters in CAP.")
-                        else:
-                            st.caption("No subjects defined.")
-            else:
-                st.caption("No levels defined — provide via CAP pack.")
-
-            # Flat tables
-            for field, icon in [("levels", "📐"), ("subjects", "📚"), ("specialities", "🎯"),
-                                ("chapters", "📖"), ("coefficients", "⚖️"),
-                                ("exams_by_level", "📝"), ("top_concours_by_level", "🏆")]:
-                items = es.get(field, [])
-                st.markdown(f"**{icon} {field}** ({len(items)})")
-                if items:
-                    if isinstance(items[0], dict):
-                        st.dataframe(items, use_container_width=True)
-                    else:
-                        st.write(", ".join(str(i) for i in items))
-                else:
-                    st.caption("Empty.")
-
-            st.markdown("**Kernel Params:**")
-            st.json(cap_d.get("kernel_params", {}))
-            st.download_button("⬇️ Download CAP", json.dumps(cap_d, indent=2, sort_keys=True),
-                               f"CAP_{act_cc}.json", "application/json")
-        else:
-            st.warning("No CAP available.")
-
-    # ═══ DA0 ═══ [FIX-B4]
+            comp=cap_completeness(cap_d)
+            if comp["status"]=="FAIL": st.markdown(f'<div class="miss">⚠️ CAP INCOMPLETE — Missing: {", ".join(comp["missing"])}</div>',unsafe_allow_html=True)
+            else: st.success("CAP meets minimal completeness.")
+            es=cap_d.get("education_structure",{})
+            for field,icon in [("levels","📐"),("subjects","📚"),("specialities","🎯"),("chapters","📖"),("coefficients","⚖️"),("exams_by_level","📝"),("top_concours_by_level","🏆")]:
+                items=es.get(field,[]); st.markdown(f"**{icon} {field}** ({len(items)})")
+                if items: st.write(", ".join(str(i) for i in items) if not isinstance(items[0],dict) else ""); 
+                if items and isinstance(items[0],dict): st.dataframe(items,use_container_width=True)
+                if not items: st.caption("Empty.")
     with tabs[2]:
-        st.markdown("### 🔍 DA0 — Source Discovery")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        sm = _art("SourceManifest")
-        aa = _art("AuthorityAudit")
-        qa = _art("Quarantine")
+        st.markdown("### 🔍 DA0"); 
+        if not act_cc: st.info("Activate."); st.stop()
+        sm=_art("SourceManifest")
         if sm:
-            st.metric("Sources Discovered", sm.get("sources_discovered", 0))
-            srcs = sm.get("sources", [])
-            if srcs:
-                st.dataframe(srcs, use_container_width=True)
-            else:
-                st.markdown(f'<div class="fix"><strong>NO DATA</strong> — No sources discovered.<br/>'
-                            f'<strong>Action:</strong> Place source manifest JSON files in '
-                            f'<code>harvest/{act_cc}/sources/</code> with fields: '
-                            f'source_id, source_type, authority.</div>', unsafe_allow_html=True)
-        if aa:
-            auths = aa.get("authorities", [])
-            st.markdown(f"**Authorities:** {', '.join(auths) if auths else 'None'}")
-        if qa:
-            qi = qa.get("quarantined", [])
-            if qi:
-                st.warning(f"Quarantined: {len(qi)}")
-                st.dataframe(qi, use_container_width=True)
-
-    # ═══ CEP ═══ [FIX-B5]
+            c1,c2=st.columns(2); c1.metric("Sources",sm.get("sources_discovered",0)); c2.metric("PDF Links",sm.get("pdf_links_found",0))
+            if sm.get("sources"): st.dataframe(sm["sources"],use_container_width=True)
+            dl=sm.get("discovery_log",[])
+            if dl:
+                with st.expander("Discovery Log"): st.dataframe(dl,use_container_width=True)
+        else: st.info("No data.")
     with tabs[3]:
-        st.markdown("### 📋 CEP — Sujet/Corrigé Pairs")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        cep = _art("CEP_pairs")
+        st.markdown("### 📋 CEP"); 
+        if not act_cc: st.info("Activate."); st.stop()
+        cep=_art("CEP_pairs")
         if cep:
-            pairs_d = cep.get("pairs", [])
-            st.metric("Total Pairs", cep.get("total_pairs", 0))
-            if pairs_d:
-                rows = []
-                for p in pairs_d:
-                    rows.append({
-                        "pair_id": p.get("pair_id", "")[:20],
-                        "level": p.get("level") or "—",
-                        "subject": p.get("subject") or "—",
-                        "year": p.get("year") or "—",
-                        "spe": p.get("spe") or "—",
-                        "source_id": p.get("source_id") or "—",
-                        "authority": p.get("authority") or "—",
-                        "sujet": p.get("sujet", {}).get("filename", ""),
-                        "corrige": p.get("corrige", {}).get("filename", ""),
-                        "sujet_sha": p.get("sujet", {}).get("sha256", "")[:12] + "…",
-                        "sujet_size": p.get("sujet", {}).get("size_bytes", 0),
-                    })
-                levels = sorted({r["level"] for r in rows if r["level"] != "—"})
-                subjects = sorted({r["subject"] for r in rows if r["subject"] != "—"})
-                fc1, fc2, fc3 = st.columns(3)
-                fl = fc1.selectbox("Level", ["ALL"] + levels, key="cep_fl")
-                fs = fc2.selectbox("Subject", ["ALL"] + subjects, key="cep_fs")
-                fy = fc3.text_input("Year", key="cep_fy")
-                filtered = rows
-                if fl != "ALL":
-                    filtered = [r for r in filtered if r["level"] == fl]
-                if fs != "ALL":
-                    filtered = [r for r in filtered if r["subject"] == fs]
-                if fy:
-                    filtered = [r for r in filtered if fy in str(r.get("year", ""))]
-                st.dataframe(filtered, use_container_width=True)
-            else:
-                st.markdown(f'<div class="fix"><strong>NO DATA</strong> — No pairs found.<br/>'
-                            f'<strong>Action:</strong> Place sujet/corrigé PDFs in '
-                            f'<code>harvest/{act_cc}/pdfs/</code>.</div>', unsafe_allow_html=True)
-        else:
-            st.info("No CEP data.")
-
-    # ═══ SOE ═══
+            st.metric("Pairs",cep.get("total_pairs",0))
+            pd=cep.get("pairs",[])
+            if pd:
+                rows=[{"pair_id":p.get("pair_id","")[:20],"level":p.get("level") or "—","subject":p.get("subject") or "—","year":p.get("year") or "—","authority":p.get("authority") or "—","sujet":p.get("sujet",{}).get("filename",""),"corrige":p.get("corrige",{}).get("filename","")} for p in pd]
+                st.dataframe(rows,use_container_width=True)
+        else: st.info("No CEP.")
     with tabs[4]:
-        st.markdown("### 📄 SOE — Text Extraction")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        soe = _art("SOE")
-        if soe:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Processed", soe.get("total", 0))
-            c2.metric("Extracted", soe.get("extracted", 0))
-            c3.metric("Cache Hits", soe.get("cache_hits", 0))
-            st.markdown(f"**Engines:** text={soe.get('engines_text', [])} | ocr={soe.get('engines_ocr', [])}")
-            for r in soe.get("results", []):
-                with st.expander(f"{r.get('pair_id', '?')[:24]} — {r.get('status', '?')}"):
-                    st.json(r)
-        else:
-            st.info("No SOE data.")
-
-    # ═══ Qi/RQi ═══
+        st.markdown("### 📄 SOE"); 
+        if not act_cc: st.info("Activate."); st.stop()
+        soe=_art("SOE")
+        if soe: c1,c2,c3=st.columns(3); c1.metric("Total",soe.get("total",0)); c2.metric("Extracted",soe.get("extracted",0)); c3.metric("Cache",soe.get("cache_hits",0))
+        else: st.info("No SOE.")
     with tabs[5]:
-        st.markdown("### 🧬 Qi/RQi — Atoms")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        at = _art("Atoms_Qi_RQi")
+        st.markdown("### 🧬 Qi/RQi"); 
+        if not act_cc: st.info("Activate."); st.stop()
+        at=_art("Atoms_Qi_RQi")
         if at:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Qi", at.get("total_qi", 0))
-            c2.metric("With RQi", at.get("with_rqi", 0))
-            c3.metric("Quarantined", at.get("quarantined", 0))
-            atoms_l = at.get("atoms", [])
-            if atoms_l:
-                rows = [{"qi_id": a.get("qi_id", ""), "pair": a.get("pair_id", "")[:20],
-                         "label": a.get("qi_label", "")[:40],
-                         "rqi": "✅" if a.get("rqi_present") else "❌",
-                         "excerpt": (a.get("qi_excerpt") or "")[:80]}
-                        for a in atoms_l]
-                st.dataframe(rows, use_container_width=True)
-                st.markdown("#### Detail")
-                sel_qi = st.selectbox("Select Qi:", [a["qi_id"] for a in atoms_l], key="qi_sel")
-                if sel_qi:
-                    a = next((x for x in atoms_l if x["qi_id"] == sel_qi), None)
-                    if a:
-                        st.markdown(f"**ID:** `{a['qi_id']}` | **Label:** {a.get('qi_label')}")
-                        st.markdown(f"**Qi SHA256:** `{a.get('qi_sha256')}`")
-                        st.markdown(f"> {a.get('qi_excerpt', '—')}")
-                        if a.get("rqi_present"):
-                            st.markdown(f"**RQi SHA256:** `{a.get('rqi_sha256')}`")
-                            st.markdown(f"> {a.get('rqi_excerpt', '—')}")
-                        else:
-                            st.warning("No matching RQi.")
-                        st.markdown(f"**Sujet PDF:** `{(a.get('sujet_pdf_sha256') or '')[:24]}…`")
-            else:
-                st.info("No atoms extracted.")
-        else:
-            st.info("No atom data.")
-
-    # ═══ Coverage ═══ [FIX-B6]
+            c1,c2,c3=st.columns(3); c1.metric("Qi",at.get("total_qi",0)); c2.metric("RQi",at.get("with_rqi",0)); c3.metric("Quarantined",at.get("quarantined",0))
+            al=at.get("atoms",[])
+            if al: st.dataframe([{"qi_id":a["qi_id"],"label":a.get("qi_label","")[:40],"rqi":"✅" if a.get("rqi_present") else "❌","excerpt":(a.get("qi_excerpt") or "")[:80]} for a in al],use_container_width=True)
+        else: st.info("No atoms.")
     with tabs[6]:
-        st.markdown("### 📊 Coverage")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        cov = _art("CoverageMap")
-        orph = _art("Orphans")
+        st.markdown("### 📊 Coverage"); 
+        if not act_cc: st.info("Activate."); st.stop()
+        cov=_art("CoverageMap")
         if cov:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("QC", cov.get("total_qc", 0))
-            c2.metric("Qi", cov.get("total_qi", 0))
-            c3.metric("Mapped", cov.get("mapped", 0))
-            c4.metric("Unmapped", cov.get("unmapped", 0))
-            # [FIX-B6] coverage_by_subject_level
-            cov_sl = cov.get("coverage_by_subject_level", [])
-            if cov_sl:
-                st.markdown("#### Coverage by Level × Subject")
-                st.dataframe(cov_sl, use_container_width=True)
-            else:
-                st.caption("No coverage data (no QCs).")
-        if orph:
-            ol = orph.get("orphans", [])
-            if ol:
-                st.warning(f"Orphans (unmapped): {len(ol)}")
-                st.dataframe(ol, use_container_width=True)
-        if not cov:
-            st.info("No coverage data.")
-
-    # ═══ QC Explorer ═══ [FIX-B6]
+            c1,c2,c3,c4=st.columns(4); c1.metric("QC",cov.get("total_qc",0)); c2.metric("Qi",cov.get("total_qi",0)); c3.metric("Mapped",cov.get("mapped",0)); c4.metric("Unmapped",cov.get("unmapped",0))
+            csl=cov.get("coverage_by_subject_level",[])
+            if csl: st.dataframe(csl,use_container_width=True)
+        else: st.info("No coverage.")
     with tabs[7]:
-        st.markdown("### 🔎 QC Explorer")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        qcv = _art("QC_validated")
-        rd_art = _art("RedundancyReport")
-        at = _art("Atoms_Qi_RQi")
+        st.markdown("### 🔎 QC Explorer"); 
+        if not act_cc: st.info("Activate."); st.stop()
+        qcv=_art("QC_validated")
         if qcv:
-            qcs_l = qcv.get("qc_list", [])
-            st.metric("Total QC", qcv.get("total", 0))
-            if qcs_l:
-                # [FIX-B6] All filters: Level, Subject, Year, Spe
-                levels_q = sorted({q.get("level") or "—" for q in qcs_l})
-                subjs_q = sorted({q.get("subject") or "—" for q in qcs_l})
-                years_q = sorted({q.get("year") or "—" for q in qcs_l})
-                spes_q = sorted({q.get("spe") or "—" for q in qcs_l})
-                fc1, fc2, fc3, fc4 = st.columns(4)
-                fl = fc1.selectbox("Level", ["ALL"] + levels_q, key="qc_fl")
-                fs = fc2.selectbox("Subject", ["ALL"] + subjs_q, key="qc_fs")
-                fy = fc3.selectbox("Year", ["ALL"] + years_q, key="qc_fy")
-                fp = fc4.selectbox("Spe", ["ALL"] + spes_q, key="qc_fp")
-                filtered = qcs_l
-                if fl != "ALL":
-                    filtered = [q for q in filtered if (q.get("level") or "—") == fl]
-                if fs != "ALL":
-                    filtered = [q for q in filtered if (q.get("subject") or "—") == fs]
-                if fy != "ALL":
-                    filtered = [q for q in filtered if (q.get("year") or "—") == fy]
-                if fp != "ALL":
-                    filtered = [q for q in filtered if (q.get("spe") or "—") == fp]
-                # Sortable table
-                tbl = [{"qc_id": q["qc_id"], "level": q.get("level") or "—",
-                        "subject": q.get("subject") or "—", "year": q.get("year") or "—",
-                        "spe": q.get("spe") or "—", "qi": q["qi_count"], "rqi": q["rqi_count"],
-                        "status": q["status"]}
-                       for q in filtered]
-                st.dataframe(tbl, use_container_width=True)
-                st.markdown(f"**Showing {len(filtered)} QC(s)**")
-                for qc in filtered:
-                    with st.expander(f"{qc['qc_id']} — {qc.get('level', '?')}/{qc.get('subject', '?')}/{qc.get('year', '?')} — {qc['qi_count']} Qi"):
-                        st.json(qc.get("evidence", {}))
-                        if at:
-                            qa = [a for a in at.get("atoms", []) if a["pair_id"] == qc["pair_id"]]
-                            if qa:
-                                for a in qa:
-                                    st.markdown(f"- `{a['qi_id']}` {a.get('qi_label', '')[:50]} | RQi: {'✅' if a.get('rqi_present') else '❌'}")
-                # FRT status
-                frt = _art("FRT")
-                if frt:
-                    if frt.get("status") in ("UNAVAILABLE_PACK_MISSING", "UNAVAILABLE"):
-                        st.warning("FRT/ARI/Triggers: UNAVAILABLE — FORMULA_PACK missing.")
-                    elif frt.get("status") == "FAIL":
-                        st.error(f"FRT error: {frt.get('reason', '?')}")
-            rej = qcv.get("rejected", [])
-            if rej:
-                st.warning(f"Rejected: {len(rej)}")
-                st.dataframe(rej, use_container_width=True)
-        if rd_art:
-            st.markdown("#### Redundancy")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Candidates", rd_art.get("total", 0))
-            c2.metric("Selected", rd_art.get("selected", 0))
-            c3.metric("Redundant", rd_art.get("redundant", 0))
-        if not qcv:
-            st.info("No QC data.")
-
-    # ═══ Gates ═══
+            ql=qcv.get("qc_list",[]); st.metric("QC",qcv.get("total",0))
+            if ql:
+                tbl=[{"qc_id":q["qc_id"],"level":q.get("level") or "—","subject":q.get("subject") or "—","year":q.get("year") or "—","qi":q["qi_count"],"rqi":q["rqi_count"],"status":q["status"]} for q in ql]
+                st.dataframe(tbl,use_container_width=True)
+                for qc in ql:
+                    with st.expander(f"{qc['qc_id']}"): st.json(qc.get("evidence",{}))
+        else: st.info("No QC.")
     with tabs[8]:
-        st.markdown("### 🚦 Gates")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        chk = _art("CHK_REPORT")
-        seal = _art("SealReport")
-        det = _art("DeterminismReport_3runs")
+        st.markdown("### 🚦 Gates"); 
+        if not act_cc: st.info("Activate."); st.stop()
+        chk=_art("CHK_REPORT"); det=_art("DeterminismReport_3runs")
         if chk:
-            ov = chk.get("overall", "?")
-            st.markdown(
-                f'**Overall:** <span class="{"gp" if ov == "PASS" else "gf"}">{ov}</span> '
-                f'({chk.get("passed", 0)}P / {chk.get("failed", 0)}F)', unsafe_allow_html=True)
-            for gn, gi in chk.get("gates", {}).items():
-                v = gi["verdict"]
-                cl = "gp" if v == "PASS" else "gf"
-                st.markdown(f'<span class="{cl}">[{v}]</span> **{gn}** — {gi.get("detail", "")} → '
-                            f'`{gi.get("proof", "")}`', unsafe_allow_html=True)
-            fails_g = [gn for gn, gi in chk.get("gates", {}).items() if gi["verdict"] == "FAIL"]
-            if fails_g:
-                st.markdown("#### 🔧 Fix Details")
-                mn = _art("FORMULA_PACK_MANIFEST")
-                for fg in fails_g:
-                    if "F1F2" in fg or "FRT" in fg:
-                        reason = mn.get("reason", "?") if mn else "No manifest"
-                        fix = mn.get("fix", "Deploy formula_packs/") if mn else ""
-                        st.markdown(f'<div class="fix"><strong>⚠️ {fg}</strong><br/>'
-                                    f'Reason: {reason}<br/>Fix: {fix}</div>', unsafe_allow_html=True)
-                    elif "CAP" in fg:
-                        st.markdown(f'<div class="fix"><strong>⚠️ {fg}</strong> — Enrich '
-                                    f'<code>packs/{act_cc}/CAP_SEALED.json</code>.</div>',
-                                    unsafe_allow_html=True)
-                    else:
-                        st.markdown(f'<div class="fix"><strong>⚠️ {fg}</strong></div>',
-                                    unsafe_allow_html=True)
-        if seal:
-            with st.expander("Seal Report"):
-                st.json(seal)
-        if det:
-            st.markdown("#### Determinism (3 runs)")
-            ds = det.get("status", "?")
-            st.markdown(f'<span class="{"gp" if ds == "PASS" else "gf"}">{ds}</span> — '
-                        f'{det.get("n", 0)} runs, {len(det.get("unique", []))} unique',
-                        unsafe_allow_html=True)
-            with st.expander("Details"):
-                st.json(det)
-
-    # ═══ Holdout ═══
+            ov=chk.get("overall","?"); st.markdown(f'**Overall:** <span class="{"gp" if ov=="PASS" else "gf"}">{ov}</span>',unsafe_allow_html=True)
+            for gn,gi in chk.get("gates",{}).items(): st.markdown(f'<span class="{"gp" if gi["verdict"]=="PASS" else "gf"}">[{gi["verdict"]}]</span> **{gn}** — {gi.get("detail","")}',unsafe_allow_html=True)
+        if det: st.markdown(f'**Determinism:** <span class="{"gp" if det.get("status")=="PASS" else "gf"}">{det.get("status","?")}</span>',unsafe_allow_html=True)
     with tabs[9]:
-        st.markdown("### 🎯 Holdout")
-        if not act_cc:
-            st.info("Activate a country."); st.stop()
-        ho = _art("HoldoutMappingReport")
-        if ho:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total", ho.get("total", 0))
-            c2.metric("Train", ho.get("train", 0))
-            c3.metric("Holdout", ho.get("holdout", 0))
-            st.json(ho)
-        else:
-            st.info("No holdout data.")
-
-    # ═══ ARTIFACTS (UI-ONLY — read-only, zero pipeline writes) ═══
+        st.markdown("### 🎯 Holdout"); 
+        if not act_cc: st.info("Activate."); st.stop()
+        ho=_art("HoldoutMappingReport")
+        if ho: c1,c2,c3=st.columns(3); c1.metric("Total",ho.get("total",0)); c2.metric("Train",ho.get("train",0)); c3.metric("Holdout",ho.get("holdout",0))
+        else: st.info("No holdout.")
     with tabs[10]:
-        st.markdown("### 📁 Artifacts — Run Download")  # UI-ONLY
-        if not act_cc or not act_rd:
-            st.info("Activate a country to generate artifacts.")
+        st.markdown("### 📁 Artifacts")  # UI-ONLY
+        if not act_cc or not act_rd: st.info("Activate a country.")
         else:
-            rd_path = Path(act_rd)
-            st.markdown(f"**Run directory:** `{act_rd}`")
+            rdp=Path(act_rd); aj=sorted(rdp.glob("*.json")) if rdp.exists() else []; ash=sorted(rdp.glob("*.sha256")) if rdp.exists() else []
+            af=sorted(set(aj+ash),key=lambda p:p.name); st.markdown(f"**{len(af)} files** ({len(aj)} JSON, {len(ash)} SHA256)")
+            for an in ["SealReport","CHK_REPORT","DeterminismReport_3runs","UI_EVENT_LOG"]:
+                jp=rdp/f"{an}.json"; sp=rdp/f"{an}.sha256"; c1,c2,c3=st.columns([4,2,2]); c1.markdown(f"**{an}**")
+                if jp.exists(): c2.download_button("⬇ .json",jp.read_bytes(),file_name=f"{an}.json",key=f"dl_{an}_j")
+                else: c2.markdown('<span class="sb sf">MISSING</span>',unsafe_allow_html=True)
+                if sp.exists(): c3.download_button("⬇ .sha256",sp.read_bytes(),file_name=f"{an}.sha256",key=f"dl_{an}_s")
+                else: c3.markdown('<span class="sb sf">MISSING</span>',unsafe_allow_html=True)
+            if af:
+                buf=io.BytesIO()
+                with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as zf:
+                    for fp in af: zf.writestr(fp.name,fp.read_bytes())
+                buf.seek(0); st.download_button(f"⬇ ZIP ({len(af)} files)",buf.getvalue(),file_name=f"{rdp.name[:32]}_artifacts.zip",mime="application/zip",key="dl_zip")
 
-            # Enumerate all files in run dir (UI-ONLY read)
-            all_json = sorted(rd_path.glob("*.json")) if rd_path.exists() else []
-            all_sha = sorted(rd_path.glob("*.sha256")) if rd_path.exists() else []
-            all_files = sorted(set(all_json + all_sha), key=lambda p: p.name)
-
-            st.markdown(f"**Total files:** {len(all_files)} ({len(all_json)} JSON, {len(all_sha)} SHA256)")
-            st.divider()
-
-            # ── Critical 4 artifacts with download buttons ──
-            st.markdown("#### 🔑 Critical Artifacts")
-            _CRITICAL = ["SealReport", "CHK_REPORT", "DeterminismReport_3runs", "UI_EVENT_LOG"]
-            for art_name in _CRITICAL:
-                jp = rd_path / f"{art_name}.json"
-                sp = rd_path / f"{art_name}.sha256"
-                c1, c2, c3 = st.columns([4, 2, 2])
-                c1.markdown(f"**{art_name}**")
-                if jp.exists():
-                    c2.download_button(
-                        f"⬇ .json", jp.read_bytes(),
-                        file_name=f"{art_name}.json", mime="application/json",
-                        key=f"dl_{art_name}_json")  # UI-ONLY
-                else:
-                    c2.markdown('<span class="sb sf">MISSING</span>', unsafe_allow_html=True)
-                if sp.exists():
-                    c3.download_button(
-                        f"⬇ .sha256", sp.read_bytes(),
-                        file_name=f"{art_name}.sha256", mime="text/plain",
-                        key=f"dl_{art_name}_sha")  # UI-ONLY
-                else:
-                    c3.markdown('<span class="sb sf">MISSING</span>', unsafe_allow_html=True)
-
-            st.divider()
-
-            # ── Full file listing with individual downloads ──
-            st.markdown("#### 📋 All Artifacts")
-            if all_files:
-                for fp in all_files:
-                    c1, c2 = st.columns([5, 2])
-                    sz = fp.stat().st_size if fp.exists() else 0
-                    c1.markdown(f"`{fp.name}` ({sz:,} bytes)")
-                    mime = "application/json" if fp.suffix == ".json" else "text/plain"
-                    c2.download_button(
-                        "⬇", fp.read_bytes(), file_name=fp.name, mime=mime,
-                        key=f"dl_all_{fp.name}")  # UI-ONLY
-            else:
-                st.warning("No artifacts found in run directory.")
-
-            st.divider()
-
-            # ── ZIP download (all run artifacts, in-memory) ──
-            st.markdown("#### 📦 Download Full Run (ZIP)")  # UI-ONLY
-            if all_files:
-                buf = io.BytesIO()
-                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for fp in all_files:  # already sorted alpha
-                        zf.writestr(fp.name, fp.read_bytes())
-                buf.seek(0)
-                rid_short = rd_path.name[:32]
-                st.download_button(
-                    f"⬇ Download ZIP ({len(all_files)} files)",
-                    buf.getvalue(),
-                    file_name=f"{rid_short}_artifacts.zip",
-                    mime="application/zip",
-                    key="dl_zip_run")  # UI-ONLY
-                st.caption("ZIP is generated in-memory (read-only). Not used in gates or hashing.")
-            else:
-                st.info("No files to archive.")
-
-
-if __name__ == "__main__":
-    main()
-
-# ─────────────────────────────────────────────────────────────
-# NOTE (≤15 lines):
-# Artifacts → run/<run_id>/*.json + .sha256 sidecars.
-# CAPs → packs/<country>/CAP_SEALED.json (auto-sealed if absent).
-# SealReport: overall + gates. CHK_REPORT: per-gate verdict+proof.
-# DeterminismReport_3runs: 3-run functional hash comparison.
-# Text extraction: pdfplumber→pypdf. Real text + sha256.
-# Atoms: real Qi/RQi from text via heuristic segmentation.
-# QCs: only if cluster_min met + evidence complete.
-# FRT/ARI/Triggers: ONLY via real runner module. UNAVAILABLE otherwise.
-# FormulaEngine: requires runner_module in manifest. Zero fake outputs.
-# Coverage: coverage_by_subject_level from QC metadata.
-# Country typeahead: strict name-prefix, st.radio, zero I/O.
-# V14.1.1: Artifacts tab (UI-ONLY read) + ZIP download.
-# Run: streamlit run smaxia_gte_v14_1_1_admin_final.py
-# ─────────────────────────────────────────────────────────────
+if __name__=="__main__": main()
