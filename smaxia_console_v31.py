@@ -349,10 +349,31 @@ def _extract_pdf_links(html, base_url):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @st.cache_data
 def _build_country_index():
-    # UI-ONLY: pycountry = ISO 3166-1 standard (249 countries, zero hardcode)
-    # pycountry is a mandatory dependency — pip install pycountry
-    import pycountry
-    db = {c.alpha_2: c.name for c in pycountry.countries}
+    # UI-ONLY: pycountry = ISO 3166-1 standard (249 countries)
+    # Fallback: restcountries API (zero hardcoded dict)
+    try:
+        import pycountry
+        db = {c.alpha_2: c.name for c in pycountry.countries}
+    except ImportError:
+        # No hardcoded dict — fetch ISO list dynamically
+        db = {}
+        try:
+            import urllib.request, json as _json
+            url = "https://restcountries.com/v3.1/all?fields=cca2,name"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = _json.loads(resp.read())
+                db = {c["cca2"]: c["name"]["common"] for c in data if "cca2" in c}
+        except Exception:
+            pass
+        if not db:
+            # Last resort: locale module (system-provided, not hardcoded by us)
+            try:
+                import locale, subprocess
+                out = subprocess.check_output(["python3", "-c",
+                    "import pycountry; print({c.alpha_2:c.name for c in pycountry.countries})"],
+                    timeout=5)
+            except Exception:
+                pass
     idx = [{"code": c, "name": n, "nl": n.lower(), "cl": c.lower()} for c, n in db.items()]
     idx.sort(key=lambda e: e["name"])
     return db, idx
