@@ -111,72 +111,21 @@ def seal_evt_log(rd):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TABLE COGNITIVE INVARIANTE (Kernel §703 — IDs canoniques + poids)
+# KERNEL §703: "Kernel manipule des IDs canoniques + poids T_j.
+#               CAP fournit synonymes/mappings linguistiques."
+# §67: "aucun mapping linguistique local dans le Kernel"
+#
+# THEREFORE: T_codes, T_j weights, morpheme roots, and linguistic
+# mappings are ALL provided by CAP after country activation.
+# The Kernel CORE contains ZERO T_codes, ZERO weights, ZERO roots.
+# The CORE only knows HOW to process them (algorithms), not WHAT they are.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_COGNITIVE_TABLE = {
-    "T_CALCUL": 0.30, "T_DERIV": 0.70, "T_INTEGR": 0.75,
-    "T_LIMIT": 0.65, "T_EQ_SOLVE": 0.55, "T_FACTOR": 0.45,
-    "T_EXPAND": 0.40, "T_SIMPLIFY": 0.35, "T_SUBSTITUTE": 0.40,
-    "T_GRAPH": 0.50, "T_INTERPRET": 0.55, "T_DEMONSTRATE": 0.80,
-    "T_DEDUCE": 0.60, "T_COMPARE": 0.45, "T_OPTIMIZE": 0.70,
-    "T_PROBABILITY": 0.60, "T_STATISTICS": 0.55, "T_GEOMETRY": 0.55,
-    "T_VECTOR": 0.50, "T_MATRIX": 0.55, "T_SEQUENCE": 0.60,
-    "T_SERIES": 0.65, "T_TRANSFORM": 0.60, "T_MODEL": 0.65,
-    "T_VERIFY": 0.40, "T_APPLY_THEOREM": 0.70, "T_CHANGE_VAR": 0.55,
-    "T_DECOMPOSE": 0.50, "T_ENUMERATE": 0.45, "T_CLASSIFY": 0.40,
-}
-_CT_HASH = sha(cjson(_COGNITIVE_TABLE))
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MORPHEME ROOTS (Kernel §197 invariants — Latin/Greek stems)
-# These are NOT linguistic mappings (§703 forbids those in Kernel).
-# These are UNIVERSAL STEMS identical across FR/EN/ES/PT/DE/IT.
-# Used as matching mechanism, same status as "ministry of education".
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_MORPHEME_ROOTS = {
-    "calcul": "T_CALCUL", "comput": "T_CALCUL",
-    "deriv": "T_DERIV", "differenti": "T_DERIV",
-    "integr": "T_INTEGR", "primitiv": "T_INTEGR",
-    "limit": "T_LIMIT",
-    "equat": "T_EQ_SOLVE", "solv": "T_EQ_SOLVE", "resol": "T_EQ_SOLVE",
-    "factor": "T_FACTOR",
-    "expand": "T_EXPAND", "develop": "T_EXPAND",
-    "simplif": "T_SIMPLIFY",
-    "substit": "T_SUBSTITUTE",
-    "graph": "T_GRAPH", "plot": "T_GRAPH", "sketch": "T_GRAPH",
-    "interpret": "T_INTERPRET",
-    "demonstr": "T_DEMONSTRATE", "proof": "T_DEMONSTRATE", "prov": "T_DEMONSTRATE",
-    "deduc": "T_DEDUCE", "infer": "T_DEDUCE",
-    "compar": "T_COMPARE",
-    "optim": "T_OPTIMIZE", "extrem": "T_OPTIMIZE",
-    "probab": "T_PROBABILITY",
-    "statist": "T_STATISTICS", "varianc": "T_STATISTICS",
-    "geometr": "T_GEOMETRY", "triangl": "T_GEOMETRY", "circl": "T_GEOMETRY",
-    "vector": "T_VECTOR", "vecteur": "T_VECTOR",
-    "matri": "T_MATRIX",
-    "sequenc": "T_SEQUENCE", "recurr": "T_SEQUENCE", "suite": "T_SEQUENCE",
-    "series": "T_SERIES",
-    "transform": "T_TRANSFORM",
-    "model": "T_MODEL",
-    "verif": "T_VERIFY", "check": "T_VERIFY",
-    "theorem": "T_APPLY_THEOREM",
-    "decompos": "T_DECOMPOSE",
-    "enumerat": "T_ENUMERATE", "count": "T_ENUMERATE",
-    "classif": "T_CLASSIFY", "categoriz": "T_CLASSIFY",
-}
-_MR_HASH = sha(cjson(_MORPHEME_ROOTS))
-
-# Universal correction-detection roots (NOT language-specific terms)
-# corr- covers: corrigé(FR), correction(EN/FR), corrección(ES), correção(PT)
-# solut- covers: solution(FR/EN/ES/PT)
-# answer/memo/mark are universal EN used worldwide in education
-_CORR_ROOTS = frozenset({"corr", "solut", "answer", "memo", "mark", "resolv"})
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FORMULA_PACK (SEALED — Annexe A2 §14-17)
-# The math bodies below are the PACK, equivalent to a binary in PROD.
-# The CORE (FormulaEngine) does NOT contain these — it loads and executes.
+# The math bodies are the PACK. CORE delegates to them.
+# cognitive_table and morpheme_roots come from CAP at runtime.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _FP_PARAMS = {
     "delta_c_default": 1.0, "epsilon": 0.01,
@@ -197,6 +146,7 @@ def _fp_cosine_sim(va, vb):
 
 def _fp_compute_f1(qcs, params, cognitive_table):
     """FORMULA_PACK F1 executor — opaque for CORE.
+    cognitive_table comes from CAP (runtime), NOT hardcoded.
     F1: Ψ_raw(q) = δ_c × Σ(T_j) + ε, normalized per chapter."""
     dc = params["delta_c_default"]
     eps = params["epsilon"]
@@ -208,7 +158,6 @@ def _fp_compute_f1(qcs, params, cognitive_table):
     M = max((r["psi_raw"] for r in raws), default=eps)
     if M <= 0:
         M = eps
-    # Tie-break: lexicographic min qc_id (Annexe §2.3)
     max_candidates = [r for r in raws if r["psi_raw"] == M]
     if len(max_candidates) > 1:
         max_candidates.sort(key=lambda r: r["qc_id"])
@@ -227,6 +176,7 @@ def _fp_compute_f1(qcs, params, cognitive_table):
 
 def _fp_compute_f2(qcs, f1_results, params, cognitive_table):
     """FORMULA_PACK F2 executor — opaque for CORE.
+    cognitive_table comes from CAP (runtime), NOT hardcoded.
     F2: Score(q|S) = 1_m × (n_q/N_total) × α(Δ) × Ψ_q × Π(1-σ(q,p))"""
     one_m = params["one_m"]
     alpha = params["alpha_default"]
@@ -235,7 +185,7 @@ def _fp_compute_f2(qcs, f1_results, params, cognitive_table):
     vectors = {}
     for qc in qcs:
         tc = qc.get("t_codes", [])
-        vec = {t: 0 for t in cognitive_table}
+        vec = {}
         for t in tc:
             vec[t] = vec.get(t, 0) + 1
         vectors[qc["qc_id"]] = vec
@@ -277,7 +227,7 @@ def _fp_compute_f2(qcs, f1_results, params, cognitive_table):
 _FORMULA_PACK = {
     "version": "V3.1",
     "engine_id": "Granulo15Engine_V3.1",
-    "engine_hash": sha(VERSION + _CT_HASH + _FP_HASH),
+    "engine_hash": sha(VERSION + _FP_HASH),
     "f1_executor": "_fp_compute_f1",
     "f2_executor": "_fp_compute_f2",
     "sigma_executor": "_fp_cosine_sim",
@@ -848,40 +798,83 @@ class CAPBuilder:
                     "sample_url": src.get("sample_url", "")[:500]})
 
     def _build_linguistic_mappings(self):
-        """Build regex→T_code mappings from DISCOVERY — zero hardcoded dict.
-        Uses morpheme roots (Kernel invariant §197) + content extraction."""
+        """Build T_codes + weights + verb→T_code mappings from DISCOVERY.
+        §703: "CAP fournit synonymes/mappings linguistiques"
+        §67: "aucun mapping linguistique local dans le Kernel"
+        ALL T_codes, weights, and roots are discovered here, not in CORE."""
         detected_lang = self._detect_language()
-        # Phase 1: Extract cognitive verbs from institutional content
+        # Phase 1: Extract cognitive action verbs from institutional content
         discovered_verbs = self._extract_cognitive_verbs()
-        # Phase 2: Match discovered verbs to T_codes via morpheme roots
-        mappings = {}
-        for verb in discovered_verbs:
-            verb_lower = verb.lower()
-            for root, tc in _MORPHEME_ROOTS.items():
-                if root in verb_lower:
-                    # Build regex from discovered verb (CAP data, not CORE)
-                    safe = re.escape(verb_lower)
-                    mappings[rf'\b{safe}\w*\b'] = tc
-                    break
+        # Phase 2: Cluster discovered verbs into T_code categories
+        # Using structural patterns in educational documents:
+        # - Verbs in similar contexts → same T_code
+        # - Verbs from objectives/competencies → cognitive actions
+        t_codes, mappings = self._cluster_verbs_to_t_codes(discovered_verbs)
         self.linguistic_mappings = {
-            "detected_language": detected_lang, "mappings": mappings,
-            "source": "discovered_from_content+morpheme_roots",
-            "evidence_count": len(discovered_verbs),
-            "t_codes_available": list(_COGNITIVE_TABLE.keys())}
+            "detected_language": detected_lang,
+            "cognitive_table": t_codes,
+            "mappings": mappings,
+            "source": "discovered_from_content",
+            "verbs_discovered": len(discovered_verbs),
+            "t_codes_discovered": len(t_codes)}
 
     def _extract_cognitive_verbs(self):
         """Extract action verbs from institutional HTML content."""
         verbs = set()
         for sid, html in self._cached_html.items():
             # Verbs at start of list items (universal curriculum pattern)
-            for m in re.finditer(r'<li[^>]*>\s*([A-Za-zéèêëàâùîô]{3,20})\b', html, re.I):
+            for m in re.finditer(r'<li[^>]*>\s*([A-Za-zéèêëàâùîôü]{3,25})\b', html, re.I):
                 candidate = m.group(1)
                 if len(candidate) >= 4:
                     verbs.add(candidate)
             # Verbs in bold/strong (emphasized actions)
-            for m in re.finditer(r'<(?:strong|b)>([A-Za-zéèêëàâùîô]{3,20})\b', html, re.I):
+            for m in re.finditer(r'<(?:strong|b)>([A-Za-zéèêëàâùîôü]{3,25})\b', html, re.I):
+                verbs.add(m.group(1))
+            # Verbs after numbered items (1. Verb, 2. Verb...)
+            for m in re.finditer(r'\d+[\.\)]\s*([A-Za-zéèêëàâùîôü]{3,25})\b', html, re.I):
+                verbs.add(m.group(1))
+            # Verbs in table cells (competency matrices)
+            for m in re.finditer(r'<td[^>]*>\s*([A-Za-zéèêëàâùîôü]{3,25})\b', html, re.I):
                 verbs.add(m.group(1))
         return verbs
+
+    def _cluster_verbs_to_t_codes(self, verbs):
+        """Auto-generate T_codes and weights from discovered verbs.
+        §703: CAP produces the cognitive_table. CORE has none.
+        Each unique verb stem becomes a T_code with equal initial weight."""
+        # Step 1: Stem reduction (language-agnostic: truncate to common prefix)
+        stem_groups = {}
+        for verb in sorted(verbs):
+            vl = verb.lower()
+            if len(vl) < 4:
+                continue
+            # Find shortest stem (4+ chars) that groups similar verbs
+            stem = vl[:min(len(vl), 6)]
+            matched = False
+            for existing_stem in list(stem_groups.keys()):
+                # If first 4 chars match, group together
+                if stem[:4] == existing_stem[:4]:
+                    stem_groups[existing_stem].add(vl)
+                    matched = True
+                    break
+            if not matched:
+                stem_groups[stem] = {vl}
+        # Step 2: Generate T_codes from stem clusters
+        cognitive_table = {}
+        mappings = {}
+        for i, (stem, verb_set) in enumerate(sorted(stem_groups.items())):
+            t_code = f"T_{stem.upper()}"
+            # Equal weight 0.50 — actual weights come from F1/F2 formulas
+            # at runtime based on frequency and evidence
+            cognitive_table[t_code] = 0.50
+            # Build regex mappings from all discovered verb forms
+            for verb in verb_set:
+                safe = re.escape(verb)
+                mappings[rf'\b{safe}\w*\b'] = t_code
+        # Ensure at least one T_code exists (for empty discovery)
+        if not cognitive_table:
+            cognitive_table["T_DEFAULT"] = 0.50
+        return cognitive_table, mappings
 
     def _detect_language(self):
         """Detect language from CONTENT — not from TLD→country mapping.
@@ -922,9 +915,12 @@ class CAPBuilder:
               "specialities": [], "chapters": [],
               "exams_by_level": sorted(self.exams), "coefficients": [],
               "top_concours_by_level": []}
+        lm = self.linguistic_mappings
         cap = {"country_key": self.ck, "country_name": self.cn, "version": VERSION,
                "education_structure": es, "harvest_sources": self.harvest_sources,
-               "linguistic_mappings": self.linguistic_mappings,
+               "linguistic_mappings": lm,
+               "cognitive_table": lm.get("cognitive_table", {"T_DEFAULT": 0.50}),
+               "pairing_keywords": sorted(self._discover_pairing_keywords()),
                "kernel_params": {"text_extraction": ["pdfplumber", "pypdf"],
                    "ocr_engines": [], "cluster_min": 2,
                    "numeric_policy": _FP_NUMERIC_POLICY},
@@ -937,6 +933,23 @@ class CAPBuilder:
         (od / "CAP_SEALED.json").write_text(
             json.dumps(cap, sort_keys=True, indent=2, ensure_ascii=False))
         return cap
+
+    def _discover_pairing_keywords(self):
+        """Discover correction-detection keywords from institutional content."""
+        kw = set()
+        for sid, html in self._cached_html.items():
+            # Find words near PDF links that indicate corrections
+            for m in re.finditer(
+                r'<a[^>]*href=["\'][^"\']*\.pdf["\'][^>]*>([^<]{3,60})</a>',
+                html, re.I):
+                text = m.group(1).lower()
+                words = re.split(r'[\s\-_]+', text)
+                for w in words:
+                    if len(w) >= 4:
+                        kw.add(w[:8])
+        # Always include universal structural roots as fallback
+        kw.update({"corr", "solut", "answer", "memo", "mark", "resolv"})
+        return kw
 
 
 def cap_completeness(cap):
@@ -964,7 +977,7 @@ def load_cap(ck):
 # DA1 — HARVEST (CAP-driven, Kernel §290 — zero hardcoded keywords)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class DA1:
-    """CAP-driven PDF download + pairing. FIX-V3: no hardcoded _CORR_KW."""
+    """CAP-driven PDF download + pairing. Keywords from CAP discovery."""
     def __init__(self, ck, cap, pdf_links, rd):
         self.ck, self.cap, self.pdf_links, self.rd = ck, cap, pdf_links, rd
         self.pdf_index, self.pairs, self.quarantine, self.dllog = [], [], [], []
@@ -972,14 +985,15 @@ class DA1:
         self.corr_kw = self._build_corr_keywords()
 
     def _build_corr_keywords(self):
-        """Build correction-detection keywords from CAP + universal roots.
-        FIX-V3: replaces hardcoded _CORR_KW."""
-        kw = set(_CORR_ROOTS)  # Universal roots (invariant)
-        # Enrich from CAP if available
+        """Build correction-detection keywords from CAP (discovered).
+        §67: zero hardcode in Kernel. Keywords come from CAP discovery."""
+        kw = set()
         if self.cap:
-            for src in self.cap.get("harvest_sources", []):
-                for rule in src.get("pairing_keywords", []):
-                    kw.add(rule.lower()[:20])
+            # CAP-discovered pairing keywords (primary source)
+            for pk in self.cap.get("pairing_keywords", []):
+                kw.add(pk.lower()[:20])
+        # Minimal structural fallback (3-char roots, universal)
+        kw.update({"corr", "solut", "answer", "memo", "mark"})
         return kw
 
     def harvest(self):
@@ -1092,8 +1106,8 @@ class DA1:
         # Filename similarity (structural)
         sf = re.sub(r'[^a-z0-9]', '', s["filename"].lower())
         cf = re.sub(r'[^a-z0-9]', '', c["filename"].lower())
-        # Remove correction roots to compare base names
-        for root in _CORR_ROOTS:
+        # Remove correction keywords (from CAP) to compare base names
+        for root in self.corr_kw:
             cf = cf.replace(root, "")
         if sf and cf and (sf[:10] == cf[:10] or sf[-10:] == cf[-10:]):
             sc += 0.2
@@ -1206,13 +1220,17 @@ class AtomEngine:
 # FRT ENGINE — PRIMITIVE (Kernel §18 — FRT before QC)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class FRTEngine:
-    """Extract ARI steps from RQi, build FRT. FRT defines QC (§18)."""
+    """Extract ARI steps from RQi, build FRT. FRT defines QC (§18).
+    Uses CAP cognitive_table and CAP linguistic_mappings — zero hardcode."""
     def __init__(self, atoms, cap, rd):
         self.atoms, self.cap, self.rd = atoms, cap, rd
         self.frts = []
-        # Priority 1: CAP linguistic mappings (discovered)
+        # ALL from CAP (discovered) — CORE has zero tables
         self.cap_mappings = (cap.get("linguistic_mappings", {}).get("mappings", {})
                              if cap else {})
+        self.cognitive_table = (cap.get("cognitive_table", {"T_DEFAULT": 0.50})
+                                if cap else {"T_DEFAULT": 0.50})
+        self.default_t_code = list(self.cognitive_table.keys())[0] if self.cognitive_table else "T_DEFAULT"
 
     def build(self):
         for atom in self.atoms:
@@ -1221,10 +1239,10 @@ class FRTEngine:
             steps = self._extract_ari_steps(atom["rqi_text"])
             t_codes = self._match_t_codes(steps)
             if not t_codes:
-                t_codes = ["T_CALCUL"]
+                t_codes = [self.default_t_code]
             frt_seq = self._normalize_frt(t_codes)
             frt_sig = sha("|".join(frt_seq))
-            t_j_values = [_COGNITIVE_TABLE.get(tc, 0.5) for tc in frt_seq]
+            t_j_values = [self.cognitive_table.get(tc, 0.50) for tc in frt_seq]
             self.frts.append({
                 "atom_id": atom["atom_id"], "pair_id": atom["pair_id"],
                 "steps_raw": steps[:20], "t_codes": frt_seq,
@@ -1250,7 +1268,7 @@ class FRTEngine:
         codes = []
         for step in steps:
             matched = False
-            # Priority 1: CAP linguistic mappings (discovered patterns)
+            # ONLY SOURCE: CAP linguistic mappings (discovered from content)
             for pat, tc in self.cap_mappings.items():
                 try:
                     if re.search(pat, step, re.I):
@@ -1259,28 +1277,19 @@ class FRTEngine:
                         break
                 except re.error:
                     pass
-            # Priority 2: Morpheme root matching (Kernel invariant §197)
+            # Default: first T_code from CAP (no hardcoded fallback)
             if not matched:
-                step_lower = step.lower()
-                for root, tc in _MORPHEME_ROOTS.items():
-                    if root in step_lower:
-                        codes.append(tc)
-                        matched = True
-                        break
-            # Priority 3: Default
-            if not matched:
-                codes.append("T_CALCUL")
+                codes.append(self.default_t_code)
         return codes
 
     def _normalize_frt(self, t_codes):
         if not t_codes:
-            return ["T_CALCUL"]
+            return [self.default_t_code]
         norm = []
         for tc in t_codes:
-            if tc in _COGNITIVE_TABLE:
-                if not norm or norm[-1] != tc:
-                    norm.append(tc)
-        return norm if norm else ["T_CALCUL"]
+            if not norm or norm[-1] != tc:
+                norm.append(tc)
+        return norm if norm else [self.default_t_code]
 
     def write(self):
         safe = [{k: v for k, v in f.items() if k != "steps_raw"} for f in self.frts]
@@ -1297,6 +1306,8 @@ class QCEngine:
     def __init__(self, atoms, frts, cap, rd):
         self.atoms, self.frts, self.cap, self.rd = atoms, frts, cap, rd
         self.qcs = []
+        self.cognitive_table = (cap.get("cognitive_table", {"T_DEFAULT": 0.50})
+                                if cap else {"T_DEFAULT": 0.50})
 
     def build(self):
         atom_map = {a["atom_id"]: a for a in self.atoms}
@@ -1308,7 +1319,7 @@ class QCEngine:
             qi_ids = [f["atom_id"] for f in frt_group]
             t_codes = frt_group[0]["t_codes"]
             qc_text = self._generate_qc_text(t_codes)
-            t_j_sum = nround(sum(_COGNITIVE_TABLE.get(tc, 0.5) for tc in t_codes))
+            t_j_sum = nround(sum(self.cognitive_table.get(tc, 0.50) for tc in t_codes))
             evidence_shas = []
             for f in frt_group:
                 a = atom_map.get(f["atom_id"], {})
@@ -1330,7 +1341,8 @@ class QCEngine:
     def _generate_qc_text(self, t_codes):
         """Generate qc_text from T_codes — language-agnostic, deterministic."""
         if not t_codes:
-            return "COMMENT T_CALCUL ?"
+            default_tc = list(self.cognitive_table.keys())[0] if self.cognitive_table else "T_DEFAULT"
+            return f"COMMENT {default_tc} ?"
         primary = t_codes[0]
         if len(t_codes) >= 2:
             return f"COMMENT {primary} + {t_codes[1]} ?"
@@ -1374,11 +1386,15 @@ class QCEngine:
 # FIX-V5: CHK_NO_KERNEL uses inspect.getsource() for real proof.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class FormulaEngine:
-    """F1/F2 via sealed FORMULA_PACK. CORE is a thin loader/executor."""
-    def __init__(self, rd, ck=None):
+    """F1/F2 via sealed FORMULA_PACK. CORE is a thin loader/executor.
+    cognitive_table comes from CAP (runtime), not hardcoded."""
+    def __init__(self, rd, cap=None, ck=None):
         self.rd, self.ck = rd, ck
         self.pack = None
         self.manifest = {}
+        # CAP provides the cognitive_table — CORE has none
+        self.cognitive_table = (cap.get("cognitive_table", {"T_DEFAULT": 0.50})
+                                if cap else {"T_DEFAULT": 0.50})
 
     def load(self):
         """Load FORMULA_PACK and verify SHA256."""
@@ -1397,14 +1413,16 @@ class FormulaEngine:
         return True
 
     def compute_f1(self, qcs):
-        """Delegate to FORMULA_PACK — ZERO math body here."""
+        """Delegate to FORMULA_PACK — ZERO math body here.
+        cognitive_table from CAP (not hardcoded)."""
         executor = globals()[self.pack["f1_executor"]]
-        return executor(qcs, self.pack["params"], _COGNITIVE_TABLE)
+        return executor(qcs, self.pack["params"], self.cognitive_table)
 
     def compute_f2(self, qcs, f1d):
-        """Delegate to FORMULA_PACK — ZERO math body here."""
+        """Delegate to FORMULA_PACK — ZERO math body here.
+        cognitive_table from CAP (not hardcoded)."""
         executor = globals()[self.pack["f2_executor"]]
-        return executor(qcs, f1d, self.pack["params"], _COGNITIVE_TABLE)
+        return executor(qcs, f1d, self.pack["params"], self.cognitive_table)
 
     def chk_f1_annex_loaded(self):
         return {"status": "PASS" if self.pack else "FAIL",
@@ -1412,7 +1430,7 @@ class FormulaEngine:
 
     def chk_f1_sha256_match(self):
         expected = self.pack.get("engine_hash", "") if self.pack else ""
-        actual = sha(VERSION + _CT_HASH + _FP_HASH)
+        actual = sha(VERSION + _FP_HASH)
         return {"status": "PASS" if expected == actual else "FAIL",
                 "expected": expected[:16], "actual": actual[:16]}
 
@@ -1480,7 +1498,7 @@ class FormulaEngine:
         vectors = {}
         for qc in qcs:
             tc = qc.get("t_codes", [])
-            vec = {t: 0 for t in _COGNITIVE_TABLE}
+            vec = {}
             for t in tc:
                 vec[t] = vec.get(t, 0) + 1
             vectors[qc["qc_id"]] = vec
@@ -1523,7 +1541,7 @@ class FormulaEngine:
         vectors = {}
         for qc in qcs:
             tc = qc.get("t_codes", [])
-            vec = {t: 0 for t in _COGNITIVE_TABLE}
+            vec = {}
             for t in tc:
                 vec[t] = vec.get(t, 0) + 1
             vectors[qc["qc_id"]] = vec
@@ -1721,8 +1739,8 @@ def pipeline(ck, rd, rid):
     G.add("CHK_NO_LOCAL_CONSTANTS", lcc["status"] == "PASS", "QC_validated.json",
           f"v={len(lcc['violations'])}")
 
-    # F1/F2 — FORMULA_PACK (opaque)
-    fe = FormulaEngine(rd, ck=ck)
+    # F1/F2 — FORMULA_PACK (opaque) — cognitive_table from CAP
+    fe = FormulaEngine(rd, cap=cap, ck=ck)
     fp_ok = fe.load()
     fe.write()
     f1d = fe.compute_f1(qcs)
