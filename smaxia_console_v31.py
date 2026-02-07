@@ -63,6 +63,49 @@ def log_event(evt_type, detail=""):
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
+# ─── COUNTRY INDEX + TYPEAHEAD ───
+@st.cache_data
+def _build_country_index():
+    try:
+        import pycountry
+        db = {c.alpha_2: c.name for c in pycountry.countries}
+    except Exception:
+        db = {}
+        try:
+            import urllib.request, json as _json
+            url = "https://restcountries.com/v3.1/all?fields=cca2,name"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = _json.loads(resp.read())
+            db = {c["cca2"]: c["name"]["common"] for c in data if "cca2" in c and "name" in c}
+        except Exception:
+            pass
+    idx = [{"code": k, "name": v, "nl": v.lower(), "cl": k.lower()} for k, v in db.items()]
+    idx.sort(key=lambda e: e["name"])
+    return db, idx
+
+def typeahead(q, limit=20):
+    _, idx = _build_country_index()
+    ql = (q or "").strip().lower()
+    if not ql:
+        return [], []
+    prefix, fallback, seen = [], [], set()
+    for e in idx:
+        if e["nl"].startswith(ql):
+            prefix.append(e)
+            seen.add(e["code"])
+            if len(prefix) >= limit:
+                break
+    if len(prefix) < limit:
+        for e in idx:
+            if e["code"] in seen:
+                continue
+            if e["cl"].startswith(ql) or ql in e["nl"] or ql in e["cl"]:
+                fallback.append(e)
+                seen.add(e["code"])
+                if len(fallback) >= limit:
+                    break
+    return prefix, fallback
+
 # ─── FORMULA_PACK (OPAQUE NAMESPACE) ───
 FORMULA_PACK = {
     "version": "FP-3.1-SEALED",
@@ -71,7 +114,6 @@ FORMULA_PACK = {
 }
 
 def _fp_compute_f1(atoms, frt, qc, pack_cfg):
-    """F1 executor — delegates to FORMULA_PACK internal. Returns opaque score digest."""
     n = len(atoms)
     if n == 0:
         return {"score_f1": 0.0, "digest": sha256("empty"), "status": "NO_ATOMS"}
@@ -81,7 +123,6 @@ def _fp_compute_f1(atoms, frt, qc, pack_cfg):
     return {"score_f1": round(raw, 4), "digest": sha256(canonical_json({"n": n, "qc_valid": qc_valid})), "status": "OK"}
 
 def _fp_compute_f2(f1_digest, ari_profiles, triggers, pack_cfg):
-    """F2 executor — delegates to FORMULA_PACK internal. Returns opaque score digest."""
     base = f1_digest.get("score_f1", 0.0)
     t_count = len(triggers)
     adj = base * (1.0 + 0.01 * t_count)
@@ -151,7 +192,7 @@ def discover_cap(iso2):
     log_event("CAP_DISCOVERY_END", iso2)
     return cap
 
-# ─── VSP (VALIDATION STRUCTURELLE PAYS) ───
+# ─── VSP ───
 def validate_vsp(cap):
     checks = []
     checks.append({"check": "iso2_present", "pass": bool(cap.get("iso2"))})
@@ -229,7 +270,7 @@ def extract_atoms(texts):
     log_event("ATOMS_END", f"{len(atoms)} atoms")
     return atoms
 
-# ─── FRT (FRÉQUENCE / RÉCURRENCE / THÉMATIQUE) ───
+# ─── FRT ───
 def compute_frt(atoms):
     log_event("FRT_START")
     themes = {}
@@ -242,7 +283,7 @@ def compute_frt(atoms):
     log_event("FRT_END", f"{len(frt_entries)} themes")
     return frt_entries
 
-# ─── QC (QUALITY CONTROL) ───
+# ─── QC ───
 def run_qc(atoms):
     log_event("QC_START")
     qc = []
@@ -272,15 +313,13 @@ def compute_triggers(ari_profiles, frt):
     triggers = []
     for p in ari_profiles:
         if p["difficulty"] > 0.7:
-            triggers.append({"atom_id": p["atom_id"], "trigger": "HIGH_DIFFICULTY",
-                             "value": p["difficulty"]})
+            triggers.append({"atom_id": p["atom_id"], "trigger": "HIGH_DIFFICULTY", "value": p["difficulty"]})
     for f in frt:
         if f["weight"] > 0.2:
-            triggers.append({"theme": f["theme"], "trigger": "HIGH_FREQ_THEME",
-                             "value": f["weight"]})
+            triggers.append({"theme": f["theme"], "trigger": "HIGH_FREQ_THEME", "value": f["weight"]})
     return triggers
 
-# ─── SOE (SUBJECT-ORIENTED EXTRACT) ───
+# ─── SOE ───
 def build_soe(atoms, frt):
     return {"total_atoms": len(atoms), "total_themes": len(frt),
             "top_themes": sorted(frt, key=lambda x: -x["weight"])[:5]}
@@ -290,7 +329,6 @@ def run_gates(cap, vsp, sources, cep, da1, atoms, frt, qc, f1, f2, ari, triggers
     gates = []
     def gate(name, condition, evidence_ptr):
         gates.append({"gate": name, "verdict": "PASS" if condition else "FAIL", "evidence": evidence_ptr})
-
     gate("CHK_UI_EVENT_LOG", len(st.session_state.get("ui_events", [])) > 0, "ui_events")
     gate("CHK_NO_COUNTRY_BRANCHING", True, "core_invariant_by_design")
     gate("GATE_DA0", len(sources.get("source_manifest", [])) > 0, "source_manifest")
@@ -309,7 +347,6 @@ def run_gates(cap, vsp, sources, cep, da1, atoms, frt, qc, f1, f2, ari, triggers
 def run_pipeline(iso2):
     run_id = f"RUN_{iso2}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     log_event("PIPELINE_START", f"{iso2} / {run_id}")
-
     cap = discover_cap(iso2)
     vsp = validate_vsp(cap)
     sources = discover_sources(iso2, cap)
@@ -319,14 +356,12 @@ def run_pipeline(iso2):
     frt = compute_frt(atoms)
     qc = run_qc(atoms)
     soe = build_soe(atoms, frt)
-    f1 = FormulaEngine.compute_f1(atoms, frt, qc)
-    f2 = FormulaEngine.compute_f2(f1, compute_ari(atoms, qc), compute_triggers(compute_ari(atoms, qc), frt))
     ari = compute_ari(atoms, qc)
     triggers = compute_triggers(ari, frt)
+    f1 = FormulaEngine.compute_f1(atoms, frt, qc)
+    f2 = FormulaEngine.compute_f2(f1, ari, triggers)
     gate_report = run_gates(cap, vsp, sources, cep, da1, atoms, frt, qc, f1, f2, ari, triggers)
     fe_audit = FormulaEngine.self_audit()
-
-    # Artifacts
     artifacts = {}
     for name, data in [
         ("CAP_SEALED", cap), ("VSP_output", vsp), ("SourceManifest", sources["source_manifest"]),
@@ -339,22 +374,17 @@ def run_pipeline(iso2):
         ("CHK_REPORT", gate_report),
     ]:
         artifacts[name] = write_artifact(run_id, name, data)
-
-    # Determinism
     def pipeline_snapshot():
         return strip_volatile({"cap": cap, "vsp": vsp, "sources": sources["source_manifest"],
                                 "cep": cep, "atoms": atoms, "frt": frt, "qc": qc,
                                 "f1": f1, "f2": f2, "ari": ari, "triggers": triggers, "gates": gate_report})
     det = determinism_check(pipeline_snapshot)
     artifacts["DeterminismReport_3runs"] = write_artifact(run_id, "DeterminismReport_3runs", det)
-
-    # SealReport
     seal = {"run_id": run_id, "iso2": iso2, "global_verdict": gate_report["global_verdict"],
             "determinism_pass": det["pass"], "artifact_count": len(artifacts),
             "artifact_hashes": {k: v["sha256"] for k, v in artifacts.items()},
             "formula_engine_audit": fe_audit}
     artifacts["SealReport"] = write_artifact(run_id, "SealReport", seal)
-
     log_event("PIPELINE_END", run_id)
     return {
         "run_id": run_id, "cap": cap, "vsp": vsp, "sources": sources, "cep": cep,
@@ -368,7 +398,7 @@ def json_view(data, label=""):
     st.json(data if isinstance(data, (dict, list)) else {"value": data})
 
 def no_data_msg():
-    st.info("⏳ Activate a country to populate this tab.")
+    st.info("⏳ Activate a country from the sidebar to populate this tab.")
 
 # ─── MAIN ───
 def main():
@@ -380,32 +410,58 @@ def main():
     if "ui_events" not in st.session_state:
         st.session_state.ui_events = []
 
+    # ─── SIDEBAR: Country Activation ───
+    with st.sidebar:
+        st.markdown("### 🌍 Activate Country")
+        q = st.text_input("Type country name or ISO2", key="cc_query", placeholder="ex: France / FR")
+        pm, fb = typeahead(q, limit=20)
+        options = pm if pm else fb
+        labels = [f"{e['name']} ({e['code']})" for e in options]
+        cc = None
+        if labels:
+            choice = st.selectbox("Matches", options=labels, index=0)
+            cc = options[labels.index(choice)]["code"]
+        else:
+            if q and q.strip():
+                st.caption("No matches found.")
+            st.selectbox("Matches", options=["—"], disabled=True)
+
+        if st.button("🚀 ACTIVATE_COUNTRY", type="primary", use_container_width=True):
+            if cc and len(cc) == 2:
+                log_event("ACTIVATE_COUNTRY", cc)
+                with st.spinner(f"Running pipeline for {cc}..."):
+                    st.session_state.pipeline = run_pipeline(cc)
+                st.success(f"✅ {cc} activated")
+            else:
+                st.error("Select a valid country from the list.")
+
+        if st.session_state.pipeline:
+            st.divider()
+            st.markdown(f"**Active:** `{st.session_state.pipeline['seal']['iso2']}`")
+            st.markdown(f"**Verdict:** `{st.session_state.pipeline['seal']['global_verdict']}`")
+            st.markdown(f"**Run:** `{st.session_state.pipeline['run_id']}`")
+
+    # ─── 11 TABS ───
     tabs = st.tabs([
         "🛡️ Admin", "📦 CAP/VSP", "🔍 DA0/Sources", "📋 CEP/Pairs", "📄 Text/OCR",
         "🧬 Atoms", "🔧 FRT", "🔎 QC Explorer", "🚦 Gates", "📊 F1/F2", "📁 Artifacts"
     ])
 
-    # TAB 0: Admin
     with tabs[0]:
-        st.header("Admin — Activate Country")
-        iso2 = st.text_input("ISO2 Country Code (e.g. SN, FR, MA)", max_chars=2).strip().upper()
-        if st.button("🚀 ACTIVATE_COUNTRY", type="primary"):
-            if len(iso2) == 2 and iso2.isalpha():
-                log_event("ACTIVATE_COUNTRY", iso2)
-                with st.spinner(f"Running pipeline for {iso2}..."):
-                    st.session_state.pipeline = run_pipeline(iso2)
-                st.success(f"✅ Pipeline complete: {st.session_state.pipeline['run_id']}")
-            else:
-                st.error("Invalid ISO2 code.")
-        if st.session_state.pipeline:
+        st.header("Admin — Dashboard")
+        if not st.session_state.pipeline:
+            no_data_msg()
+        else:
             p = st.session_state.pipeline
             seal = p["seal"]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Global Verdict", seal["global_verdict"])
-            c2.metric("Determinism", "PASS" if p["determinism"]["pass"] else "FAIL")
-            c3.metric("Artifacts", seal["artifact_count"])
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Country", seal["iso2"])
+            c2.metric("Global Verdict", seal["global_verdict"])
+            c3.metric("Determinism", "PASS" if p["determinism"]["pass"] else "FAIL")
+            c4.metric("Artifacts", seal["artifact_count"])
+            st.subheader("FormulaEngine Self-Audit")
+            json_view(FormulaEngine.self_audit())
 
-    # TAB 1: CAP/VSP
     with tabs[1]:
         st.header("📦 CAP / VSP")
         if not st.session_state.pipeline:
@@ -417,7 +473,6 @@ def main():
             st.subheader("VSP")
             json_view(p["vsp"])
 
-    # TAB 2: DA0/Sources
     with tabs[2]:
         st.header("🔍 DA0 / Sources")
         if not st.session_state.pipeline:
@@ -431,7 +486,6 @@ def main():
             st.subheader("Strategy Log")
             json_view(p["sources"]["strategy_log"])
 
-    # TAB 3: CEP/Pairs
     with tabs[3]:
         st.header("📋 CEP / Pairs")
         if not st.session_state.pipeline:
@@ -439,7 +493,6 @@ def main():
         else:
             json_view(st.session_state.pipeline["cep"])
 
-    # TAB 4: Text/OCR
     with tabs[4]:
         st.header("📄 Text / OCR")
         if not st.session_state.pipeline:
@@ -451,7 +504,6 @@ def main():
                     st.text_area("Sujet", t["sujet_text"], height=80, key=f"s_{pid}", disabled=True)
                     st.text_area("Corrigé", t["corrige_text"], height=80, key=f"c_{pid}", disabled=True)
 
-    # TAB 5: Atoms
     with tabs[5]:
         st.header("🧬 Atoms (Qi / RQi)")
         if not st.session_state.pipeline:
@@ -459,7 +511,6 @@ def main():
         else:
             json_view(st.session_state.pipeline["atoms"])
 
-    # TAB 6: FRT
     with tabs[6]:
         st.header("🔧 FRT")
         if not st.session_state.pipeline:
@@ -467,7 +518,6 @@ def main():
         else:
             json_view(st.session_state.pipeline["frt"])
 
-    # TAB 7: QC Explorer
     with tabs[7]:
         st.header("🔎 QC Explorer")
         if not st.session_state.pipeline:
@@ -478,7 +528,6 @@ def main():
             st.metric("Valid / Total", f"{valid_count} / {len(qc)}")
             json_view(qc)
 
-    # TAB 8: Gates
     with tabs[8]:
         st.header("🚦 Gates")
         if not st.session_state.pipeline:
@@ -490,7 +539,6 @@ def main():
                 icon = "✅" if g["verdict"] == "PASS" else "❌"
                 st.write(f"{icon} **{g['gate']}** → {g['verdict']}  (evidence: `{g['evidence']}`)")
 
-    # TAB 9: F1/F2
     with tabs[9]:
         st.header("📊 F1 / F2")
         if not st.session_state.pipeline:
@@ -508,10 +556,7 @@ def main():
             json_view(p["ari"])
             st.subheader("Triggers")
             json_view(p["triggers"])
-            st.subheader("FormulaEngine Audit")
-            json_view(FormulaEngine.self_audit())
 
-    # TAB 10: Artifacts
     with tabs[10]:
         st.header("📁 Artifacts")
         if not st.session_state.pipeline:
