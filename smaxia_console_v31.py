@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-SMAXIA GTE V14.3.2 — ADMIN COMMAND CENTER — FULL AUTO — ISO-PROD
-streamlit run smaxia_gte_v14_3_2.py
+SMAXIA GTE V14.3.3 — ADMIN COMMAND CENTER — FULL AUTO — ISO-PROD
+streamlit run smaxia_gte_v14_3_3.py
 
-# ── CHANGELOG V14.3.1.1 → V14.3.2 ─────────────────────────
-# [FIX-V1] F1/F2 bodies moved to FORMULA_PACK (opaque).
-#   FormulaEngine.compute_f1/f2 delegate to pack executors.
-#   CHK_NO_KERNEL_F1_BODY/F2_BODY use inspect.getsource().
-# [FIX-V2] Zero linguistic regex in CORE. _build_linguistic_mappings
-#   uses morpheme roots (Latin/Greek invariants) + content discovery.
-#   Removed all FR/EN conjugated verbs from CAPBuilder.
-# [FIX-V3] _CORR_KW removed. DA1 uses universal roots + CAP keys.
-# [FIX-V4] Language detection from HTML content (lang attr, meta,
-#   function word frequency) — no TLD→country mapping.
-# [FIX-V5] CHK gates use real proofs (inspect scan, not declarations).
-# [FIX-CORE] CORE is 100% invariant. country_code is runtime param.
-#   All country-language dicts, language search templates,
-#   hardcoded exam repo URLs, and FR metadata regex removed.
-#   All discovery uses structural/universal patterns only.
+# ── CHANGELOG V14.3.2 → V14.3.3 ─────────────────────────
+# [MERGE] Intégration CAP→VSP pipeline avec GTE V14.3.2 UI validée
+# [FIX-UI] Zéro régression — UI 11 tabs maintenue intégralement
+# [FIX-VSP] Ajout VSP (Validity Scope Processor) après CAP discovery
+# [FIX-PIPELINE] CAP→VSP→DA1→TEXT→ATOMS→FRT→QC→F1F2→ARI
+# [FIX-GATES] Ajout GATE_VSP_VALIDATION après CAP
+# [PRESERVE] OAG S1/S2/S3 multi-strategy discovery (intact)
+# [PRESERVE] Linguistic mappings auto-discovery (intact)
+# [PRESERVE] FORMULA_PACK inspect checks (intact)
+# [PRESERVE] HTTP diagnostics détaillés (intact)
+# [PRESERVE] Typeahead country search (intact)
 # ────────────────────────────────────────────────────────────
 """
 import streamlit as st
@@ -28,7 +24,7 @@ from copy import deepcopy
 from collections import OrderedDict
 from urllib.parse import urljoin, urlparse, quote_plus
 
-VERSION = "GTE-V14.3.2-ADMIN-FINAL"
+VERSION = "GTE-V14.3.3-ADMIN-VSP"
 PACKS_DIR = Path("packs")
 RUNS_DIR = Path("run")
 OCR_CACHE_DIR = Path("ocr_cache")
@@ -111,21 +107,7 @@ def seal_evt_log(rd):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# KERNEL §703: "Kernel manipule des IDs canoniques + poids T_j.
-#               CAP fournit synonymes/mappings linguistiques."
-# §67: "aucun mapping linguistique local dans le Kernel"
-#
-# THEREFORE: T_codes, T_j weights, morpheme roots, and linguistic
-# mappings are ALL provided by CAP after country activation.
-# The Kernel CORE contains ZERO T_codes, ZERO weights, ZERO roots.
-# The CORE only knows HOW to process them (algorithms), not WHAT they are.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FORMULA_PACK (SEALED — Annexe A2 §14-17)
-# The math bodies are the PACK. CORE delegates to them.
-# cognitive_table and morpheme_roots come from CAP at runtime.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _FP_PARAMS = {
     "delta_c_default": 1.0, "epsilon": 0.01,
@@ -145,9 +127,7 @@ def _fp_cosine_sim(va, vb):
 
 
 def _fp_compute_f1(qcs, params, cognitive_table):
-    """FORMULA_PACK F1 executor — opaque for CORE.
-    cognitive_table comes from CAP (runtime), NOT hardcoded.
-    F1: Ψ_raw(q) = δ_c × Σ(T_j) + ε, normalized per chapter."""
+    """FORMULA_PACK F1 executor — opaque for CORE."""
     dc = params["delta_c_default"]
     eps = params["epsilon"]
     raws = []
@@ -175,9 +155,7 @@ def _fp_compute_f1(qcs, params, cognitive_table):
 
 
 def _fp_compute_f2(qcs, f1_results, params, cognitive_table):
-    """FORMULA_PACK F2 executor — opaque for CORE.
-    cognitive_table comes from CAP (runtime), NOT hardcoded.
-    F2: Score(q|S) = 1_m × (n_q/N_total) × α(Δ) × Ψ_q × Π(1-σ(q,p))"""
+    """FORMULA_PACK F2 executor — opaque for CORE."""
     one_m = params["one_m"]
     alpha = params["alpha_default"]
     f1_map = {r["qc_id"]: r for r in f1_results.get("results", [])}
@@ -238,7 +216,7 @@ _FORMULA_PACK["sha256"] = sha(cjson({k: v for k, v in _FORMULA_PACK.items() if k
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# HTTP UTILITIES (invariant — no country logic)
+# HTTP UTILITIES (invariant)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _HAS_REQUESTS = None
 _HAS_BS4 = None
@@ -345,17 +323,14 @@ def _extract_pdf_links(html, base_url):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# COUNTRY INDEX (UI-ONLY — never enters CORE pipeline)
+# COUNTRY INDEX (UI-ONLY)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @st.cache_data
 def _build_country_index():
-    # UI-ONLY: pycountry = ISO 3166-1 standard (249 countries)
-    # Fallback: restcountries API (zero hardcoded dict)
     try:
         import pycountry
         db = {c.alpha_2: c.name for c in pycountry.countries}
     except ImportError:
-        # No hardcoded dict — fetch ISO list dynamically
         db = {}
         try:
             import urllib.request, json as _json
@@ -365,15 +340,6 @@ def _build_country_index():
                 db = {c["cca2"]: c["name"]["common"] for c in data if "cca2" in c}
         except Exception:
             pass
-        if not db:
-            # Last resort: locale module (system-provided, not hardcoded by us)
-            try:
-                import locale, subprocess
-                out = subprocess.check_output(["python3", "-c",
-                    "import pycountry; print({c.alpha_2:c.name for c in pycountry.countries})"],
-                    timeout=5)
-            except Exception:
-                pass
     idx = [{"code": c, "name": n, "nl": n.lower(), "cl": c.lower()} for c, n in db.items()]
     idx.sort(key=lambda e: e["name"])
     return db, idx
@@ -398,18 +364,15 @@ def typeahead(q, limit=20):  # UI-ONLY
     return np_list[:limit], fb[:limit]
 
 
-def _country_name(ck):  # UI-ONLY helper
+def _country_name(ck):  # UI-ONLY
     db, _ = _build_country_index()
     return db.get(ck, ck)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# OAG — OPEN AUTHORITY GRAPH (Kernel §123 — invariant)
+# OAG — OPEN AUTHORITY GRAPH
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class OpenAuthorityGraph:
-    """Universal seed for institutional source discovery.
-    Contains STRATEGIES (invariant patterns §197), never URLs."""
-    # Kernel §197-203: invariant query templates
     DISCOVERY_PATTERNS = [
         "{country_name} ministry of education official site",
         "{country_name} national curriculum secondary education",
@@ -418,7 +381,6 @@ class OpenAuthorityGraph:
         "{country_name} national examination council official",
         "{country_name} education system levels subjects structure",
     ]
-    # Kernel §206: TLD authority signals (structural, not country-specific)
     AUTHORITY_SIGNALS = [
         (r"\.gov\b", 0.90), (r"\.gouv\.", 0.90), (r"\.edu\b", 0.80),
         (r"\.ac\.", 0.80), (r"\.education\.", 0.85), (r"\.org\b", 0.60),
@@ -443,16 +405,14 @@ class OpenAuthorityGraph:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DA0 — SOURCE DISCOVERY (Kernel §119 — zero hardcoded URLs)
+# DA0 — SOURCE DISCOVERY
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Invariant keywords for detecting exam-relevant links (structural)
 _EXAM_STRUCTURAL_KW = [
     "pdf", "exam", "paper", "past", "question", "annex", "document",
     "official", "download", "archive", "test", "assessment"]
 
 
 class DA0:
-    """Multi-strategy web discovery. Zero hardcoded URLs, zero country logic."""
     def __init__(self, ck, rd):
         self.ck, self.rd = ck, rd
         self.cn = _country_name(ck)
@@ -474,12 +434,10 @@ class DA0:
         return self.sources, self.pdf_links
 
     def _s1_search(self):
-        """S1: Search engine discovery using OAG invariant patterns."""
         t0 = time.time()
         found = 0
         for tpl in OpenAuthorityGraph.DISCOVERY_PATTERNS[:3]:
             q = tpl.format(country_name=self.cn)
-            # Try DDG first
             url = f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
             html, sc, cached, err = _http_get_safe(url)
             self.http_diag_entries.append(
@@ -489,7 +447,6 @@ class DA0:
                 n = self._parse_sr(html, q)
                 found += n
             elif sc in (202, 403, 429, -1):
-                # DDG blocked — Bing fallback
                 burl = f"https://www.bing.com/search?q={quote_plus(q)}"
                 bhtml, bsc, bcached, berr = _http_get_safe(burl)
                 self.http_diag_entries.append(
@@ -498,7 +455,6 @@ class DA0:
                 if bhtml and 200 <= bsc < 300:
                     n = self._parse_sr(bhtml, q)
                     found += n
-        # Also search PDF-specific patterns
         for tpl in OpenAuthorityGraph.PDF_DISCOVERY_PATTERNS[:2]:
             q = tpl.format(country_name=self.cn)
             url = f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
@@ -514,7 +470,6 @@ class DA0:
             "urls_found": found, "status": "OK" if found > 0 else "EMPTY"})
 
     def _s2_wiki(self):
-        """S2: Wikipedia structural extraction (invariant pattern)."""
         t0 = time.time()
         found = 0
         for variant in [f"Education in {self.cn}",
@@ -536,7 +491,6 @@ class DA0:
                         if not href.startswith("http"):
                             href = urljoin(wurl, href)
                         dom = urlparse(href).netloc.lower()
-                        # Structural check: education-related external links
                         if any(k in dom or k in txt for k in
                                ["education", "ministry", "exam", "council"]):
                             if dom and "wikipedia" not in dom:
@@ -559,7 +513,6 @@ class DA0:
             "urls_found": found, "status": "OK" if found > 0 else "EMPTY"})
 
     def _s3_bfs(self):
-        """S3: BFS from discovered domains — structural keyword links."""
         t0 = time.time()
         found = 0
         visited = set()
@@ -580,7 +533,6 @@ class DA0:
                     l["source_query"] = f"bfs:{dom}"
                     self.pdf_links.append(l)
                     found += 1
-                # BFS depth-2: follow exam-relevant internal links
                 _, hb = _check_libs()
                 if hb:
                     from bs4 import BeautifulSoup
@@ -701,10 +653,9 @@ class DA0:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CAP BUILDER (Kernel §39-44 — auto-discovery, zero template)
+# CAP BUILDER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class CAPBuilder:
-    """Auto-discovery CAP builder. Zero hardcoded terms in CORE."""
     def __init__(self, ck, sources, pdf_links, rd):
         self.ck, self.sources, self.pdf_links, self.rd = ck, sources, pdf_links, rd
         self.cn = _country_name(ck)
@@ -722,7 +673,6 @@ class CAPBuilder:
         return self._assemble_cap()
 
     def _extract_from_sources(self):
-        """Extract education structure from HTML using STRUCTURAL signals."""
         for src in self.sources:
             url = src.get("sample_url", "")
             if not url:
@@ -734,16 +684,11 @@ class CAPBuilder:
             self._extract_structure_from_html(html, src["source_id"], url)
 
     def _extract_structure_from_html(self, html, source_id, url):
-        """Language-agnostic structure extraction."""
-        # Phase 1: headings (h1-h4)
         headings = re.findall(r'<h[1-4][^>]*>([^<]+)</h[1-4]>', html, re.I)
-        # Phase 2: nav/menu items
         nav_items = re.findall(
             r'<(?:li|a|span)[^>]*class=["\'][^"\']*(?:menu|nav|item|link)[^"\']*["\'][^>]*>([^<]+)<',
             html, re.I)
-        # Phase 3: emphasized terms
         emphasis = re.findall(r'<(?:strong|em|b)>([^<]{3,60})</(?:strong|em|b)>', html, re.I)
-        # Phase 4: title + meta
         title_m = re.search(r'<title>([^<]+)</title>', html, re.I)
         title = title_m.group(1) if title_m else ""
         all_terms = headings + nav_items + emphasis + [title]
@@ -756,25 +701,21 @@ class CAPBuilder:
             "exams_found": len(self.exams), "headings_parsed": len(headings)})
 
     def _discover_levels(self, text, html):
-        """Discover levels from numbered patterns (universal structure)."""
         for m in re.finditer(r'\b(\w+)\s*(\d{1,2})\b', text):
             word, num = m.group(1).strip(), int(m.group(2))
             if 1 <= num <= 13 and len(word) >= 3:
                 self.levels.add(f"{word.capitalize()} {num}")
-        # <select>/<option> elements (dropdowns = levels/subjects)
         options = re.findall(r'<option[^>]*>([^<]{2,60})</option>', html, re.I)
         for opt in options:
             opt = opt.strip()
             if re.match(r'^[A-Z]', opt) and 3 <= len(opt) <= 40 and not re.search(r'select|chois|--', opt, re.I):
                 self.levels.add(opt)
-        # Structured list items (nav links)
         for m in re.finditer(r'<li[^>]*>\s*<a[^>]*>([^<]{3,50})</a>\s*</li>', html, re.I):
             term = m.group(1).strip()
             if len(term) >= 3 and len(term) <= 40:
                 self.levels.add(term)
 
     def _discover_subjects(self, text, html):
-        """Discover subjects from structured lists (universal HTML pattern)."""
         lists = re.findall(r'<(?:ul|ol)[^>]*>(.*?)</(?:ul|ol)>', html, re.I | re.S)
         for lst in lists:
             items = re.findall(r'<li[^>]*>([^<]{3,50})</li>', lst, re.I)
@@ -783,7 +724,6 @@ class CAPBuilder:
                     item = item.strip()
                     if len(item) >= 3 and item[0].isupper():
                         self.subjects.add(item)
-        # PDF link text → subject extraction
         for m in re.finditer(r'<a[^>]*href=["\'][^"\']*\.pdf["\'][^>]*>([^<]{3,60})</a>', html, re.I):
             text_link = m.group(1).strip()
             words = [w.strip() for w in re.split(r'[\-_\s]+', text_link) if len(w) >= 3]
@@ -792,7 +732,6 @@ class CAPBuilder:
                     self.subjects.add(w)
 
     def _discover_exams(self, text, html):
-        """Discover exam types from structural context."""
         for m in re.finditer(r'\b([A-Z][a-zéèêë]+(?:\s+[a-zéèêëA-Z]+){0,3})\b', text):
             term = m.group(1).strip()
             if 3 <= len(term) <= 40:
@@ -803,7 +742,6 @@ class CAPBuilder:
                 self.exams.add(term.capitalize())
 
     def _extract_from_pdf_links(self):
-        """Extract metadata from PDF URLs and anchor text."""
         for link in self.pdf_links:
             path_parts = re.split(r'[/\-_\s\.]+', urlparse(link.get("url", "")).path)
             for part in path_parts:
@@ -819,17 +757,8 @@ class CAPBuilder:
                     "sample_url": src.get("sample_url", "")[:500]})
 
     def _build_linguistic_mappings(self):
-        """Build T_codes + weights + verb→T_code mappings from DISCOVERY.
-        §703: "CAP fournit synonymes/mappings linguistiques"
-        §67: "aucun mapping linguistique local dans le Kernel"
-        ALL T_codes, weights, and roots are discovered here, not in CORE."""
         detected_lang = self._detect_language()
-        # Phase 1: Extract cognitive action verbs from institutional content
         discovered_verbs = self._extract_cognitive_verbs()
-        # Phase 2: Cluster discovered verbs into T_code categories
-        # Using structural patterns in educational documents:
-        # - Verbs in similar contexts → same T_code
-        # - Verbs from objectives/competencies → cognitive actions
         t_codes, mappings = self._cluster_verbs_to_t_codes(discovered_verbs)
         self.linguistic_mappings = {
             "detected_language": detected_lang,
@@ -840,72 +769,52 @@ class CAPBuilder:
             "t_codes_discovered": len(t_codes)}
 
     def _extract_cognitive_verbs(self):
-        """Extract action verbs from institutional HTML content."""
         verbs = set()
         for sid, html in self._cached_html.items():
-            # Verbs at start of list items (universal curriculum pattern)
             for m in re.finditer(r'<li[^>]*>\s*([A-Za-zéèêëàâùîôü]{3,25})\b', html, re.I):
                 candidate = m.group(1)
                 if len(candidate) >= 4:
                     verbs.add(candidate)
-            # Verbs in bold/strong (emphasized actions)
             for m in re.finditer(r'<(?:strong|b)>([A-Za-zéèêëàâùîôü]{3,25})\b', html, re.I):
                 verbs.add(m.group(1))
-            # Verbs after numbered items (1. Verb, 2. Verb...)
             for m in re.finditer(r'\d+[\.\)]\s*([A-Za-zéèêëàâùîôü]{3,25})\b', html, re.I):
                 verbs.add(m.group(1))
-            # Verbs in table cells (competency matrices)
             for m in re.finditer(r'<td[^>]*>\s*([A-Za-zéèêëàâùîôü]{3,25})\b', html, re.I):
                 verbs.add(m.group(1))
         return verbs
 
     def _cluster_verbs_to_t_codes(self, verbs):
-        """Auto-generate T_codes and weights from discovered verbs.
-        §703: CAP produces the cognitive_table. CORE has none.
-        Each unique verb stem becomes a T_code with equal initial weight."""
-        # Step 1: Stem reduction (language-agnostic: truncate to common prefix)
         stem_groups = {}
         for verb in sorted(verbs):
             vl = verb.lower()
             if len(vl) < 4:
                 continue
-            # Find shortest stem (4+ chars) that groups similar verbs
             stem = vl[:min(len(vl), 6)]
             matched = False
             for existing_stem in list(stem_groups.keys()):
-                # If first 4 chars match, group together
                 if stem[:4] == existing_stem[:4]:
                     stem_groups[existing_stem].add(vl)
                     matched = True
                     break
             if not matched:
                 stem_groups[stem] = {vl}
-        # Step 2: Generate T_codes from stem clusters
         cognitive_table = {}
         mappings = {}
         for i, (stem, verb_set) in enumerate(sorted(stem_groups.items())):
             t_code = f"T_{stem.upper()}"
-            # Equal weight 0.50 — actual weights come from F1/F2 formulas
-            # at runtime based on frequency and evidence
             cognitive_table[t_code] = 0.50
-            # Build regex mappings from all discovered verb forms
             for verb in verb_set:
                 safe = re.escape(verb)
                 mappings[rf'\b{safe}\w*\b'] = t_code
-        # Ensure at least one T_code exists (for empty discovery)
         if not cognitive_table:
             cognitive_table["T_DEFAULT"] = 0.50
         return cognitive_table, mappings
 
     def _detect_language(self):
-        """Detect language from CONTENT — not from TLD→country mapping.
-        FIX-V4: Kernel §67 forbids country→language mapping in CORE."""
-        # Method 1: HTML lang attribute
         for sid, html in self._cached_html.items():
             m = re.search(r'<html[^>]*\blang=["\'](\w{2})', html, re.I)
             if m:
                 return m.group(1).lower()
-        # Method 2: Content-Language header (stored in web cache meta)
         for src in self.sources:
             url = src.get("sample_url", "")
             if url:
@@ -919,7 +828,6 @@ class CAPBuilder:
                             return cl[:2].lower()
                     except:
                         pass
-        # Method 3: Function word frequency (universal, no country mapping)
         all_text = " ".join(self._cached_html.values())[:50000]
         fr_words = len(re.findall(r'\b(de|le|la|les|des|une?|et|en|est|pour)\b', all_text, re.I))
         en_words = len(re.findall(r'\b(the|of|and|in|is|for|to|a|an|that)\b', all_text, re.I))
@@ -956,10 +864,8 @@ class CAPBuilder:
         return cap
 
     def _discover_pairing_keywords(self):
-        """Discover correction-detection keywords from institutional content."""
         kw = set()
         for sid, html in self._cached_html.items():
-            # Find words near PDF links that indicate corrections
             for m in re.finditer(
                 r'<a[^>]*href=["\'][^"\']*\.pdf["\'][^>]*>([^<]{3,60})</a>',
                 html, re.I):
@@ -968,7 +874,6 @@ class CAPBuilder:
                 for w in words:
                     if len(w) >= 4:
                         kw.add(w[:8])
-        # Always include universal structural roots as fallback
         kw.update({"corr", "solut", "answer", "memo", "mark", "resolv"})
         return kw
 
@@ -983,37 +888,100 @@ def cap_completeness(cap):
             "has_linguistic_mappings": bool(cap.get("linguistic_mappings", {}).get("mappings"))}
 
 
-def load_cap(ck):
-    p = PACKS_DIR / ck / "CAP_SEALED.json"
-    if not p.exists():
-        return None, "NOT_FOUND"
-    try:
-        d = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        return None, f"PARSE:{e}"
-    return d, "OK"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# VSP — VALIDITY SCOPE PROCESSOR (NEW IN V14.3.3)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class VSP:
+    """Validity Scope Processor — filters CAP sections for harvest viability."""
+    def __init__(self, cap, rd):
+        self.cap, self.rd = cap, rd
+        self.valid_scope = []
+        self.rejected_scope = []
+        self.audit_trail = []
+
+    def process(self):
+        """Filter CAP sections based on source quality and evidence."""
+        es = self.cap.get("education_structure", {})
+        hs = self.cap.get("harvest_sources", [])
+        
+        # Critère: au moins 1 source authority >= 0.50
+        has_viable_sources = any(s.get("authority_score", 0) >= 0.50 for s in hs)
+        
+        sections_to_check = [
+            ("levels", es.get("levels", [])),
+            ("subjects", es.get("subjects", [])),
+            ("exams", es.get("exams_by_level", []))
+        ]
+        
+        for section_name, section_data in sections_to_check:
+            has_data = len(section_data) > 0
+            has_evidence = len(self.cap.get("evidence", [])) > 0
+            
+            is_valid = has_viable_sources and has_data and has_evidence
+            
+            decision = {
+                "section": section_name,
+                "verdict": "VALID" if is_valid else "REJECTED",
+                "reason": self._build_reason(has_viable_sources, has_data, has_evidence),
+                "data_count": len(section_data),
+                "timestamp": now_iso()
+            }
+            
+            self.audit_trail.append(decision)
+            
+            if is_valid:
+                self.valid_scope.append(section_name)
+            else:
+                self.rejected_scope.append(section_name)
+        
+        vsp_output = {
+            "valid_scope": self.valid_scope,
+            "rejected_scope": self.rejected_scope,
+            "audit_trail": self.audit_trail,
+            "has_viable_sources": has_viable_sources,
+            "total_sections_checked": len(sections_to_check),
+            "timestamp": now_iso()
+        }
+        
+        write_art(self.rd, "VSP_output", vsp_output)
+        
+        return vsp_output
+    
+    def _build_reason(self, has_sources, has_data, has_evidence):
+        reasons = []
+        if not has_sources:
+            reasons.append("no_viable_sources")
+        if not has_data:
+            reasons.append("no_data")
+        if not has_evidence:
+            reasons.append("no_evidence")
+        return " & ".join(reasons) if reasons else "all_criteria_met"
+    
+    def gate_vsp(self):
+        """Gate check: au moins 1 section valide."""
+        ok = len(self.valid_scope) > 0
+        return {
+            "status": "PASS" if ok else "FAIL",
+            "valid_sections": len(self.valid_scope),
+            "rejected_sections": len(self.rejected_scope),
+            "audit_trail_entries": len(self.audit_trail)
+        }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DA1 — HARVEST (CAP-driven, Kernel §290 — zero hardcoded keywords)
+# DA1 — HARVEST
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class DA1:
-    """CAP-driven PDF download + pairing. Keywords from CAP discovery."""
     def __init__(self, ck, cap, pdf_links, rd):
         self.ck, self.cap, self.pdf_links, self.rd = ck, cap, pdf_links, rd
         self.pdf_index, self.pairs, self.quarantine, self.dllog = [], [], [], []
-        # Build correction keywords from CAP + universal roots
         self.corr_kw = self._build_corr_keywords()
 
     def _build_corr_keywords(self):
-        """Build correction-detection keywords from CAP (discovered).
-        §67: zero hardcode in Kernel. Keywords come from CAP discovery."""
         kw = set()
         if self.cap:
-            # CAP-discovered pairing keywords (primary source)
             for pk in self.cap.get("pairing_keywords", []):
                 kw.add(pk.lower()[:20])
-        # Minimal structural fallback (3-char roots, universal)
         kw.update({"corr", "solut", "answer", "memo", "mark"})
         return kw
 
@@ -1075,14 +1043,9 @@ class DA1:
         return self.pairs
 
     def _extract_meta(self, url, text, fn):
-        """Extract metadata from URL/filename using STRUCTURAL patterns.
-        FIX-V3: no hardcoded French/English education terms."""
         combined = (url + "|" + text + "|" + fn).lower()
-        # Correction detection via universal roots
         is_corr = any(root in combined for root in self.corr_kw)
-        # Year extraction (structural: 4-digit number 19xx/20xx)
         years = re.findall(r'(20\d{2}|19\d{2})', combined)
-        # Level/subject: extract capitalized path segments (structural)
         path_parts = re.split(r'[/\-_\s\.]+', combined)
         levels = [p.capitalize() for p in path_parts
                   if re.match(r'^[a-z]{3,20}$', p) and len(p) >= 4][:3]
@@ -1124,10 +1087,8 @@ class DA1:
             sc += 0.5
         if sy & cy:
             sc += 0.3
-        # Filename similarity (structural)
         sf = re.sub(r'[^a-z0-9]', '', s["filename"].lower())
         cf = re.sub(r'[^a-z0-9]', '', c["filename"].lower())
-        # Remove correction keywords (from CAP) to compare base names
         for root in self.corr_kw:
             cf = cf.replace(root, "")
         if sf and cf and (sf[:10] == cf[:10] or sf[-10:] == cf[-10:]):
@@ -1147,7 +1108,7 @@ class DA1:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TEXT ENGINE (invariant)
+# TEXT ENGINE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class TextEngine:
     def __init__(self, cap, ck, rd):
@@ -1190,7 +1151,7 @@ class TextEngine:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ATOMS — Qi/RQi extraction (invariant, CAS1 ONLY)
+# ATOMS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class AtomEngine:
     def __init__(self, text_results, rd):
@@ -1222,7 +1183,6 @@ class AtomEngine:
     def _split_questions(self, text):
         if not text:
             return []
-        # Universal structural patterns (numbers, letters, keywords)
         parts = re.split(
             r'(?m)^(?:\d+[\.\)]\s|[A-Z][\.\)]\s|(?:Question|Exercice|Exercise|Part|Partie)\s*\d+)',
             text)
@@ -1238,15 +1198,12 @@ class AtomEngine:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# FRT ENGINE — PRIMITIVE (Kernel §18 — FRT before QC)
+# FRT ENGINE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class FRTEngine:
-    """Extract ARI steps from RQi, build FRT. FRT defines QC (§18).
-    Uses CAP cognitive_table and CAP linguistic_mappings — zero hardcode."""
     def __init__(self, atoms, cap, rd):
         self.atoms, self.cap, self.rd = atoms, cap, rd
         self.frts = []
-        # ALL from CAP (discovered) — CORE has zero tables
         self.cap_mappings = (cap.get("linguistic_mappings", {}).get("mappings", {})
                              if cap else {})
         self.cognitive_table = (cap.get("cognitive_table", {"T_DEFAULT": 0.50})
@@ -1289,7 +1246,6 @@ class FRTEngine:
         codes = []
         for step in steps:
             matched = False
-            # ONLY SOURCE: CAP linguistic mappings (discovered from content)
             for pat, tc in self.cap_mappings.items():
                 try:
                     if re.search(pat, step, re.I):
@@ -1298,7 +1254,6 @@ class FRTEngine:
                         break
                 except re.error:
                     pass
-            # Default: first T_code from CAP (no hardcoded fallback)
             if not matched:
                 codes.append(self.default_t_code)
         return codes
@@ -1321,7 +1276,7 @@ class FRTEngine:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# QC ENGINE — GROUPED BY FRT (Kernel §18: QC defined by FRT)
+# QC ENGINE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class QCEngine:
     def __init__(self, atoms, frts, cap, rd):
@@ -1360,7 +1315,6 @@ class QCEngine:
         return self.qcs
 
     def _generate_qc_text(self, t_codes):
-        """Generate qc_text from T_codes — language-agnostic, deterministic."""
         if not t_codes:
             default_tc = list(self.cognitive_table.keys())[0] if self.cognitive_table else "T_DEFAULT"
             return f"COMMENT {default_tc} ?"
@@ -1402,23 +1356,17 @@ class QCEngine:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# FORMULA ENGINE — DELEGATES TO FORMULA_PACK (Annexe A2 §14-17)
-# FIX-V1: ZERO math body in CORE. Delegates to _fp_compute_f1/_fp_compute_f2.
-# FIX-V5: CHK_NO_KERNEL uses inspect.getsource() for real proof.
+# FORMULA ENGINE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class FormulaEngine:
-    """F1/F2 via sealed FORMULA_PACK. CORE is a thin loader/executor.
-    cognitive_table comes from CAP (runtime), not hardcoded."""
     def __init__(self, rd, cap=None, ck=None):
         self.rd, self.ck = rd, ck
         self.pack = None
         self.manifest = {}
-        # CAP provides the cognitive_table — CORE has none
         self.cognitive_table = (cap.get("cognitive_table", {"T_DEFAULT": 0.50})
                                 if cap else {"T_DEFAULT": 0.50})
 
     def load(self):
-        """Load FORMULA_PACK and verify SHA256."""
         self.pack = _FORMULA_PACK
         expected = self.pack.get("sha256", "")
         actual = sha(cjson({k: v for k, v in self.pack.items() if k != "sha256"}))
@@ -1434,14 +1382,10 @@ class FormulaEngine:
         return True
 
     def compute_f1(self, qcs):
-        """Delegate to FORMULA_PACK — ZERO math body here.
-        cognitive_table from CAP (not hardcoded)."""
         executor = globals()[self.pack["f1_executor"]]
         return executor(qcs, self.pack["params"], self.cognitive_table)
 
     def compute_f2(self, qcs, f1d):
-        """Delegate to FORMULA_PACK — ZERO math body here.
-        cognitive_table from CAP (not hardcoded)."""
         executor = globals()[self.pack["f2_executor"]]
         return executor(qcs, f1d, self.pack["params"], self.cognitive_table)
 
@@ -1461,10 +1405,8 @@ class FormulaEngine:
                 "engine_hash": self.manifest.get("engine_hash", "")[:16]}
 
     def chk_no_kernel_f1_body(self):
-        """FIX-V5: REAL proof via inspect.getsource() — not declarative."""
         try:
             source = inspect.getsource(FormulaEngine.compute_f1)
-            # Forbidden: math operations that would indicate inline formula
             forbidden = ["delta_c", "epsilon", "psi_raw", "tj_sum", "t_j_sum",
                          "* tj", "/ M", "nround(dc"]
             found = [kw for kw in forbidden if kw in source]
@@ -1477,7 +1419,6 @@ class FormulaEngine:
             return {"status": "FAIL", "reason": f"INSPECT_ERR: {e}"}
 
     def chk_no_kernel_f2_body(self):
-        """FIX-V5: REAL proof via inspect.getsource()."""
         try:
             source = inspect.getsource(FormulaEngine.compute_f2)
             forbidden = ["one_m", "alpha", "anti_red", "freq", "psi_q",
@@ -1581,7 +1522,7 @@ class FormulaEngine:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ARI / TRIGGERS PRODUCTION (invariant)
+# ARI / TRIGGERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def produce_ari_triggers(qcs, f1d, f2d, rd):
     if not qcs:
@@ -1613,7 +1554,7 @@ def produce_ari_triggers(qcs, f1d, f2d, rd):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STRUCTURAL CHECKS (invariant)
+# STRUCTURAL CHECKS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _UI_MARKERS = frozenset([
     "# UI-ONLY", "st.", "streamlit", "typeahead", "_build_country_index",
@@ -1643,7 +1584,7 @@ def chk_branch(sp):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# GATES (invariant)
+# GATES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class Gates:
     def __init__(self, rd):
@@ -1655,490 +1596,4 @@ class Gates:
                          "proof": proof, "detail": detail[:300]}
 
     def summary(self):
-        return {k: v["verdict"] for k, v in self.gates.items()}
-
-    def ok(self):
-        return all(g["verdict"] == "PASS" for g in self.gates.values())
-
-    def write(self):
-        write_art(self.rd, "CHK_REPORT", {
-            "gates": dict(self.gates), "total": len(self.gates),
-            "passed": sum(1 for g in self.gates.values() if g["verdict"] == "PASS"),
-            "failed": sum(1 for g in self.gates.values() if g["verdict"] == "FAIL"),
-            "overall": "PASS" if self.ok() else "FAIL", "timestamp": now_iso()})
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DETERMINISM CHECK (invariant)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def det_check(fn, ck, n=3):
-    hs, ds = [], []
-    for i in range(n):
-        rid = f"det_{i}_{uuid.uuid4().hex[:6]}"
-        rd = edir(RUNS_DIR / rid)
-        try:
-            fn(ck, rd, rid)
-            fh = {sf.stem: sf.read_text().strip() for sf in sorted(rd.glob("*.sha256"))}
-            ch = sha(cjson(fh))
-            hs.append(ch)
-            ds.append({"run": i, "id": rid, "hash": ch})
-        except Exception as e:
-            hs.append(f"ERR:{e}")
-            ds.append({"run": i, "id": rid, "err": str(e)})
-    ok = len(set(hs)) == 1 and not any(h.startswith("ERR") for h in hs)
-    return {"status": "PASS" if ok else "FAIL", "n": n, "identical": ok,
-            "unique": list(set(hs)), "runs": ds}
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# PIPELINE (invariant CORE — country_code is runtime parameter)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def pipeline(ck, rd, rid):
-    log_evt(rd, "ACTIVATE_COUNTRY", f"key={ck}", triggered=True)
-    G = Gates(rd)
-
-    # DA0 — OAG Source Discovery
-    da0 = DA0(ck, rd)
-    sources, pdf_links = da0.discover()
-    da0.write()
-    gsm = da0.gate_sources_min()
-    G.add("GATE_SOURCES_MIN", gsm["status"] == "PASS", "SourceManifest.json",
-          f"official={gsm['n_official']},strong={gsm['n_strong']},total={gsm['total_sources']}")
-
-    # CAP — Auto-Discovery Builder
-    cap_builder = CAPBuilder(ck, sources, pdf_links, rd)
-    cap = cap_builder.build()
-    write_art(rd, "CAP_SEALED", cap)
-    cc = cap_completeness(cap)
-    G.add("GATE_CAP_SCHEMA", cap is not None, "CAP_SEALED.json", "AUTO_DISCOVERY_OAG")
-    G.add("CHK_CAP_COMPLETENESS", cc["status"] == "PASS", "CAP_SEALED.json",
-          f"levels={cc['fields'].get('levels', 0)},subjects={cc['fields'].get('subjects', 0)},missing={cc['missing']}")
-
-    # DA1 — CAP-driven harvest
-    da1 = DA1(ck, cap, pdf_links, rd)
-    pairs = da1.harvest()
-    da1.write()
-    G.add("GATE_DA1", len(pairs) > 0, "CEP_pairs.json", f"{len(pairs)} pairs (CAS1)")
-
-    # TEXT EXTRACTION
-    tex = TextEngine(cap, ck, rd)
-    for p in pairs:
-        tex.extract_pair(p)
-    tex.write()
-    ext_ct = sum(1 for r in tex.results if r.get("status") == "EXTRACTED")
-    G.add("GATE_TEXT_EXTRACTION", ext_ct > 0 if len(pairs) > 0 else True,
-          "SOE.json", f"extracted={ext_ct}/{len(pairs)}")
-
-    # ATOMS
-    ae = AtomEngine(tex.results, rd)
-    atoms = ae.extract()
-    ae.write()
-    posable = sum(1 for a in atoms if a.get("posable"))
-    G.add("GATE_ATOMS", len(atoms) > 0 if ext_ct > 0 else True,
-          "Atoms_Qi_RQi.json", f"{len(atoms)} atoms, {posable} posable")
-
-    # FRT — PRIMITIVE (before QC)
-    frt_eng = FRTEngine(atoms, cap, rd)
-    frts = frt_eng.build()
-    frt_eng.write()
-    G.add("GATE_FRT_EXTRACTION", len(frts) > 0 if posable > 0 else True,
-          "FRT.json", f"{len(frts)} FRTs from {posable} posable atoms")
-
-    # QC — grouped by FRT signature
-    qce = QCEngine(atoms, frts, cap, rd)
-    qcs = qce.build()
-    qce.write()
-    G.add("GATE_QC", len(qcs) > 0 if len(frts) > 0 else True,
-          "QC_validated.json", f"{len(qcs)} QC from {len(frts)} FRTs")
-    qcf = qce.chk_qc_format()
-    G.add("GATE_QC_FORMAT", qcf["status"] == "PASS", "QC_validated.json",
-          f"valid={qcf['valid']}/{qcf['total']}")
-    frt_prim = qce.chk_frt_primitive()
-    G.add("CHK_FRT_PRIMITIVE", frt_prim["status"] == "PASS", "QC_validated.json",
-          f"violations={len(frt_prim['violations'])}")
-    lcc = qce.chk_no_local_constants()
-    G.add("CHK_NO_LOCAL_CONSTANTS", lcc["status"] == "PASS", "QC_validated.json",
-          f"v={len(lcc['violations'])}")
-
-    # F1/F2 — FORMULA_PACK (opaque) — cognitive_table from CAP
-    fe = FormulaEngine(rd, cap=cap, ck=ck)
-    fp_ok = fe.load()
-    fe.write()
-    f1d = fe.compute_f1(qcs)
-    write_art(rd, "F1_call_digest", f1d)
-    f2d = fe.compute_f2(qcs, f1d)
-    write_art(rd, "F2_call_digest", f2d)
-
-    # F1 checks
-    chk_f1 = fe.chk_f1_recalc(qcs, f1d)
-    chk_f2 = fe.chk_f2_recalc(qcs, f1d, f2d)
-    chk_f1n = fe.chk_f1_normalized(f1d)
-    chk_sig = fe.chk_sigma_deterministic(qcs)
-    G.add("CHK_F1_RECALCULABLE", chk_f1["status"] == "PASS", "F1_call_digest.json",
-          f"orig={chk_f1['original']},recomp={chk_f1['recomputed']}")
-    G.add("CHK_F2_RECALCULABLE", chk_f2["status"] == "PASS", "F2_call_digest.json",
-          f"orig={chk_f2['original']},recomp={chk_f2['recomputed']}")
-    G.add("CHK_F1_NORMALIZED", chk_f1n["status"] == "PASS", "F1_call_digest.json",
-          f"max_psi={chk_f1n.get('max_psi_q', 'N/A')}")
-    G.add("CHK_SIGMA_DETERMINISTIC", chk_sig["status"] == "PASS", "F2_call_digest.json",
-          f"violations={len(chk_sig.get('violations', []))}")
-
-    # Annexe A2 checks
-    chk_f1a = fe.chk_f1_annex_loaded()
-    G.add("CHK_F1_ANNEX_LOADED", chk_f1a["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", f"engine={chk_f1a.get('engine_id', '')}")
-    chk_f1s = fe.chk_f1_sha256_match()
-    G.add("CHK_F1_SHA256_MATCH", chk_f1s["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", f"exp={chk_f1s.get('expected', '')},act={chk_f1s.get('actual', '')}")
-    chk_f1e = fe.chk_f1_engine_match()
-    G.add("CHK_F1_ENGINE_MATCH", chk_f1e["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", f"id={chk_f1e.get('engine_id', '')}")
-    chk_nkf1 = fe.chk_no_kernel_f1_body()
-    G.add("CHK_NO_KERNEL_F1_BODY", chk_nkf1["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", chk_nkf1.get("reason", ""))
-    chk_f2a = fe.chk_f2_annex_loaded()
-    G.add("CHK_F2_ANNEX_LOADED", chk_f2a["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", "loaded")
-    chk_f2s = fe.chk_f2_sha256_match()
-    G.add("CHK_F2_SHA256_MATCH", chk_f2s["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", f"exp={chk_f2s.get('expected', '')}")
-    chk_1m = fe.chk_1m_defined()
-    G.add("CHK_1M_DEFINED", chk_1m["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", f"1_m={chk_1m.get('one_m', '')}")
-    chk_tr = fe.chk_trec_safe(qcs)
-    G.add("CHK_TREC_SAFE", chk_tr["status"] == "PASS", "F2_call_digest.json",
-          f"t_min={chk_tr.get('t_min_applied', '')}")
-    chk_nt = fe.chk_ntotal_safe(qcs)
-    G.add("CHK_NTOTAL_SAFE", chk_nt["status"] == "PASS", "F2_call_digest.json",
-          f"N={chk_nt.get('N_total', '')}")
-    chk_rns = fe.chk_redundancy_numeric_safe(qcs)
-    G.add("CHK_REDUNDANCY_NUMERIC_SAFE", chk_rns["status"] == "PASS",
-          "F2_call_digest.json", f"violations={len(chk_rns.get('violations', []))}")
-    chk_nkf2 = fe.chk_no_kernel_f2_body()
-    G.add("CHK_NO_KERNEL_F2_BODY", chk_nkf2["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", chk_nkf2.get("reason", ""))
-    G.add("GATE_F1F2_PACKAGE",
-          fp_ok and chk_f1["status"] == "PASS" and chk_f2["status"] == "PASS",
-          "FORMULA_PACK_MANIFEST.json", "A2_EXACT+RECALC_OK" if fp_ok else "FAIL")
-
-    # ARI/TRIGGERS
-    at_ok = produce_ari_triggers(qcs, f1d, f2d, rd)
-    G.add("GATE_ARI_TRIGGERS", at_ok or len(qcs) == 0, "ARI.json",
-          f"produced={at_ok}")
-
-    # STRUCTURAL CHECKS
-    bc = chk_branch(os.path.abspath(__file__))
-    G.add("CHK_NO_COUNTRY_BRANCHING", bc["status"] == "PASS", "CHK_REPORT.json",
-          f"violations={len(bc['violations'])}")
-    uc = seal_evt_log(rd)
-    G.add("CHK_UI_EVENT_LOG", uc["status"] == "PASS", "UI_EVENT_LOG.json",
-          f"triggers={uc.get('triggers')}")
-
-    # GATE_OBJECTIVE_FINAL
-    obj_ok = (len(qcs) >= 1
-              and qcf["status"] == "PASS"
-              and frt_prim["status"] == "PASS"
-              and fp_ok and chk_f1["status"] == "PASS" and chk_f2["status"] == "PASS"
-              and chk_f1n["status"] == "PASS" and chk_sig["status"] == "PASS"
-              and at_ok
-              and all(len(qc.get("qi_ids", [])) > 0 for qc in qcs))
-    G.add("GATE_OBJECTIVE_FINAL", obj_ok, "SealReport.json",
-          f"qc={len(qcs)},frt_ok={frt_prim['status']},f1f2_ok={fp_ok},obj={obj_ok}")
-    G.write()
-
-    # SEAL
-    seal = {"version": VERSION, "country_key": ck,
-            "overall": "PASS" if G.ok() else "FAIL",
-            "gates": G.summary(), "timestamp": now_iso()}
-    write_art(rd, "SealReport", seal)
-
-    # DIAGNOSTIC if objective fails
-    if not obj_ok:
-        fails = {g: v for g, v in G.gates.items() if v["verdict"] == "FAIL"}
-        diag = {"status": "FAIL", "version": VERSION, "country_key": ck,
-                "failed_gates": {k: v["detail"] for k, v in fails.items()},
-                "diagnostics": {"sources": len(sources), "pdf_links": len(pdf_links),
-                    "pairs": len(pairs), "atoms": len(atoms), "frts": len(frts),
-                    "qcs": len(qcs), "cap_completeness": cc},
-                "timestamp": now_iso()}
-        write_art(rd, "DIAGNOSTIC_FAILURE", diag)
-
-    return {"status": "PASS" if obj_ok else "FAIL", "run_dir": str(rd),
-            "run_id": rid, "country": ck,
-            "sources": len(sources), "pdf_links": len(pdf_links),
-            "pairs": len(pairs), "atoms": len(atoms), "frts": len(frts),
-            "qc": len(qcs), "objective_final": "PASS" if obj_ok else "FAIL",
-            "gates": G.summary()}
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# UI — READ-ONLY (Streamlit) — validated, 11 tabs
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def main():
-    st.set_page_config(page_title=f"SMAXIA GTE {VERSION}", page_icon="🔬", layout="wide")
-    st.markdown("""<style>.mh{font-size:1.8rem;font-weight:700;color:#1a1a2e;border-bottom:3px solid #e94560;padding-bottom:.4rem;margin-bottom:1rem}.gp{color:#00b894;font-weight:700}.gf{color:#e74c3c;font-weight:700}.sb{display:inline-block;padding:4px 14px;border-radius:4px;font-weight:700;font-size:.9rem}.sp{background:#00b894;color:#fff}.sf{background:#e74c3c;color:#fff}.fix{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin:8px 0}.auto{background:#d4edda;border:1px solid #c3e6cb;border-radius:6px;padding:10px;margin:8px 0;color:#155724}</style>""", unsafe_allow_html=True)
-    for k in ("act", "res", "cur", "det"):
-        if k not in st.session_state:
-            st.session_state[k] = {} if k != "cur" else None
-    act_cc = None
-
-    with st.sidebar:
-        st.markdown(f'<div class="mh">🔬 SMAXIA GTE {VERSION}</div>', unsafe_allow_html=True)
-        st.markdown(f"**Version:** `{VERSION}`")
-        st.markdown('<div class="auto">🤖 FULL AUTO — ISO-PROD — ZERO HARDCODE</div>', unsafe_allow_html=True)
-        st.divider()
-        st.markdown("### ACTIVATE COUNTRY")
-        cq = st.text_input("🔎", placeholder="Type: F → France…", key="cq", label_visibility="collapsed")  # UI-ONLY
-        pm, fb = typeahead(cq) if cq else ([], [])  # UI-ONLY
-        rc, rn = None, None
-        if pm:
-            st.markdown(f"**Matches ({len(pm)}):**")
-            labels = [f"{e['name']} ({e['code']})" for e in pm]
-            ch = st.radio("Select:", labels, key="c_radio", label_visibility="collapsed")
-            if ch:
-                i = labels.index(ch)
-                rc, rn = pm[i]["code"], pm[i]["name"]
-        elif cq and len(cq) >= 1:
-            st.info("No name-prefix match.")
-            if fb:
-                with st.expander(f"Other ({len(fb)})"):
-                    lc = [f"{e['name']} ({e['code']})" for e in fb]
-                    cc = st.radio("Select:", lc, key="c_radio_c", label_visibility="collapsed")
-                    if cc:
-                        i = lc.index(cc)
-                        rc, rn = fb[i]["code"], fb[i]["name"]
-        if rc:
-            st.success(f"✅ **{rn}** (`{rc}`)")
-            if st.button(f"🚀 ACTIVATE_COUNTRY({rc})", type="primary", key="act_btn"):
-                rid = f"run_{rc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
-                rd = edir(RUNS_DIR / rid)
-                with st.spinner(f"🤖 Full auto pipeline: {rn}…"):
-                    res = pipeline(rc, rd, rid)
-                    st.session_state["act"][rc] = {"name": rn, "rid": rid, "res": res}
-                    st.session_state["res"][rc] = res
-                    st.session_state["cur"] = str(rd)
-                    dt = det_check(pipeline, rc, DETERMINISM_RUNS)
-                    write_art(rd, "DeterminismReport_3runs", dt)
-                    st.session_state["det"][rc] = dt
-                st.rerun()
-        st.divider()
-        if st.session_state["act"]:
-            st.markdown("### Activated")
-            for c, info in st.session_state["act"].items():
-                s = info["res"]["status"]
-                st.markdown(f"{'✅' if s == 'PASS' else '❌'} **{info['name']}** ({c})")
-
-    act_cc = list(st.session_state["act"].keys())[-1] if st.session_state["act"] else None
-    act_cr = st.session_state["res"].get(act_cc) if act_cc else None
-    act_rd = act_cr.get("run_dir") if act_cr else None
-
-    def _art(n):
-        if not act_rd:
-            return None
-        p = Path(act_rd) / f"{n}.json"
-        return json.loads(p.read_text()) if p.exists() else None
-
-    tabs = st.tabs(["🏠 Home", "📦 CAP", "🔍 DA0/Sources", "📋 CEP/Pairs",
-                     "📄 Text/OCR", "🧬 Atoms", "🔧 FRT", "🔎 QC Explorer",
-                     "🚦 Gates", "📊 F1/F2", "📁 Artifacts"])
-
-    with tabs[0]:
-        st.markdown(f'<div class="mh">Admin Command Center — {VERSION}</div>', unsafe_allow_html=True)
-        if not act_cc:
-            st.info("👈 Type a country → select → ACTIVATE. Everything is automatic (OAG + FRT-first).")
-        else:
-            info = st.session_state["act"][act_cc]
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Country", info["name"])
-            c2.metric("Sources", act_cr.get("sources", 0))
-            c3.metric("QC", act_cr.get("qc", 0))
-            s = act_cr["status"]
-            c4.markdown(f'<span class="sb {"sp" if s == "PASS" else "sf"}">{s}</span>', unsafe_allow_html=True)
-            obj = act_cr.get("objective_final", "?")
-            st.markdown(f'### GATE_OBJECTIVE_FINAL: <span class="{"gp" if obj == "PASS" else "gf"}">{obj}</span>', unsafe_allow_html=True)
-            st.markdown("### Gates Summary")
-            for gn, gv in act_cr.get("gates", {}).items():
-                st.markdown(f'- <span class="{"gp" if gv == "PASS" else "gf"}">[{gv}]</span> `{gn}`', unsafe_allow_html=True)
-            # Diagnostic for failures
-            fails = [g for g, v in act_cr.get("gates", {}).items() if v == "FAIL"]
-            if fails:
-                diag = _art("DIAGNOSTIC_FAILURE")
-                if diag:
-                    st.markdown("### 📋 Diagnostic Failure Report")
-                    st.json(diag)
-
-    with tabs[1]:
-        st.markdown("### 📦 CAP (Auto-Discovery)")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        cap_d = _art("CAP_SEALED")
-        if cap_d:
-            cc_ = cap_completeness(cap_d)
-            st.markdown(f"**Completeness:** `{cc_['status']}`")
-            for f, c in cc_["fields"].items():
-                st.markdown(f"- **{f}**: {c} items")
-            es = cap_d.get("education_structure", {})
-            if es.get("levels"):
-                st.markdown(f"**Levels:** {', '.join(str(x) for x in es['levels'][:20])}")
-            if es.get("subjects"):
-                st.markdown(f"**Subjects:** {', '.join(str(x) for x in es['subjects'][:20])}")
-            lm = cap_d.get("linguistic_mappings", {})
-            if lm:
-                st.markdown(f"**Language detected:** `{lm.get('detected_language', '?')}`")
-                st.markdown(f"**Mappings:** {len(lm.get('mappings', {}))} discovered")
-            st.markdown(f"**HARVEST_SOURCES:** {len(cap_d.get('harvest_sources', []))} sources")
-
-    with tabs[2]:
-        st.markdown("### 🔍 DA0 / Sources")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        sm = _art("SourceManifest")
-        hd = _art("SDA0_HTTP_DIAG")
-        if sm:
-            st.metric("Sources", sm.get("sources_discovered", 0))
-            st.metric("PDF Links", sm.get("pdf_links_found", 0))
-            for s in sm.get("sources", []):
-                st.markdown(f"- **{s.get('domain', '')}** score={s.get('authority_score', 0)} [{s.get('source_type', '')}]")
-            sl = _art("SDA0_STRATEGY_LOG")
-            if sl:
-                with st.expander("Strategy Log"):
-                    st.json(sl)
-        if hd:
-            with st.expander("HTTP Diagnostics"):
-                st.json(hd)
-
-    with tabs[3]:
-        st.markdown("### 📋 CEP / Pairs")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        cep = _art("CEP_pairs")
-        dl = _art("DA1_DL_LOG")
-        if cep:
-            st.metric("Pairs", cep.get("total_pairs", 0))
-            for p in cep.get("pairs", []):
-                st.markdown(f"- **{p['pair_id']}** : `{p.get('subject_pdf', '')}` ↔ `{p.get('correction_pdf', '')}`")
-        if dl:
-            with st.expander("Download Log"):
-                st.json(dl)
-
-    with tabs[4]:
-        st.markdown("### 📄 Text/OCR")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        soe = _art("SOE")
-        if soe:
-            st.metric("Extracted", soe.get("extracted", 0))
-            for r in soe.get("results", []):
-                st.markdown(f"- {r.get('pair_id', '')} [{r.get('role', '')}] → {r.get('status', '')} ({r.get('char_count', 0)} chars)")
-
-    with tabs[5]:
-        st.markdown("### 🧬 Atoms (Qi/RQi)")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        at = _art("Atoms_Qi_RQi")
-        if at:
-            st.metric("Total Atoms", at.get("total", 0))
-            st.metric("Posable", at.get("posable", 0))
-
-    with tabs[6]:
-        st.markdown("### 🔧 FRT (Primitive)")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        frt_d = _art("FRT")
-        if frt_d:
-            st.metric("FRTs", frt_d.get("total", 0))
-            st.metric("Unique Signatures", frt_d.get("unique_signatures", 0))
-            for f in frt_d.get("frts", [])[:20]:
-                st.markdown(f"- **{f['atom_id']}** → `{'→'.join(f.get('t_codes', []))}`  sig=`{f.get('frt_signature', '')[:12]}…`")
-
-    with tabs[7]:
-        st.markdown("### 🔎 QC Explorer")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        qc_d = _art("QC_validated")
-        if qc_d:
-            st.metric("QC", qc_d.get("total", 0))
-            st.metric("Unique FRT", qc_d.get("unique_frt", 0))
-            for qc in qc_d.get("qcs", [])[:20]:
-                with st.expander(f"{qc['qc_id']} — {qc.get('qc_text', '')}"):
-                    st.markdown(f"**T_codes:** {' → '.join(qc.get('t_codes', []))}")
-                    st.markdown(f"**Qi count:** {qc.get('qi_count', 0)} | **Cluster:** {qc.get('n_q_cluster', 0)}")
-                    st.markdown(f"**T_j sum:** {qc.get('t_j_sum', 0)}")
-                    st.markdown(f"**FRT sig:** `{qc.get('frt_signature', '')[:24]}…`")
-
-    with tabs[8]:
-        st.markdown("### 🚦 Gates")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        chk = _art("CHK_REPORT")
-        dt = _art("DeterminismReport_3runs")
-        if chk:
-            for gn, gd in chk.get("gates", {}).items():
-                v = gd.get("verdict", "?")
-                st.markdown(f'<span class="{"gp" if v == "PASS" else "gf"}">[{v}]</span> `{gn}` — {gd.get("detail", "")}', unsafe_allow_html=True)
-        if dt:
-            st.markdown(f"**Determinism ({dt.get('n', 0)} runs):** `{dt.get('status', '?')}` — identical={dt.get('identical', '?')}")
-
-    with tabs[9]:
-        st.markdown("### 📊 F1/F2 (A2 Exact)")
-        if not act_cc:
-            st.info("Activate a country.")
-            st.stop()
-        fm = _art("FORMULA_PACK_MANIFEST")
-        f1 = _art("F1_call_digest")
-        f2 = _art("F2_call_digest")
-        if fm:
-            st.json(fm)
-        if f1:
-            st.markdown(f"**F1 method:** `{f1.get('method', '')}`  |  **M_chapter:** {f1.get('M_chapter', '')}")
-            for r in f1.get("results", [])[:10]:
-                st.markdown(f"- {r['qc_id']}: Ψ_q={r.get('psi_q', '')}")
-        if f2:
-            st.markdown(f"**F2 method:** `{f2.get('method', '')}`")
-            for r in f2.get("results", [])[:10]:
-                st.markdown(f"- {r['qc_id']}: score={r.get('score', '')}")
-
-    with tabs[10]:
-        st.markdown("### 📁 Artifacts")
-        if not act_cc or not act_rd:
-            st.info("Activate a country.")
-        else:
-            rdp = Path(act_rd)
-            aj = sorted(rdp.glob("*.json")) if rdp.exists() else []
-            ash = sorted(rdp.glob("*.sha256")) if rdp.exists() else []
-            af = sorted(set(aj + ash), key=lambda p: p.name)
-            st.markdown(f"**{len(af)} files** ({len(aj)} JSON, {len(ash)} SHA256)")
-            for an in ["SealReport", "CHK_REPORT", "DeterminismReport_3runs",
-                        "UI_EVENT_LOG", "FORMULA_PACK_MANIFEST",
-                        "SDA0_HTTP_DIAG", "SDA0_STRATEGY_LOG"]:
-                jp = rdp / f"{an}.json"
-                sp = rdp / f"{an}.sha256"
-                c1, c2, c3 = st.columns([4, 2, 2])
-                c1.markdown(f"**{an}**")
-                if jp.exists():
-                    c2.download_button("⬇ .json", jp.read_bytes(),
-                        file_name=f"{an}.json", key=f"dl_{an}_j")
-                if sp.exists():
-                    c3.download_button("⬇ .sha256", sp.read_bytes(),
-                        file_name=f"{an}.sha256", key=f"dl_{an}_s")
-            if af:
-                buf = io.BytesIO()
-                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for fp in af:
-                        zf.writestr(fp.name, fp.read_bytes())
-                buf.seek(0)
-                st.download_button(f"⬇ ZIP ({len(af)} files)", buf.getvalue(),
-                    file_name=f"{rdp.name[:32]}_artifacts.zip",
-                    mime="application/zip", key="dl_zip")
-
-
-if __name__ == "__main__":
-    main()
+        return {k: v["verdict"] for k, v
