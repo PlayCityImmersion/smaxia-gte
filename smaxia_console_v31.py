@@ -53,8 +53,6 @@ def _build_country_index():
                 data=_j.loads(r.read())
             db={c["cca2"]:c["name"]["common"] for c in data if "cca2" in c and "name" in c}
         except Exception: pass
-    if not db:
-        db={"KM":"Comoros","FR":"France","SN":"Senegal","MA":"Morocco","US":"United States","GB":"United Kingdom","CO":"Colombia","CI":"Ivory Coast","TN":"Tunisia","DZ":"Algeria","CM":"Cameroon","MG":"Madagascar","ML":"Mali","NE":"Niger","TD":"Chad","BF":"Burkina Faso","BJ":"Benin","TG":"Togo","GA":"Gabon","CG":"Congo","CD":"DR Congo","DJ":"Djibouti","MR":"Mauritania","GN":"Guinea","HT":"Haiti","LB":"Lebanon","CA":"Canada","BE":"Belgium","CH":"Switzerland","LU":"Luxembourg","MC":"Monaco","DE":"Germany","ES":"Spain","IT":"Italy","PT":"Portugal","BR":"Brazil","MX":"Mexico","AR":"Argentina","JP":"Japan","CN":"China","IN":"India","KR":"South Korea","AU":"Australia","NZ":"New Zealand","ZA":"South Africa","NG":"Nigeria","KE":"Kenya","GH":"Ghana","EG":"Egypt","SA":"Saudi Arabia","AE":"United Arab Emirates","RU":"Russia","TR":"Turkey","PL":"Poland","RO":"Romania","SE":"Sweden","NO":"Norway","DK":"Denmark","FI":"Finland","NL":"Netherlands","IE":"Ireland","AT":"Austria","CZ":"Czechia","HU":"Hungary","GR":"Greece","IL":"Israel","TH":"Thailand","VN":"Vietnam","PH":"Philippines","ID":"Indonesia","MY":"Malaysia","SG":"Singapore","PK":"Pakistan","BD":"Bangladesh","LK":"Sri Lanka","MM":"Myanmar","KH":"Cambodia","LA":"Laos","ET":"Ethiopia","TZ":"Tanzania","UG":"Uganda","RW":"Rwanda","BI":"Burundi","MW":"Malawi","ZM":"Zambia","ZW":"Zimbabwe","MZ":"Mozambique","AO":"Angola","NA":"Namibia","BW":"Botswana","SZ":"Eswatini","LS":"Lesotho","SC":"Seychelles","MU":"Mauritius","YT":"Mayotte","RE":"Reunion"}
     idx=[{"code":k,"name":v,"nl":v.lower(),"cl":k.lower()} for k,v in db.items()]
     idx.sort(key=lambda e:e["name"]);return db,idx
 def typeahead(q,limit=20):
@@ -375,7 +373,7 @@ def run_pipeline(iso2,_determinism_run=False):
         sources=_da0_simulation_manifest(iso2,"determinism_run",[])
     else:
         sources=discover_sources(iso2,cap,cache_only=(execution_mode=="TEST_ISO_PROD"))
-    cep=build_cep(sources);da1=execute_da1(cep,iso2,cache_only=_determinism_run)
+    cep=build_cep(sources);da1_cache_only=_determinism_run or (sources.get("mode")!="REAL");da1=execute_da1(cep,iso2,cache_only=da1_cache_only)
     atoms=extract_atoms(da1["texts"]);frt=compute_frt(atoms);qc=run_qc(atoms);soe=build_soe(atoms,frt)
     ari=compute_ari(atoms,qc,iso2);triggers=compute_triggers(ari,frt)
     f1=FormulaEngine.compute_f1(atoms,frt,qc);f2=FormulaEngine.compute_f2(f1,ari,triggers)
@@ -407,7 +405,11 @@ def main():
             choice=st.selectbox("Select country",options=labels,index=0)
             cc=options[labels.index(choice)]["code"]
         else:
-            if q and q.strip(): st.caption("No matches found.")
+            if q and q.strip():
+                raw=q.strip().upper()
+                if len(raw)==2 and raw.isalpha():
+                    st.caption(f"No index available — using raw ISO2: {raw}");cc=raw
+                else: st.caption("No matches found. Try a 2-letter ISO code.")
         if st.button("🚀 ACTIVATE_COUNTRY",type="primary",use_container_width=True):
             if cc and len(cc)==2:
                 log_event("ACTIVATE_COUNTRY",cc)
