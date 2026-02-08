@@ -3,10 +3,9 @@
 """SMAXIA GTE Kernel v14.3.3 — ISO-PROD Single-File Compact"""
 
 import streamlit as st
-import json, hashlib, os, re, time, inspect, random, math
+import json, hashlib, os, re, inspect, random, math
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import OrderedDict
 
 # ─── CONFIG ───
 MAX_PDFS = 20
@@ -31,11 +30,16 @@ def strip_volatile(obj):
         return [strip_volatile(i) for i in obj]
     return obj
 
-def determinism_check(func, *args, n=3):
+def _rng_for_country(iso2):
+    seed = int(sha256(("SMAXIA:" + (iso2 or "").upper()))[:8], 16)
+    return random.Random(seed)
+
+def determinism_check(pipeline_func, iso2, n=3):
     hashes = []
     for _ in range(n):
-        result = func(*args)
-        c = canonical_json(strip_volatile(result))
+        result = pipeline_func(iso2, _determinism_run=True)
+        snap = strip_volatile(result["snapshot"])
+        c = canonical_json(snap)
         hashes.append(sha256(c))
     return {"pass": len(set(hashes)) == 1, "hashes": hashes}
 
@@ -51,8 +55,7 @@ def write_artifact(run_id, name, data):
     h = sha256(c)
     fp = p / f"{name}.json"
     fp.write_text(c, encoding="utf-8")
-    manifest_entry = {"artifact": name, "sha256": h, "path": str(fp)}
-    return manifest_entry
+    return {"artifact": name, "sha256": h, "path": str(fp)}
 
 # ─── UI EVENT LOG ───
 def log_event(evt_type, detail=""):
@@ -88,13 +91,21 @@ def typeahead(q, limit=20):
     ql = (q or "").strip().lower()
     if not ql:
         return [], []
+    is_iso_like = len(ql) == 2 and ql.isalpha()
     prefix, fallback, seen = [], [], set()
-    for e in idx:
-        if e["nl"].startswith(ql):
-            prefix.append(e)
-            seen.add(e["code"])
-            if len(prefix) >= limit:
+    if is_iso_like:
+        for e in idx:
+            if e["cl"] == ql:
+                prefix.append(e)
+                seen.add(e["code"])
                 break
+    if not prefix:
+        for e in idx:
+            if e["nl"].startswith(ql):
+                prefix.append(e)
+                seen.add(e["code"])
+                if len(prefix) >= limit:
+                    break
     if len(prefix) < limit:
         for e in idx:
             if e["code"] in seen:
@@ -109,29 +120,34 @@ def typeahead(q, limit=20):
 # ─── FORMULA_PACK (OPAQUE NAMESPACE) ───
 FORMULA_PACK = {
     "version": "FP-3.1-SEALED",
+    "mode": "SIMULATION",
     "sha256_manifest": None,
     "executors": {}
 }
 
 def _fp_compute_f1(atoms, frt, qc, pack_cfg):
+    """F1 opaque digest executor — SIMULATION mode. Returns digest, not real A2 score."""
     n = len(atoms)
     if n == 0:
-        return {"score_f1": 0.0, "digest": sha256("empty"), "status": "NO_ATOMS"}
-    qc_valid = sum(1 for q in qc if q.get("valid"))
-    ratio = qc_valid / max(n, 1)
-    raw = ratio * 100.0
-    return {"score_f1": round(raw, 4), "digest": sha256(canonical_json({"n": n, "qc_valid": qc_valid})), "status": "OK"}
+        return {"digest": sha256("empty"), "status": "NO_ATOMS", "mode": "SIMULATION"}
+    qc_hashes = canonical_json([q.get("qi_hash", "") for q in sorted(qc, key=lambda x: x.get("atom_id", ""))])
+    atom_hashes = canonical_json([a["Qi"]["source_hash"] for a in atoms])
+    combined = sha256(qc_hashes + atom_hashes + canonical_json(frt))
+    return {"digest": combined, "status": "OK", "mode": "SIMULATION", "inputs_n": n}
 
 def _fp_compute_f2(f1_digest, ari_profiles, triggers, pack_cfg):
-    base = f1_digest.get("score_f1", 0.0)
-    t_count = len(triggers)
-    adj = base * (1.0 + 0.01 * t_count)
-    return {"score_f2": round(min(adj, 100.0), 4), "digest": sha256(canonical_json({"base": base, "t": t_count})), "status": "OK"}
+    """F2 opaque digest executor — SIMULATION mode. Returns digest, not real A2 score."""
+    base_digest = f1_digest.get("digest", "")
+    ari_canon = canonical_json(sorted([p.get("atom_id", "") for p in ari_profiles]))
+    trig_canon = canonical_json(sorted([t.get("trigger", "") for t in triggers]))
+    combined = sha256(base_digest + ari_canon + trig_canon)
+    return {"digest": combined, "status": "OK", "mode": "SIMULATION", "inputs_ari": len(ari_profiles), "inputs_trig": len(triggers)}
 
 FORMULA_PACK["executors"]["compute_f1"] = _fp_compute_f1
 FORMULA_PACK["executors"]["compute_f2"] = _fp_compute_f2
 FORMULA_PACK["sha256_manifest"] = sha256(canonical_json({
     "version": FORMULA_PACK["version"],
+    "mode": FORMULA_PACK["mode"],
     "f1_src_hash": sha256(inspect.getsource(_fp_compute_f1)),
     "f2_src_hash": sha256(inspect.getsource(_fp_compute_f2)),
 }))
@@ -158,11 +174,40 @@ class FormulaEngine:
 
     @staticmethod
     def self_audit():
-        a1 = FormulaEngine._audit_source(FormulaEngine.compute_f1)
-        a2 = FormulaEngine._audit_source(FormulaEngine.compute_f2)
-        return {"compute_f1_clean": a1["pass"], "compute_f2_clean": a2["pass"],
-                "formula_pack_version": FORMULA_PACK["version"],
-                "formula_pack_sha256": FORMULA_PACK["sha256_manifest"]}
+        a1 = FormulaEngine._audit_source(FORMULA_PACK["executors"]["compute_f1"])
+        a2 = FormulaEngine._audit_source(FORMULA_PACK["executors"]["compute_f2"])
+        violations = []
+        if not a1["pass"]:
+            violations.append(a1)
+        if not a2["pass"]:
+            violations.append(a2)
+        return {
+            "compute_f1_executor_clean": a1["pass"],
+            "compute_f2_executor_clean": a2["pass"],
+            "formula_pack_version": FORMULA_PACK["version"],
+            "formula_pack_mode": FORMULA_PACK["mode"],
+            "formula_pack_sha256": FORMULA_PACK["sha256_manifest"],
+            "violations": violations,
+        }
+
+# ─── CHK_NO_COUNTRY_BRANCHING (REAL SOURCE SCAN) ───
+def chk_no_country_branching():
+    try:
+        src = Path(__file__).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {"pass": False, "reason": "cannot_read_source"}
+    bad = []
+    patterns = [
+        r'==\s*["\']FR["\']', r'==\s*["\']SN["\']', r'==\s*["\']MA["\']',
+        r'==\s*["\']US["\']', r'==\s*["\']GB["\']',
+        r'if\s+.*country\s*==', r'switch.*country',
+        r'\bcountry_map\s*\[', r'\bcountry_dict\s*\[',
+    ]
+    for pat in patterns:
+        matches = re.findall(pat, src, re.IGNORECASE)
+        if matches:
+            bad.append({"pattern": pat, "count": len(matches)})
+    return {"pass": len(bad) == 0, "bad_patterns": bad}
 
 # ─── CAP DISCOVERY (INVARIANT, ZERO COUNTRY BRANCHING) ───
 def build_cap_questions():
@@ -194,42 +239,44 @@ def discover_cap(iso2):
 
 # ─── VSP ───
 def validate_vsp(cap):
-    checks = []
-    checks.append({"check": "iso2_present", "pass": bool(cap.get("iso2"))})
-    checks.append({"check": "questions_count", "pass": len(cap.get("questions", [])) >= 5})
-    checks.append({"check": "responses_exist", "pass": len(cap.get("responses", {})) > 0})
+    checks = [
+        {"check": "iso2_present", "pass": bool(cap.get("iso2"))},
+        {"check": "questions_count", "pass": len(cap.get("questions", [])) >= 5},
+        {"check": "responses_exist", "pass": len(cap.get("responses", {})) > 0},
+    ]
     all_pass = all(c["pass"] for c in checks)
     return {"status": "PASS" if all_pass else "FAIL", "checks": checks, "cap_sha256": cap.get("sha256")}
 
-# ─── DA0 / SOURCE DISCOVERY ───
+# ─── DA0 / SOURCE DISCOVERY (SIMULATION MODE — gates will FAIL) ───
 def discover_sources(iso2, cap):
     log_event("DA0_START", iso2)
+    rng = _rng_for_country(iso2)
     seeds = [f"https://education.{iso2.lower()}.example.org", f"https://exams.{iso2.lower()}.example.org"]
     seeds = seeds[:SEED_DOMAINS_MAX]
-    strategy_log = {"iso2": iso2, "seeds": seeds, "bfs_depth": BFS_DEPTH, "max_pdfs": MAX_PDFS}
+    strategy_log = {"iso2": iso2, "seeds": seeds, "bfs_depth": BFS_DEPTH, "max_pdfs": MAX_PDFS, "mode": "SIMULATION"}
     http_diag = []
     discovered = []
-    for i, seed in enumerate(seeds):
-        entry = {"url": seed, "status": "SIMULATED_200", "pdfs_found": min(5, MAX_PDFS // len(seeds))}
+    for seed in seeds:
+        n_pdfs = min(5, MAX_PDFS // len(seeds))
+        entry = {"url": seed, "status": "SIMULATED_200", "pdfs_found": n_pdfs}
         http_diag.append(entry)
-        for j in range(entry["pdfs_found"]):
+        for j in range(n_pdfs):
             discovered.append({
                 "url": f"{seed}/exam_{j+1}.pdf",
-                "type": random.choice(["sujet", "corrige"]),
+                "type": rng.choice(["sujet", "corrige"]),
                 "hash": sha256(f"{seed}/exam_{j+1}.pdf"),
-                "size_kb": random.randint(50, 500),
+                "size_kb": rng.randint(50, 500),
             })
     discovered = discovered[:MAX_PDFS]
     log_event("DA0_END", f"{len(discovered)} PDFs")
-    return {"source_manifest": discovered, "strategy_log": strategy_log, "http_diag": http_diag}
+    return {"mode": "SIMULATION", "source_manifest": discovered, "strategy_log": strategy_log, "http_diag": http_diag}
 
 # ─── CEP / PAIRING ───
 def build_cep(sources):
     manifest = sources.get("source_manifest", [])
     sujets = [s for s in manifest if s["type"] == "sujet"]
     corriges = [s for s in manifest if s["type"] == "corrige"]
-    pairs = []
-    unpaired = []
+    pairs, unpaired = [], []
     for i, s in enumerate(sujets):
         if i < len(corriges):
             pairs.append({"sujet": s["url"], "corrige": corriges[i]["url"],
@@ -242,8 +289,9 @@ def build_cep(sources):
     return {"pairs": pairs, "unpaired": unpaired, "total_pairs": len(pairs)}
 
 # ─── DA1 / DOWNLOAD + TEXT/OCR ───
-def execute_da1(cep):
+def execute_da1(cep, iso2):
     log_event("DA1_START")
+    rng = _rng_for_country(iso2)
     dl_log = []
     texts = {}
     for pair in cep.get("pairs", []):
@@ -251,8 +299,8 @@ def execute_da1(cep):
         dl_log.append({"pair_id": pid, "sujet_status": "DL_OK_SIM", "corrige_status": "DL_OK_SIM"})
         texts[pid] = {
             "sujet_text": f"[OCR_TEXT_SUJET_{pid}] Exercice 1: Question portant sur le programme. ...",
-            "corrige_text": f"[OCR_TEXT_CORRIGE_{pid}] Correction: La réponse attendue est ...",
-            "ocr_confidence": round(random.uniform(0.75, 0.98), 3),
+            "corrige_text": f"[OCR_TEXT_CORRIGE_{pid}] Correction: La reponse attendue est ...",
+            "ocr_confidence": round(rng.uniform(0.75, 0.98), 3),
         }
     log_event("DA1_END", f"{len(dl_log)} pairs processed")
     return {"dl_log": dl_log, "texts": texts}
@@ -261,7 +309,8 @@ def execute_da1(cep):
 def extract_atoms(texts):
     log_event("ATOMS_START")
     atoms = []
-    for pid, t in texts.items():
+    for pid in sorted(texts.keys()):
+        t = texts[pid]
         stxt = t.get("sujet_text", "")
         ctxt = t.get("corrige_text", "")
         qi = {"id": f"{pid}_Q1", "pair_id": pid, "text": stxt[:200], "source_hash": sha256(stxt)}
@@ -288,8 +337,7 @@ def run_qc(atoms):
     log_event("QC_START")
     qc = []
     for a in atoms:
-        qi = a["Qi"]
-        rqi = a["RQi"]
+        qi, rqi = a["Qi"], a["RQi"]
         valid = len(qi["text"]) > 10 and len(rqi["text"]) > 10
         qc.append({"atom_id": qi["id"], "valid": valid,
                     "qi_hash": qi["source_hash"], "rqi_hash": rqi["source_hash"],
@@ -298,14 +346,16 @@ def run_qc(atoms):
     return qc
 
 # ─── ARI / TRIGGERS ───
-def compute_ari(atoms, qc):
+def compute_ari(atoms, qc, iso2):
+    rng = _rng_for_country(iso2)
     profiles = []
     for a in atoms:
         qid = a["Qi"]["id"]
         qc_entry = next((q for q in qc if q["atom_id"] == qid), None)
         if qc_entry and qc_entry["valid"]:
-            profiles.append({"atom_id": qid, "difficulty": round(random.uniform(0.3, 0.9), 3),
-                             "discrimination": round(random.uniform(0.1, 0.7), 3),
+            profiles.append({"atom_id": qid,
+                             "difficulty": round(rng.uniform(0.3, 0.9), 3),
+                             "discrimination": round(rng.uniform(0.1, 0.7), 3),
                              "source_qi_hash": a["Qi"]["source_hash"]})
     return profiles
 
@@ -329,39 +379,63 @@ def run_gates(cap, vsp, sources, cep, da1, atoms, frt, qc, f1, f2, ari, triggers
     gates = []
     def gate(name, condition, evidence_ptr):
         gates.append({"gate": name, "verdict": "PASS" if condition else "FAIL", "evidence": evidence_ptr})
+
     gate("CHK_UI_EVENT_LOG", len(st.session_state.get("ui_events", [])) > 0, "ui_events")
-    gate("CHK_NO_COUNTRY_BRANCHING", True, "core_invariant_by_design")
+
+    ncb = chk_no_country_branching()
+    gate("CHK_NO_COUNTRY_BRANCHING", ncb["pass"], "chk_no_country_branching_report")
+
+    gate("CHK_DA0_NOT_SIMULATED", sources.get("mode") != "SIMULATION", "sources.mode")
+
     gate("GATE_DA0", len(sources.get("source_manifest", [])) > 0, "source_manifest")
     gate("GATE_DA1", len(da1.get("dl_log", [])) > 0, "dl_log")
     gate("GATE_TEXT", any(t.get("sujet_text") for t in da1.get("texts", {}).values()), "texts")
     gate("GATE_ATOMS", len(atoms) > 0, "atoms")
     gate("GATE_QC", any(q["valid"] for q in qc), "qc_validated")
     gate("GATE_F1F2", f1.get("status") == "OK" and f2.get("status") == "OK", "f1f2_digests")
+    gate("CHK_F1F2_NOT_SIMULATED", f1.get("mode") != "SIMULATION", "f1.mode")
     gate("CHK_CAP_COMPLETENESS", vsp.get("status") == "PASS", "vsp_output")
     gate("GATE_FRT", len(frt) > 0, "frt")
     gate("GATE_ARI", len(ari) > 0, "ari_profiles")
+
     all_pass = all(g["verdict"] == "PASS" for g in gates)
-    return {"gates": gates, "global_verdict": "PASS" if all_pass else "FAIL"}
+    return {"gates": gates, "global_verdict": "PASS" if all_pass else "FAIL",
+            "no_country_branching_report": ncb}
 
 # ─── FULL PIPELINE ───
-def run_pipeline(iso2):
-    run_id = f"RUN_{iso2}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
-    log_event("PIPELINE_START", f"{iso2} / {run_id}")
+def run_pipeline(iso2, _determinism_run=False):
     cap = discover_cap(iso2)
+    run_id = f"RUN_{iso2}_{sha256(canonical_json(strip_volatile(cap)))[:8]}"
+
+    if not _determinism_run:
+        log_event("PIPELINE_START", f"{iso2} / {run_id}")
+
     vsp = validate_vsp(cap)
     sources = discover_sources(iso2, cap)
     cep = build_cep(sources)
-    da1 = execute_da1(cep)
+    da1 = execute_da1(cep, iso2)
     atoms = extract_atoms(da1["texts"])
     frt = compute_frt(atoms)
     qc = run_qc(atoms)
     soe = build_soe(atoms, frt)
-    ari = compute_ari(atoms, qc)
+    ari = compute_ari(atoms, qc, iso2)
     triggers = compute_triggers(ari, frt)
     f1 = FormulaEngine.compute_f1(atoms, frt, qc)
     f2 = FormulaEngine.compute_f2(f1, ari, triggers)
     gate_report = run_gates(cap, vsp, sources, cep, da1, atoms, frt, qc, f1, f2, ari, triggers)
     fe_audit = FormulaEngine.self_audit()
+
+    snapshot = strip_volatile({
+        "cap": cap, "vsp": vsp, "sources": sources["source_manifest"],
+        "cep": cep, "atoms": atoms, "frt": frt, "qc": qc,
+        "f1": f1, "f2": f2, "ari": ari, "triggers": triggers, "gates": gate_report,
+    })
+
+    if _determinism_run:
+        return {"snapshot": snapshot}
+
+    det = determinism_check(run_pipeline, iso2)
+
     artifacts = {}
     for name, data in [
         ("CAP_SEALED", cap), ("VSP_output", vsp), ("SourceManifest", sources["source_manifest"]),
@@ -369,32 +443,37 @@ def run_pipeline(iso2):
         ("CEP_pairs", cep), ("DA1_DL_LOG", da1["dl_log"]), ("SOE", soe),
         ("Atoms_Qi_RQi", atoms), ("FRT", frt), ("QC_validated", qc),
         ("F1_call_digest", f1), ("F2_call_digest", f2), ("ARI", ari), ("Triggers", triggers),
-        ("FORMULA_PACK_MANIFEST", {"version": FORMULA_PACK["version"], "sha256": FORMULA_PACK["sha256_manifest"], "fe_audit": fe_audit}),
+        ("FORMULA_PACK_MANIFEST", {"version": FORMULA_PACK["version"], "mode": FORMULA_PACK["mode"],
+                                    "sha256": FORMULA_PACK["sha256_manifest"], "fe_audit": fe_audit}),
         ("UI_EVENT_LOG", st.session_state.get("ui_events", [])),
         ("CHK_REPORT", gate_report),
+        ("NO_COUNTRY_BRANCHING_REPORT", gate_report.get("no_country_branching_report", {})),
     ]:
         artifacts[name] = write_artifact(run_id, name, data)
-    def pipeline_snapshot():
-        return strip_volatile({"cap": cap, "vsp": vsp, "sources": sources["source_manifest"],
-                                "cep": cep, "atoms": atoms, "frt": frt, "qc": qc,
-                                "f1": f1, "f2": f2, "ari": ari, "triggers": triggers, "gates": gate_report})
-    det = determinism_check(pipeline_snapshot)
+
     artifacts["DeterminismReport_3runs"] = write_artifact(run_id, "DeterminismReport_3runs", det)
-    seal = {"run_id": run_id, "iso2": iso2, "global_verdict": gate_report["global_verdict"],
-            "determinism_pass": det["pass"], "artifact_count": len(artifacts),
-            "artifact_hashes": {k: v["sha256"] for k, v in artifacts.items()},
-            "formula_engine_audit": fe_audit}
+
+    seal = {
+        "run_id": run_id, "iso2": iso2,
+        "global_verdict": gate_report["global_verdict"],
+        "determinism_pass": det["pass"],
+        "artifact_count": len(artifacts) + 1,
+        "artifact_hashes": {k: v["sha256"] for k, v in artifacts.items()},
+        "formula_engine_audit": fe_audit,
+    }
     artifacts["SealReport"] = write_artifact(run_id, "SealReport", seal)
+
     log_event("PIPELINE_END", run_id)
     return {
         "run_id": run_id, "cap": cap, "vsp": vsp, "sources": sources, "cep": cep,
         "da1": da1, "atoms": atoms, "frt": frt, "qc": qc, "soe": soe,
         "f1": f1, "f2": f2, "ari": ari, "triggers": triggers,
         "gates": gate_report, "seal": seal, "artifacts": artifacts, "determinism": det,
+        "snapshot": snapshot,
     }
 
 # ─── UI HELPERS ───
-def json_view(data, label=""):
+def json_view(data):
     st.json(data if isinstance(data, (dict, list)) else {"value": data})
 
 def no_data_msg():
@@ -413,23 +492,32 @@ def main():
     # ─── SIDEBAR: Country Activation ───
     with st.sidebar:
         st.markdown("### 🌍 Activate Country")
-        q = st.text_input("Type country name or ISO2", key="cc_query", placeholder="ex: France / FR")
+        q = st.text_input("Type country name or code", key="cc_query", placeholder="ex: France, Senegal, FR, SN")
         pm, fb = typeahead(q, limit=20)
         options = pm if pm else fb
         labels = [f"{e['name']} ({e['code']})" for e in options]
         cc = None
+
         if labels:
-            choice = st.selectbox("Matches", options=labels, index=0)
-            cc = options[labels.index(choice)]["code"]
+            st.caption(f"{len(labels)} match{'es' if len(labels) != 1 else ''}")
+            display_labels = labels[:12]
+            choice = st.radio("Matches", options=display_labels, index=0, label_visibility="visible")
+            idx = display_labels.index(choice)
+            cc = options[idx]["code"]
+            if len(labels) > 12:
+                more_labels = labels[12:]
+                extra = st.selectbox("More matches…", options=["—"] + more_labels)
+                if extra != "—":
+                    eidx = labels.index(extra)
+                    cc = options[eidx]["code"]
         else:
             if q and q.strip():
                 st.caption("No matches found.")
-            st.selectbox("Matches", options=["—"], disabled=True)
 
         if st.button("🚀 ACTIVATE_COUNTRY", type="primary", use_container_width=True):
             if cc and len(cc) == 2:
                 log_event("ACTIVATE_COUNTRY", cc)
-                with st.spinner(f"Running pipeline for {cc}..."):
+                with st.spinner(f"Running pipeline for {cc}…"):
                     st.session_state.pipeline = run_pipeline(cc)
                 st.success(f"✅ {cc} activated")
             else:
@@ -437,9 +525,16 @@ def main():
 
         if st.session_state.pipeline:
             st.divider()
-            st.markdown(f"**Active:** `{st.session_state.pipeline['seal']['iso2']}`")
-            st.markdown(f"**Verdict:** `{st.session_state.pipeline['seal']['global_verdict']}`")
-            st.markdown(f"**Run:** `{st.session_state.pipeline['run_id']}`")
+            p = st.session_state.pipeline
+            st.markdown(f"**Active:** `{p['seal']['iso2']}`")
+            v = p["seal"]["global_verdict"]
+            if v == "PASS":
+                st.markdown(f"**Verdict:** :green[{v}]")
+            else:
+                st.markdown(f"**Verdict:** :red[{v}]")
+            det_status = "PASS" if p["determinism"]["pass"] else "FAIL"
+            st.markdown(f"**Determinism:** `{det_status}`")
+            st.markdown(f"**Run:** `{p['run_id']}`")
 
     # ─── 11 TABS ───
     tabs = st.tabs([
@@ -447,6 +542,7 @@ def main():
         "🧬 Atoms", "🔧 FRT", "🔎 QC Explorer", "🚦 Gates", "📊 F1/F2", "📁 Artifacts"
     ])
 
+    # TAB 0: Admin
     with tabs[0]:
         st.header("Admin — Dashboard")
         if not st.session_state.pipeline:
@@ -462,17 +558,18 @@ def main():
             st.subheader("FormulaEngine Self-Audit")
             json_view(FormulaEngine.self_audit())
 
+    # TAB 1: CAP/VSP
     with tabs[1]:
         st.header("📦 CAP / VSP")
         if not st.session_state.pipeline:
             no_data_msg()
         else:
-            p = st.session_state.pipeline
             st.subheader("CAP")
-            json_view(p["cap"])
+            json_view(st.session_state.pipeline["cap"])
             st.subheader("VSP")
-            json_view(p["vsp"])
+            json_view(st.session_state.pipeline["vsp"])
 
+    # TAB 2: DA0/Sources
     with tabs[2]:
         st.header("🔍 DA0 / Sources")
         if not st.session_state.pipeline:
@@ -486,6 +583,7 @@ def main():
             st.subheader("Strategy Log")
             json_view(p["sources"]["strategy_log"])
 
+    # TAB 3: CEP/Pairs
     with tabs[3]:
         st.header("📋 CEP / Pairs")
         if not st.session_state.pipeline:
@@ -493,17 +591,20 @@ def main():
         else:
             json_view(st.session_state.pipeline["cep"])
 
+    # TAB 4: Text/OCR
     with tabs[4]:
         st.header("📄 Text / OCR")
         if not st.session_state.pipeline:
             no_data_msg()
         else:
             texts = st.session_state.pipeline["da1"]["texts"]
-            for pid, t in texts.items():
+            for pid in sorted(texts.keys()):
+                t = texts[pid]
                 with st.expander(f"Pair: {pid} (conf: {t['ocr_confidence']})"):
                     st.text_area("Sujet", t["sujet_text"], height=80, key=f"s_{pid}", disabled=True)
-                    st.text_area("Corrigé", t["corrige_text"], height=80, key=f"c_{pid}", disabled=True)
+                    st.text_area("Corrige", t["corrige_text"], height=80, key=f"c_{pid}", disabled=True)
 
+    # TAB 5: Atoms
     with tabs[5]:
         st.header("🧬 Atoms (Qi / RQi)")
         if not st.session_state.pipeline:
@@ -511,6 +612,7 @@ def main():
         else:
             json_view(st.session_state.pipeline["atoms"])
 
+    # TAB 6: FRT
     with tabs[6]:
         st.header("🔧 FRT")
         if not st.session_state.pipeline:
@@ -518,6 +620,7 @@ def main():
         else:
             json_view(st.session_state.pipeline["frt"])
 
+    # TAB 7: QC Explorer
     with tabs[7]:
         st.header("🔎 QC Explorer")
         if not st.session_state.pipeline:
@@ -528,17 +631,23 @@ def main():
             st.metric("Valid / Total", f"{valid_count} / {len(qc)}")
             json_view(qc)
 
+    # TAB 8: Gates
     with tabs[8]:
         st.header("🚦 Gates")
         if not st.session_state.pipeline:
             no_data_msg()
         else:
             gr = st.session_state.pipeline["gates"]
-            st.subheader(f"Global: {gr['global_verdict']}")
+            verdict = gr["global_verdict"]
+            if verdict == "PASS":
+                st.success(f"Global Verdict: {verdict}")
+            else:
+                st.error(f"Global Verdict: {verdict}")
             for g in gr["gates"]:
                 icon = "✅" if g["verdict"] == "PASS" else "❌"
                 st.write(f"{icon} **{g['gate']}** → {g['verdict']}  (evidence: `{g['evidence']}`)")
 
+    # TAB 9: F1/F2
     with tabs[9]:
         st.header("📊 F1 / F2")
         if not st.session_state.pipeline:
@@ -547,16 +656,17 @@ def main():
             p = st.session_state.pipeline
             c1, c2 = st.columns(2)
             with c1:
-                st.subheader("F1")
+                st.subheader("F1 Digest")
                 json_view(p["f1"])
             with c2:
-                st.subheader("F2")
+                st.subheader("F2 Digest")
                 json_view(p["f2"])
             st.subheader("ARI Profiles")
             json_view(p["ari"])
             st.subheader("Triggers")
             json_view(p["triggers"])
 
+    # TAB 10: Artifacts
     with tabs[10]:
         st.header("📁 Artifacts")
         if not st.session_state.pipeline:
