@@ -612,7 +612,10 @@ def main():
                 log_ev("ACTIVATE", cc)
                 with st.spinner(f"Pipeline {cc}… (web discovery may take 30-60s)"): st.session_state.pipeline = run_pipeline(cc)
                 v = st.session_state.pipeline["seal"]["verdict"]
-                st.success(f"✅ {cc}") if v == "PASS" else st.warning(f"⚠️ {cc} — {v}")
+                if v == "PASS":
+                    st.success(f"PASS — {cc}")
+                else:
+                    st.warning(f"{cc} — {v} (check Gates)")
             else: st.error("Select country.")
         if st.session_state.pipeline:
             st.divider(); p = st.session_state.pipeline; s = p["seal"]
@@ -694,7 +697,10 @@ def main():
         if not p: nd()
         else:
             gr = p["gates"]; v = gr["global_verdict"]
-            st.success(f"🟢 {v}") if v == "PASS" else st.error(f"🔴 {v}")
+            if v == "PASS":
+                st.success(f"GLOBAL: {v}")
+            else:
+                st.error(f"GLOBAL: {v}")
             for g in gr["gates"]: st.write(f"{'✅' if g['verdict']=='PASS' else '❌'} **{g['gate']}** {g['verdict']} (`{g['evidence']}`)")
     with T[9]:
         st.header("📊 F1/F2"); p = st.session_state.pipeline
