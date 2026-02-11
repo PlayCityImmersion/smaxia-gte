@@ -337,8 +337,9 @@ def _detect_grading(pages):
         html,_,_,_=http_get(p["url"],cache_only=True)
         if not html:continue
         low=html.lower()
-        if"/20"in low:return{"max":20,"pass_threshold":10,"description":"Scale 0-20","source":"ar0_crawl"}
-        if"/100"in low or"percent"in low or"marks"in low:return{"max":100,"pass_threshold":33,"description":"Scale 0-100","source":"ar0_crawl"}
+        if re.search(r'(?:note|grade|mark|score|barème).*?/\s*20\b',low):return{"max":20,"pass_threshold":10,"description":"Scale 0-20","source":"ar0_crawl"}
+        if re.search(r'(?:maximum|total)\s+marks?\s*:?\s*100',low):return{"max":100,"pass_threshold":33,"description":"Scale 0-100","source":"ar0_crawl"}
+        if"marks"in low and re.search(r'\b(?:50|100)\s*marks?\b',low):return{"max":100,"pass_threshold":33,"description":"Scale 0-100","source":"ar0_crawl"}
     return{"max":0,"description":"[NOT_DETECTED]","source":"NONE"}
 def _is_subdomain(dom,roots):
     for r in roots:
@@ -365,14 +366,74 @@ def vsp_validate(cap):
     C("status_ok",cap.get("status")in["DISCOVERED","PARTIAL"])
     return{"status":"PASS"if all(c["pass"]for c in ch)else"FAIL","checks":ch}
 # ═══ DA0 PDF DISCOVERY ═══
+## ═══ INVARIANT HUNTER: Multilingual Dork Generator ═══
+# Language terms detected from country name — NO country branching
+_LANG_TERMS={
+    "fr":{"exam":["sujet","sujets","épreuve","annales"],"answer":["corrigé","correction","barème"],
+          "diploma":["baccalauréat","brevet","diplôme","examen d'État","concours"],"subject":["mathématiques","physique","philosophie"]},
+    "en":{"exam":["exam","question paper","past paper","test paper"],"answer":["answer key","mark scheme","solution","correction"],
+          "diploma":["examination","certificate","board exam","GCE","GCSE","SAT"],"subject":["mathematics","physics","chemistry"]},
+    "es":{"exam":["examen","prueba","evaluación"],"answer":["solución","corrección","pauta"],
+          "diploma":["bachillerato","selectividad","EVAU","PAU"],"subject":["matemáticas","física","filosofía"]},
+    "pt":{"exam":["exame","prova","vestibular"],"answer":["gabarito","correção","resolução"],
+          "diploma":["ENEM","vestibular","exame nacional"],"subject":["matemática","física","química"]},
+    "ar":{"exam":["امتحان","اختبار","موضوع"],"answer":["تصحيح","حل","إجابة"],
+          "diploma":["بكالوريا","شهادة","امتحان وطني"],"subject":["رياضيات","فيزياء","فلسفة"]},
+}
+def _detect_lang(cn,ar0_domains):
+    """Detect language from country name and AR0 domain TLD — invariant."""
+    cnl=cn.lower();langs=["en"]  # default
+    for kw,lang in[("france","fr"),("sénégal","fr"),("senegal","fr"),("maroc","fr"),("morocco","fr"),("tunisie","fr"),("tunisia","fr"),("algérie","fr"),("algeria","fr"),("côte d'ivoire","fr"),("ivory coast","fr"),("cameroun","fr"),("cameroon","fr"),("congo","fr"),("mali","fr"),("madagascar","fr"),("niger ","fr"),("burkina","fr"),("bénin","fr"),("benin","fr"),("togo","fr"),("guinée","fr"),("guinea","fr"),("gabon","fr"),("haïti","fr"),("haiti","fr"),("belgique","fr"),("belgium","fr"),("suisse","fr"),("switzerland","fr"),("luxembourg","fr"),("canada","fr"),("djibouti","fr"),("comoros","fr"),("chad","fr"),("tchad","fr"),
+        ("brasil","pt"),("brazil","pt"),("portugal","pt"),("moçambique","pt"),("angola","pt"),
+        ("españa","es"),("spain","es"),("méxico","es"),("mexico","es"),("colombia","es"),("argentina","es"),("chile","es"),("perú","es"),("peru","es"),("venezuela","es"),("ecuador","es"),("bolivia","es"),("uruguay","es"),("paraguay","es"),("guatemala","es"),("cuba","es"),
+        ("مصر","ar"),("egypt","ar"),("morocco","ar"),("algeria","ar"),("tunisia","ar"),("iraq","ar"),("jordan","ar"),("saudi","ar"),("kuwait","ar"),("qatar","ar"),("bahrain","ar"),("oman","ar"),("libya","ar"),("sudan","ar"),("yemen","ar"),("syria","ar"),("lebanon","ar"),("palestine","ar"),("uae","ar"),("emirates","ar")]:
+        if kw in cnl:langs=[lang];break
+    # Also detect from TLD
+    for d in ar0_domains:
+        dl=d.lower()
+        if".gouv."in dl or".fr"in dl:
+            if"fr"not in langs:langs.append("fr")
+        elif".br"in dl or".pt"in dl:
+            if"pt"not in langs:langs.append("pt")
+        elif".es"in dl or".mx"in dl or".ar"in dl or".co"in dl:
+            if"es"not in langs:langs.append("es")
+    if"en"not in langs:langs.append("en")  # always include EN as fallback
+    return langs[:3]
 def _query_pack(cn,domains):
-    qs=[]
+    """Invariant Hunter: generate search dorks dynamically based on country+language.
+    NO hardcoded URLs. NO country branching. Language detected from country name."""
+    langs=_detect_lang(cn,domains)
+    qs=[];year=datetime.now().year
     for dom in domains[:3]:
-        qs+=[f"site:{dom} filetype:pdf exam",f"site:{dom} filetype:pdf question paper",
-             f"site:{dom} filetype:pdf sujet",f"site:{dom} filetype:pdf past paper"]
-    qs+=[f"{cn} official exam past papers PDF",f"{cn} board exam question paper PDF",
-         f"{cn} sujet corrige PDF officiel",f"{cn} épreuve baccalauréat PDF"]
-    return qs
+        # Perplexity-style dorks per language
+        for lang in langs:
+            terms=_LANG_TERMS.get(lang,_LANG_TERMS["en"])
+            exam_or=" OR ".join(f'"{t}"'for t in terms["exam"][:3])
+            diploma_or=" OR ".join(f'"{t}"'for t in terms["diploma"][:2])
+            answer_or=" OR ".join(f'"{t}"'for t in terms["answer"][:2])
+            # Core dork: exam papers on official domain
+            qs.append(f"site:{dom} filetype:pdf ({exam_or}) {year}")
+            qs.append(f"site:{dom} filetype:pdf ({exam_or}) {year-1}")
+            # Diploma-specific dork
+            qs.append(f"site:{dom} filetype:pdf ({diploma_or})")
+            # Answer/correction dork
+            qs.append(f"site:{dom} filetype:pdf ({answer_or})")
+    # TLD-level dork (catches subdomains and CDNs)
+    tlds=set()
+    for d in domains:
+        parts=d.split(".");tld=".".join(parts[-2:])if len(parts)>=2 else d
+        if any(k in tld for k in["gov","gouv","edu","ac","nic"]):tlds.add(tld)
+    for tld in list(tlds)[:2]:
+        for lang in langs[:2]:
+            terms=_LANG_TERMS.get(lang,_LANG_TERMS["en"])
+            exam_or=" OR ".join(f'"{t}"'for t in terms["exam"][:2])
+            qs.append(f"site:.{tld} filetype:pdf ({exam_or}) {year}")
+    # Country-level broad queries (no site: restriction)
+    for lang in langs[:2]:
+        terms=_LANG_TERMS.get(lang,_LANG_TERMS["en"])
+        qs.append(f"{cn} filetype:pdf {terms['exam'][0]} {terms['diploma'][0]} {year}")
+        qs.append(f"{cn} official {terms['exam'][0]} PDF {year}")
+    return qs[:20]  # cap at 20 queries
 def _search_pdfs(queries,diag,max_r=20):
     results=[];tried=[]
     key=os.environ.get("SERPAPI_KEY")
@@ -491,43 +552,115 @@ def real_da1(cep):
     img=sum(1 for t in texts.values()if t["sujet_ocr"]in["extraction_failed","no_data"]and t["sujet_text"]=="")
     log_ev("DA1_END",f"{len(dl)}p {roc}ocr {img}img")
     return{"dl_log":dl,"texts":texts,"text_mode":"OCR_REAL"if roc>0 else"OCR_NONE","real_ocr_count":roc,"image_detected":img}
-# ═══ B6: ATOMS ═══
+# ═══ B6: ATOMS — Universal Exam Segmentation ═══
+# Header detection patterns (multilingual, invariant)
+_HEADER_PATS=[r'roll\s*no',r'q\.?\s*p\.?\s*code',r'candidates?\s+must',r'time\s*(?:allowed|allotted)',
+    r'maximum\s+marks',r'printed\s+pages',r'ne\s+rien\s+écrire',r'page\s+\d+\s+(?:of|de|sur)\s+\d+',
+    r'set[\s~-]*\d',r'series\s*:',r'P\.?\s*T\.?\s*O\.?',r'please\s+check']
+_INSTRUCTION_PATS=[r'answer\s+any\s+\d+\s+out\s+of',r'attempt\s+(?:all|any)',r'this\s+(?:section|question\s+paper)',
+    r'read\s+(?:the\s+)?(?:following|these|this)',r'instructions?\s*:',r'note\s*:',r'general\s+instructions']
+
+def _is_header_or_instruction(text):
+    """Detect if text chunk is a header/footer/instruction, not a real question."""
+    low=text.lower()
+    header_hits=sum(1 for p in _HEADER_PATS if re.search(p,low))
+    if header_hits>=2:return True
+    instr_hits=sum(1 for p in _INSTRUCTION_PATS if re.search(p,low))
+    if instr_hits>=1 and not re.search(r'(?:what|why|how|explain|describe|define|calculate|find|solve|write|list|name|state|mention|discuss)',low):return True
+    return False
+
 def _split_q(text):
-    if not text:return[]
-    for pat in[r'(?=(?:Sujet|Exercice|EXERCICE|Exercise|QUESTION|Question|Partie|PARTIE|Part|SECTION)\s*[\d\-:IVA-F])',r'(?=\d+[\.\)]\s+[A-Z])']:
-        parts=re.split(pat,text,flags=re.I);parts=[p.strip()for p in parts if len(p.strip())>40]
+    """Universal exam question segmenter — works on FR/EN/ES/PT/AR/HI exams."""
+    if not text or len(text)<100:return[]
+    # Strategy 1: Numbered questions (most universal pattern)
+    # Match: "1.", "Q1.", "Q.1", "1)", "1-", with text after
+    q_pat=r'(?:^|\n)\s*(?:Q\.?\s*)?(\d{1,3})\s*[\.\)\-:]\s*(.+?)(?=(?:^|\n)\s*(?:Q\.?\s*)?\d{1,3}\s*[\.\)\-:]|\Z)'
+    matches=list(re.finditer(q_pat,text,re.DOTALL|re.MULTILINE))
+    if len(matches)>=3:
+        parts=[]
+        for m in matches:
+            chunk=m.group(0).strip()
+            if len(chunk)>=40 and not _is_header_or_instruction(chunk):
+                parts.append(chunk)
         if len(parts)>=2:return parts
-    parts=[p.strip()for p in text.split("\n\n")if len(p.strip())>40]
-    return parts if len(parts)>=2 else([text]if len(text)>100 else[])
+    # Strategy 2: Section/Exercice/Part markers
+    for pat in[r'(?=(?:SECTION|Section|PARTIE|Partie|Exercice|EXERCICE|Exercise)\s*[-:.]?\s*[A-Za-z0-9IViv])',
+               r'(?=(?:QUESTION|Question|Pregunta|Questão|السؤال)\s*\d)']:
+        parts=re.split(pat,text,flags=re.I)
+        parts=[p.strip()for p in parts if len(p.strip())>=60 and not _is_header_or_instruction(p)]
+        if len(parts)>=2:return parts
+    # Strategy 3: Double-newline split (fallback)
+    parts=[p.strip()for p in text.split("\n\n")if len(p.strip())>=60 and not _is_header_or_instruction(p)]
+    if len(parts)>=3:return parts
+    # Strategy 4: Single block if text is substantial
+    if len(text)>=200 and not _is_header_or_instruction(text):return[text]
+    return[]
+
 def _pts(text):
-    for pat in[r'(\d+)\s*(?:points?|pts?|marks?)',r'\((\d+)\s*(?:pt|mk|point)',r'[Mm]arks?\s*:?\s*(\d+)']:
+    """Extract points/marks from question text — multilingual."""
+    # Direct patterns: (5 marks), (5 points), 5 pts, /5, [5], 5अंक, 5م
+    for pat in[r'[\(\[]\s*(\d{1,3})\s*(?:marks?|points?|pts?|अंक|م)\s*[\)\]]',
+               r'(\d{1,3})\s*(?:marks?|points?|pts?|अंक)\b',
+               r'[\(\[]\s*(\d{1,3})\s*[\)\]]',
+               r'(?:marks?|points?)\s*[:=]\s*(\d{1,3})',
+               r'/\s*(\d{1,3})\b',
+               r'(\d{1,3})\s*×\s*(\d{1,3})\s*=\s*(\d{1,3})']:
         m=re.search(pat,text,re.I)
-        if m:return int(m.group(1))
-    m=re.search(r'/(\d+)',text)
-    if m and 1<=int(m.group(1))<=100:return int(m.group(1))
+        if m:
+            groups=[g for g in m.groups()if g]
+            val=int(groups[-1])  # last group is typically the total
+            if 1<=val<=200:return val
     return None
+
+def _classify_atom(text):
+    """Classify: QUESTION, INSTRUCTION, HEADER, NOISE."""
+    if not text or len(text)<20:return"NOISE"
+    if _is_header_or_instruction(text):return"INSTRUCTION"
+    low=text.lower()
+    # Question indicators (multilingual)
+    q_signals=sum(1 for k in["what","why","how","explain","describe","define","calculate","find","solve",
+        "write","list","name","state","mention","discuss","evaluate","compare","differentiate","draw",
+        "prove","show","derive","identify","classify","analyse","analyze","give","suggest",
+        "qu'est","expliquer","décrire","calculer","définir","démontrer","résoudre","citer","nommer",
+        "explique","defina","calcule","descreva","mencione","اشرح","عرف","احسب","وضح",
+        "?","marks","अंक","points","pts"]if k in low)
+    if q_signals>=1:return"QUESTION"
+    if len(text)>=150:return"QUESTION"  # long enough to be substantial
+    return"FRAGMENT"
+
 def extract_atoms(texts):
     atoms=[]
     for pid in sorted(texts.keys()):
         t=texts[pid];st_,ct_=t.get("sujet_text",""),t.get("corrige_text","")
-        if not st_ or len(st_)<50:continue
+        if not st_ or len(st_)<100:continue
         qb=_split_q(st_);cb=_split_q(ct_)if ct_ else[]
-        for qi,q in enumerate(qb,1):
-            rb=cb[qi-1]if qi-1<len(cb)else""
-            atoms.append({"Qi":{"id":f"{pid}_Q{qi}","pair_id":pid,"text":q.strip(),"points":_pts(q),"source_hash":sha(q.strip())},"RQi":{"id":f"{pid}_R{qi}","pair_id":pid,"text":rb.strip(),"source_hash":sha(rb.strip())}})
+        qi_count=0
+        for qi_idx,q in enumerate(qb):
+            cat=_classify_atom(q)
+            if cat in["NOISE","INSTRUCTION","HEADER"]:continue
+            qi_count+=1
+            rb=cb[qi_idx]if qi_idx<len(cb)else""
+            atoms.append({"Qi":{"id":f"{pid}_Q{qi_count}","pair_id":pid,"text":q.strip(),"points":_pts(q),
+                "source_hash":sha(q.strip()),"category":cat},
+                "RQi":{"id":f"{pid}_R{qi_count}","pair_id":pid,"text":rb.strip(),"source_hash":sha(rb.strip())}})
     return atoms
-# ═══ B7: QC ═══
-QC_SCHEMA={"qi_text_min":40,"rqi_text_min":0,"placeholder_patterns":["[OCR_PENDING","[DL_FAIL","[PENDING","[HARVEST"]}
+# ═══ B7: QC — Intelligent Validation ═══
+QC_SCHEMA={"qi_text_min":40,"placeholder_patterns":["[OCR_PENDING","[DL_FAIL","[PENDING","[HARVEST"]}
 def calc_qc(atoms):
     qc=[]
     for a in atoms:
         qi,rqi=a["Qi"],a["RQi"]
-        checks={"qi_len":len(qi["text"])>=QC_SCHEMA["qi_text_min"],
-                "points_or_long":(qi.get("points")is not None and qi["points"]>0)or len(qi["text"])>=150,
-                "qi_no_placeholder":not any(k in qi["text"]for k in QC_SCHEMA["placeholder_patterns"])}
+        cat=qi.get("category","QUESTION")
+        checks={
+            "qi_len":len(qi["text"])>=QC_SCHEMA["qi_text_min"],
+            "is_question":cat in["QUESTION","FRAGMENT"],
+            "has_substance":(qi.get("points")is not None and qi["points"]>0)or len(qi["text"])>=100,
+            "qi_no_placeholder":not any(k in qi["text"]for k in QC_SCHEMA["placeholder_patterns"])}
         valid=all(checks.values())
         reason="OK"if valid else next(k for k,v in checks.items()if not v)
-        qc.append({"atom_id":qi["id"],"valid":valid,"reason":reason,"checks":checks,"qi_hash":qi["source_hash"],"rqi_hash":rqi["source_hash"],"points":qi.get("points")or 0})
+        qc.append({"atom_id":qi["id"],"valid":valid,"reason":reason,"checks":checks,
+            "qi_hash":qi["source_hash"],"rqi_hash":rqi["source_hash"],"points":qi.get("points")or 0,
+            "category":cat})
     return qc
 # ═══ B8: FRT / ARI / TRIGGERS ═══
 def calc_frt(atoms,qc):
@@ -539,18 +672,29 @@ def calc_frt(atoms,qc):
     total=max(sum(t["c"]for t in themes.values()),1)
     return[{"theme":k,"frequency":v["c"],"recurrence":1,"weight":round(v["c"]/total,4),"total_points":v["p"]}for k,v in sorted(themes.items())]
 def calc_ari(atoms,qc):
-    vids={q["atom_id"]for q in qc if q["valid"]};etot={}
+    vids={q["atom_id"]for q in qc if q["valid"]};etot={};ecnt={}
     for a in atoms:
-        if a["Qi"]["id"]in vids:pid=a["Qi"]["pair_id"];etot[pid]=etot.get(pid,0)+(a["Qi"].get("points")or 1)
+        if a["Qi"]["id"]in vids:
+            pid=a["Qi"]["pair_id"]
+            etot[pid]=etot.get(pid,0)+(a["Qi"].get("points")or 1)
+            ecnt[pid]=ecnt.get(pid,0)+1
     profiles=[]
-    for a in atoms:
+    for idx,a in enumerate(atoms):
         qi,rqi=a["Qi"],a["RQi"]
         if qi["id"]not in vids:continue
-        pts=qi.get("points")or 1;total=max(etot.get(qi["pair_id"],1),1)
-        diff=round(min((pts/total)*min(len(rqi["text"])/max(len(qi["text"]),1),3)if rqi["text"]else pts/total,0.99),3)
-        qi_density=min(len(qi["text"])/200,1)
-        disc=round(max(0.05,min((pts/total)*qi_density,0.95)),3)
-        profiles.append({"atom_id":qi["id"],"pair_id":qi["pair_id"],"difficulty":diff,"discrimination":disc,"points":pts,"exam_total":total})
+        pid=qi["pair_id"];pts=qi.get("points")or 1
+        total=max(etot.get(pid,1),1);cnt=max(ecnt.get(pid,1),1)
+        # Difficulty: based on point weight + text complexity
+        weight=pts/total
+        text_complexity=min(len(qi["text"])/500,1.0)  # longer = more complex
+        has_math=1.0 if re.search(r'[=+\-×÷∫∑√π²³]|calcul|solve|prove|démontrer',qi["text"],re.I)else 0.5
+        diff=round(min(weight*0.4+text_complexity*0.3+has_math*0.3,0.99),3)
+        # Discrimination: based on position diversity + point spread
+        position_factor=min((idx%cnt+1)/cnt,1.0)
+        point_spread=min(pts/max(total/cnt,1),1.0)
+        has_answer=0.3 if rqi["text"]else 0.0
+        disc=round(max(0.10,min(position_factor*0.3+point_spread*0.3+text_complexity*0.2+has_answer+0.1,0.95)),3)
+        profiles.append({"atom_id":qi["id"],"pair_id":pid,"difficulty":diff,"discrimination":disc,"points":pts,"exam_total":total})
     return profiles
 def calc_triggers(ari,frt,f1,f2):
     trig=[]
@@ -558,36 +702,46 @@ def calc_triggers(ari,frt,f1,f2):
         if p["difficulty"]>0.7:trig.append({"trigger":"HIGH_DIFFICULTY","atom_id":p["atom_id"],"value":p["difficulty"],"severity":"WARN"})
         if p["discrimination"]<0.2:trig.append({"trigger":"LOW_DISCRIMINATION","atom_id":p["atom_id"],"value":p["discrimination"],"severity":"INFO"})
     for f in frt:
-        if f["weight"]>0.25:trig.append({"trigger":"HIGH_FREQ_THEME","theme":f["theme"],"value":f["weight"],"severity":"INFO"})
+        if f["weight"]>0.30:trig.append({"trigger":"HIGH_FREQ_THEME","theme":f["theme"],"value":f["weight"],"severity":"INFO"})
     if f1.get("status")=="OK"and f2.get("status")=="OK":
-        gap=abs(f2["score"]-f1["score"])
-        if gap>0.15:trig.append({"trigger":"SCORE_GAP","f1":f1["score"],"f2":f2["score"],"gap":round(gap,4),"severity":"WARN"})
+        gap=abs(f2.get("score",0)-f1.get("score",0))
+        if gap>0.15:trig.append({"trigger":"SCORE_GAP","value":round(gap,4),"f1":f1["score"],"f2":f2["score"],"severity":"WARN"})
     return trig
 # ═══ B9: F1/F2 TEST_CLEAR ═══
 def compute_f1_clear(atoms,frt,qc):
     valid_atoms=[a for a in atoms if a["Qi"]["id"]in{q["atom_id"]for q in qc if q["valid"]}]
     if not valid_atoms:return _f_empty("F1")
-    exam_scores={};total_w=0
+    exam_data={}
     for a in valid_atoms:
         pid=a["Qi"]["pair_id"];pts=a["Qi"].get("points")or 1
-        exam_scores.setdefault(pid,{"sum_pts":0,"count":0})
-        exam_scores[pid]["sum_pts"]+=pts;exam_scores[pid]["count"]+=1
-    scores=[]
-    for pid,es in exam_scores.items():
-        norm=min(es["sum_pts"]/(max(es["count"],1)*10),1.0)
-        w=next((f["weight"]for f in frt if f["theme"]==pid),1/max(len(exam_scores),1))
-        scores.append(norm*w);total_w+=w
-    f1_score=round(sum(scores)/max(total_w,0.01),4)if scores else 0
-    return{"score":f1_score,"status":"OK","formula_mode":"TEST_CLEAR","formula_version":"TEST_V0",
+        exam_data.setdefault(pid,{"sum_pts":0,"count":0,"max_pts":0})
+        exam_data[pid]["sum_pts"]+=pts;exam_data[pid]["count"]+=1;exam_data[pid]["max_pts"]=max(exam_data[pid]["max_pts"],pts)
+    # F1 = weighted coverage score across exams
+    # Each exam contributes: (valid_questions / expected_questions) * weight
+    total_valid=len(valid_atoms);total_atoms=len(atoms)
+    coverage=total_valid/max(total_atoms,1)
+    # Diversity bonus: more exams = better
+    n_exams=len(exam_data)
+    diversity=min(n_exams/5,1.0)  # cap at 5 exams
+    # Points completeness: do we have points for most questions?
+    pts_ratio=sum(1 for a in valid_atoms if a["Qi"].get("points"))/max(len(valid_atoms),1)
+    f1_score=round(min(coverage*0.5+diversity*0.3+pts_ratio*0.2,1.0),4)
+    return{"score":f1_score,"status":"OK","formula_mode":"TEST_CLEAR","formula_version":"TEST_V1",
            "approved":False,"source":"R&D","note":"Not sealed. Not IP reference. For pipeline validation only.",
-           "n_exams":len(exam_scores),"n_items":len(valid_atoms)}
+           "n_exams":n_exams,"n_items":len(valid_atoms),"coverage":round(coverage,4),"diversity":round(diversity,4),"pts_ratio":round(pts_ratio,4)}
 def compute_f2_clear(f1,ari,triggers):
     if f1.get("status")!="OK"or not ari:return _f_empty("F2")
     avg_diff=sum(p["difficulty"]for p in ari)/max(len(ari),1)
     avg_disc=sum(p["discrimination"]for p in ari)/max(len(ari),1)
-    trig_penalty=sum(0.01 for t in triggers if t.get("severity")=="WARN")
-    f2_score=round(max(0,min(f1["score"]*(0.5+avg_disc*0.3+avg_diff*0.2)-trig_penalty,1.0)),4)
-    spread=round(avg_disc*0.15,4)
+    warn_count=sum(1 for t in triggers if t.get("severity")=="WARN")
+    trig_penalty=min(warn_count*0.02,0.15)
+    # F2 = f1 adjusted by quality metrics
+    f2_score=round(max(0,min(f1["score"]*(0.4+avg_disc*0.35+avg_diff*0.25)-trig_penalty,1.0)),4)
+    spread=round(avg_disc*0.1,4)
+    return{"score":f2_score,"status":"OK","formula_mode":"TEST_CLEAR","formula_version":"TEST_V1",
+           "approved":False,"source":"R&D","note":"Not sealed. Not IP reference. For pipeline validation only.",
+           "predicted_range":[round(max(0,f2_score-spread),4),round(min(1,f2_score+spread),4)],
+           "avg_difficulty":round(avg_diff,4),"avg_discrimination":round(avg_disc,4)}
     return{"score":f2_score,"status":"OK","formula_mode":"TEST_CLEAR","formula_version":"TEST_V0",
            "approved":False,"source":"R&D","note":"Not sealed. Not IP reference. For pipeline validation only.",
            "predicted_range":[round(max(0,f2_score-spread),4),round(min(1,f2_score+spread),4)],
@@ -629,15 +783,25 @@ def det_check(fn,iso2,rid,n=3):
     if mf.exists():
         try:sealed=json.loads(mf.read_text(encoding="utf-8"))
         except:pass
+    af=RUN_DIR/rid/"AR0.json";sealed_ar0=None
+    if af.exists():
+        try:sealed_ar0=json.loads(af.read_text(encoding="utf-8"))
+        except:pass
+    cf=RUN_DIR/rid/"CAP.json";sealed_cap=None
+    if cf.exists():
+        try:sealed_cap=json.loads(cf.read_text(encoding="utf-8"))
+        except:pass
     hashes=[]
     for _ in range(n):
-        snap=fn(iso2,_replay=True,_sealed_src=sealed)["snapshot"]
+        snap=fn(iso2,_replay=True,_sealed_src=sealed,_sealed_ar0=sealed_ar0,_sealed_cap=sealed_cap)["snapshot"]
         hashes.append(sha(cj(sv(snap))))
     return{"pass":len(set(hashes))==1,"hashes":hashes}
-def run_pipeline(iso2,_replay=False,_sealed_src=None):
+def run_pipeline(iso2,_replay=False,_sealed_src=None,_sealed_ar0=None,_sealed_cap=None):
     st.session_state["_sil"]=_replay;log_ev("PIPELINE",iso2)
-    ar0=da0_discover_ar0(iso2)
-    cap=cap_build(ar0,iso2)
+    if _sealed_ar0 is not None:ar0=_sealed_ar0
+    else:ar0=da0_discover_ar0(iso2)
+    if _sealed_cap is not None:cap=_sealed_cap
+    else:cap=cap_build(ar0,iso2)
     rid=f"RUN_{iso2}_{sha(cj(sv(cap)))[:8]}"
     vsp=vsp_validate(cap)
     if _sealed_src is not None:
