@@ -261,7 +261,7 @@ def bloc3_cap(ar0,seed):
     iso2=seed["iso2"];cn=seed["country_name"];langs=seed.get("languages",["en"]);log_ev("BLOC3_CAP",iso2)
     if ar0["status"]!="OK":return{"status":"FAIL","code":"AR0_FAIL","iso2":iso2,"A_METADATA":{"status":"FAIL"},"C_HARVEST":{"authority_domains":[],"pages_crawled":0,"pdfs_found":0,"documents":[],"authority_graph":[]},"B_EDUCATION":{"levels":[],"subjects":[],"chapters_status":"FAIL"},"E_EXAMS":{"exams":[],"grading":{"max":0,"description":"N/A"}},"D_KERNEL":{}}
     domains=ar0.get("domains",[]);wiki=_wiki_cap(cn)
-    pages,pdfs=[];allowed=set(domains);pages=[];pdfs=[]
+    pages=[];pdfs=[];allowed=set(domains)
     seeds=[v["url"]for v in[ar0["selected"].get("AR0_EDU"),ar0["selected"].get("AR0_EXAM")]if v]
     exam_dom=ar0["selected"].get("AR0_EXAM")
     if exam_dom and exam_dom.get("accessible"):
@@ -537,24 +537,8 @@ def run_full_pipeline(iso2):
 # ═══ PREMIUM UI ═══
 def _css():
     st.markdown("""<style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Outfit:wght@300;500;700;900&display=swap');
-    .stApp {font-family:'Outfit',sans-serif}
-    [data-testid="stSidebar"]{background:linear-gradient(180deg,#0a0e1a 0%,#111827 100%);color:#e2e8f0}
-    [data-testid="stSidebar"] .stMarkdown{color:#e2e8f0}
-    [data-testid="stSidebar"] p,.sidebar-text{color:#94a3b8!important}
     .block-container{padding-top:1rem}
-    div[data-testid="stMetric"]{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:12px;padding:12px 16px}
-    div[data-testid="stMetric"] label{color:#94a3b8!important;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em}
-    div[data-testid="stMetric"] [data-testid="stMetricValue"]{color:#f1f5f9!important;font-family:'JetBrains Mono';font-weight:700}
-    .stTabs [data-baseweb="tab-list"]{background:#0f172a;border-radius:12px;padding:4px;gap:2px}
-    .stTabs [data-baseweb="tab"]{color:#94a3b8;border-radius:8px;font-weight:500}
-    .stTabs [aria-selected="true"]{background:linear-gradient(135deg,#3b82f6,#6366f1)!important;color:#fff!important}
-    div[data-testid="stExpander"]{border:1px solid #1e293b;border-radius:8px;background:#0f172a}
-    .top-bar{background:linear-gradient(135deg,#0f172a,#1e1b4b);border-radius:16px;padding:20px 24px;margin-bottom:16px;border:1px solid #312e81}
-    .status-pass{color:#22c55e;font-weight:700;font-family:'JetBrains Mono'}.status-fail{color:#ef4444;font-weight:700;font-family:'JetBrains Mono'}
-    .gate-pass{background:#052e16;border:1px solid #16a34a;border-radius:6px;padding:4px 8px;margin:2px 0;font-size:0.85rem;color:#86efac}
-    .gate-fail{background:#450a0a;border:1px solid #dc2626;border-radius:6px;padding:4px 8px;margin:2px 0;font-size:0.85rem;color:#fca5a5}
-    .decision-reject{color:#f87171;font-size:0.8rem}.decision-accept{color:#4ade80;font-size:0.8rem}
+    .decision-reject{color:#dc2626;font-size:0.85rem}.decision-accept{color:#16a34a;font-size:0.85rem}
     </style>""",unsafe_allow_html=True)
 def main():
     st.set_page_config(page_title=f"SMAXIA v{VERSION}",layout="wide",initial_sidebar_state="expanded")
@@ -584,8 +568,8 @@ def main():
             st.markdown(f"{ico} {k}")
         if st.session_state.pipeline and"seal"in st.session_state.pipeline:
             s=st.session_state.pipeline["seal"];st.markdown("---")
-            v_class="status-pass"if s["verdict"]=="PASS"else"status-fail"
-            st.markdown(f'<p class="{v_class}">{s["iso2"]}: {s["verdict"]}</p>',unsafe_allow_html=True)
+            v_ico="✅"if s["verdict"]=="PASS"else"❌"
+            st.markdown(f"**{s['iso2']}: {v_ico} {s['verdict']}**")
             st.markdown(f"**F1:** `{s['f1']:.4f}` **F2:** `{s['f2']:.4f}`")
             st.markdown(f"Atoms:`{s['n_atoms']}` QC:`{s['n_qc_pass']}/{s['n_qc']}` Pairs:`{s['n_pairs']}`")
             st.markdown(f"Cov:`{s['coverage']:.0%}` Lang:`{s.get('languages',[])}`")
@@ -596,7 +580,8 @@ def main():
     # ═══ MAIN ═══
     p=st.session_state.pipeline
     if not p or"seal"not in p:
-        st.markdown('<div class="top-bar"><h1 style="color:#e2e8f0;margin:0">🚀 SMAXIA MISSION CONTROL</h1><p style="color:#94a3b8;margin:0">Select a country in the sidebar and press ACTIVATE</p></div>',unsafe_allow_html=True)
+        st.title(f"🚀 SMAXIA MISSION CONTROL v{VERSION}")
+        st.info("Select a country in the sidebar and press ACTIVATE")
         return
     s=p["seal"]
     # Status bar
@@ -693,8 +678,7 @@ def main():
         st.progress(min(cov["coverage_rate"],1.0),text=f"Coverage: {cov['coverage_rate']:.1%}")
         st.markdown("#### Gates")
         for g in p["gates"]["gates"]:
-            cls="gate-pass"if g["verdict"]=="PASS"else"gate-fail"
-            st.markdown(f'<div class="{cls}">{"✅"if g["verdict"]=="PASS"else"🔴"} <b>{g["gate"]}</b> {g["evidence"]}</div>',unsafe_allow_html=True)
+            st.write(f"{'✅' if g['verdict']=='PASS' else '🔴'} **{g['gate']}** `{g['evidence']}`")
         if cov["orphans"]:
             st.markdown("#### Orphans");[st.write(f"⚠️ {o['qi_id']}")for o in cov["orphans"][:10]]
         st.divider();fc1,fc2=st.columns(2)
