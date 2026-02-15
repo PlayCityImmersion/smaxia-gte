@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""SMAXIA GTE CORE v15.0.0 — ISO-PROD
-CHANGELOG v15: Brave L2 snapshot+SHA256, DA1 15 pairs, QUARANTINE pairing/atoms,
-CAP_PARTIAL_NO_CHAPTERS, QC_text from Qi source, singleton bootstrap, CHK_REPORT.
-Formulas TEST_CLEAR (CEO concession for TEST phase)."""
+"""SMAXIA GTE CORE v15.1.0 — ISO-PROD
+Pipeline 11 Blocs: ACTIVATE→DA0→CAP→DA1→ATOMS→IA1_MINER→CLUSTERING→IA1_BUILDER→IA2_JUDGE→F1F2→COVERAGE+SEAL
+UI: 6 onglets Mission Control (CAP, SUJETS, Qi/RQi, QC, KPI, MAPPING)
+Fixes: st.secrets for API keys, Wikidata P37 for lang detection, Brave L2 snapshot."""
 import streamlit as st
-import json,hashlib,re,os,importlib.util
+import json,hashlib,re,os,importlib.util,io
 from datetime import datetime,timezone
 from pathlib import Path
 from urllib.parse import quote_plus,urljoin,urlparse
 RUN_DIR,CACHE_DIR=Path("run"),Path("web_cache")
 VOLATILE={"timestamp","ts","run_id","elapsed_ms","wall_clock","fetched_at"}
-EXEC_MODE="TEST";VERSION="15.0.0"
+EXEC_MODE="TEST";VERSION="15.1.0"
 def cj(o):return json.dumps(o,sort_keys=True,ensure_ascii=False,separators=(",",":"))
 def sha(d):return hashlib.sha256((d if isinstance(d,bytes)else d.encode("utf-8"))).hexdigest()
 def sv(o):
@@ -23,6 +23,10 @@ def w_art(rid,name,data):
 def log_ev(t,d=""):
     if st.session_state.get("_sil"):return
     st.session_state.setdefault("ui_ev",[]).append({"type":t,"detail":d,"ts":datetime.now(timezone.utc).isoformat()})
+def _secret(key):
+    """st.secrets FIRST (Streamlit Cloud canonical), then os.environ fallback."""
+    try:return st.secrets[key]
+    except:return os.environ.get(key)
 @st.cache_data
 def _cdb():
     db={}
@@ -78,357 +82,306 @@ def _links(html,base,fn=None):
         raw=re.findall(r'href=["\']([^"\']+)',html or"");out=[]
         for r2 in raw:
             u=urljoin(base,r2);txt=""
-            m=re.search(r'>([^<]{1,120})</a',html[html.find(r2):html.find(r2)+500],re.I)
-            if m:txt=m.group(1).strip()
+            pos=html.find(r2)
+            if pos>=0:
+                m=re.search(r'>([^<]{1,120})</a',html[pos:pos+500],re.I)
+                if m:txt=m.group(1).strip()
             if fn and not fn(u,txt):continue
             out.append({"url":u,"text":txt})
         return out
     except:return[]
-# ═══ B1: DA0 AR0 ═══
-def _invariant_queries(cn):
-    return[f'"ministry of education" "{cn}"',f'"national curriculum" "{cn}"',f'"exam syllabus" "{cn}"',
-           f'"secondary education" "{cn}"',f'"examination board" "{cn}"',f'"examination council" "{cn}"']
-def _authority_score(url,html,aux=""):
+# ═══ BLOC 1: ACTIVATE_COUNTRY ═══
+def bloc1_activate(iso2):
+    log_ev("BLOC1_ACTIVATE",iso2);db,_=_cdb();cn=db.get(iso2)
+    if not cn:return{"status":"FAIL","gate":"GATE_ISO2_VALID","iso2":iso2}
+    return{"status":"OK","iso2":iso2,"country_name":cn,"languages":[],"gate":"GATE_ISO2_VALID"}
+# ═══ BLOC 2: DA0 Authority Discovery ═══
+def _dom_score(dom):
+    for kw,v in[(".gov",0.9),(".gouv",0.9),(".nic.",0.85),(".edu",0.8),(".ac.",0.7)]:
+        if kw in dom.lower():return v
+    return 0.3
+def _is_sub(dom,roots):
+    for r in roots:
+        if dom==r or dom.endswith("."+r):return True
+    return False
+def _auth_score(url,html):
     dom=urlparse(url).netloc.lower();reasons=[];sc=0.3
-    for kw,v,tag in[(".gov",0.9,"TLD_GOV"),(".gouv",0.9,"TLD_GOUV"),(".edu",0.8,"TLD_EDU"),(".ac.",0.7,"TLD_AC"),(".nic.",0.85,"TLD_NIC_GOV")]:
+    for kw,v,tag in[(".gov",0.9,"TLD_GOV"),(".gouv",0.9,"TLD_GOUV"),(".edu",0.8,"TLD_EDU"),(".ac.",0.7,"TLD_AC"),(".nic.",0.85,"TLD_NIC")]:
         if kw in dom:sc=max(sc,v);reasons.append(tag)
     low=(html or"").lower()[:8000]
-    for kw,tag in[("ministry","OFFICIAL_EDU"),("ministère","OFFICIAL_EDU"),("education","OFFICIAL_EDU"),("curriculum","SYLLABUS"),("examination","OFFICIAL_EXAM"),("question paper","EXAM_CONTENT"),("past paper","EXAM_CONTENT"),("annales","EXAM_CONTENT"),("sujet","EXAM_CONTENT")]:
+    for kw,tag in[("ministry","OFFICIAL_EDU"),("ministère","OFFICIAL_EDU"),("education","OFFICIAL_EDU"),("examination","OFFICIAL_EXAM"),("question paper","EXAM_CONTENT"),("past paper","EXAM_CONTENT"),("annales","EXAM_CONTENT"),("sujet","EXAM_CONTENT")]:
         if kw in low:reasons.append(tag)
     if any(k in reasons for k in["OFFICIAL_EDU","OFFICIAL_EXAM"]):sc=max(sc,0.75)
-    if "EXAM_CONTENT"in reasons:sc=max(sc,0.7)
+    if"EXAM_CONTENT"in reasons:sc=max(sc,0.7)
     return{"score":round(sc,2),"reasons":reasons[:10]}
-def _country_tld_check(url,iso2,cn):
-    dom=urlparse(url).netloc.lower()
-    return any(k in dom for k in[".gov",".gouv",".edu",".ac.",".nic.",".org"])or f".{iso2.lower()}"in dom
-def _wikidata_ar0(cn,iso2,diag):
-    results=[]
-    terms=[f"Ministry of Education ({cn})",f"Ministry of Education {cn}",f"Central Board Secondary Education {cn}",
-           f"national examination board {cn}",f"examination council {cn}",f"Education in {cn}"]
-    try:
-        import urllib.request,urllib.parse
-        for term in terms:
-            su='https://en.wikipedia.org/w/api.php?'+urllib.parse.urlencode({'action':'query','list':'search','srsearch':term,'format':'json','srlimit':3})
-            req=urllib.request.Request(su,headers={'User-Agent':f'SMAXIA-GTE/{VERSION}'})
-            with urllib.request.urlopen(req,timeout=12)as r:data=json.loads(r.read())
-            for res in data.get('query',{}).get('search',[]):
-                title=res['title']
-                wu='https://en.wikipedia.org/w/api.php?'+urllib.parse.urlencode({'action':'query','titles':title,'prop':'pageprops','ppprop':'wikibase_item','format':'json'})
-                req2=urllib.request.Request(wu,headers={'User-Agent':f'SMAXIA-GTE/{VERSION}'})
-                with urllib.request.urlopen(req2,timeout=10)as r2:data2=json.loads(r2.read())
-                for pid,page in data2.get('query',{}).get('pages',{}).items():
-                    qid=page.get('pageprops',{}).get('wikibase_item')
-                    if not qid:continue
-                    wdu=f'https://www.wikidata.org/w/api.php?action=wbgetclaims&entity={qid}&property=P856&format=json'
-                    req3=urllib.request.Request(wdu,headers={'User-Agent':f'SMAXIA-GTE/{VERSION}'})
-                    with urllib.request.urlopen(req3,timeout=10)as r3:data3=json.loads(r3.read())
-                    for c2 in data3.get('claims',{}).get('P856',[]):
-                        u=c2.get('mainsnak',{}).get('datavalue',{}).get('value','')
-                        if not any(k in u.lower()for k in['.gov','.gouv','.edu','.ac.','.nic.']):continue
-                        if not _country_tld_check(u,iso2,cn):continue
-                        if u not in[x["url"]for x in results]:
-                            ie=any(k in title.lower()for k in["exam","board","council","secondary","certificate"])
-                            diag.append({"p":"wikidata","url":u,"qid":qid,"title":title,"is_exam":ie})
-                            results.append({"url":u,"title":title,"provider":"wikidata","qid":qid,"is_exam":ie})
-            if len(results)>=4:break
-    except:pass
-    results.sort(key=lambda x:x["url"])
-    variants=[]
-    for r2 in results:
-        u=r2["url"];dom=urlparse(u).netloc
-        if".nic."in dom:
-            alt=u.replace(dom,dom.replace(".nic.",".gov.")).replace("http://","https://")
-            if alt not in[x["url"]for x in results]:variants.append({**r2,"url":alt,"title":r2["title"]+" (gov variant)","provider":"domain_variant"})
-    results.extend(variants);return results
 def _brave_search(queries,diag,max_per=10):
-    """Brave Search L2 — snapshot+hash for determinism."""
-    cands,snaps=[],[];bk=os.environ.get("BRAVE_KEY")
-    if not bk:return cands,snaps
+    bk=_secret("BRAVE_KEY")
+    if not bk:return[],[]
+    cands=[];snaps=[]
     try:
         import requests as rq
         for q in queries:
             r=rq.get("https://api.search.brave.com/res/v1/web/search",params={"q":q,"count":max_per},
                 headers={"Accept":"application/json","X-Subscription-Token":bk},timeout=15)
-            diag.append({"p":"brave","q":q[:50],"s":r.status_code,"source_flag":"BRAVE_L2"})
+            diag.append({"p":"brave","q":q[:60],"s":r.status_code})
             if r.status_code==200:
                 raw=r.text;sh=sha(raw)
-                snaps.append({"query":q[:60],"response_hash":sh,"ts":datetime.now(timezone.utc).isoformat()})
+                snaps.append({"query":q[:60],"hash":sh,"ts":datetime.now(timezone.utc).isoformat()})
                 for res in r.json().get("web",{}).get("results",[]):
-                    cands.append({"url":res.get("url",""),"title":res.get("title","")[:100],"provider":"brave","source_flag":"BRAVE_L2","snapshot_hash":sh})
+                    cands.append({"url":res.get("url",""),"title":res.get("title","")[:100],"provider":"brave","source_flag":"BRAVE_L2","snap_hash":sh})
     except:pass
     return cands,snaps
-def _serpapi_search(queries,diag):
-    cands=[];key=os.environ.get("SERPAPI_KEY")
-    if not key:return cands
+def _wikidata_ar0(cn,iso2,diag):
+    results=[]
+    terms=[f"Ministry of Education ({cn})",f"Ministry of Education {cn}",f"examination board {cn}",f"Education in {cn}"]
     try:
-        import requests as rq
-        for q in queries[:4]:
-            r=rq.get("https://serpapi.com/search",params={"q":q,"api_key":key,"num":10},timeout=15)
-            diag.append({"p":"serpapi","q":q[:50],"s":r.status_code})
-            if r.status_code==200:
-                for res in r.json().get("organic_results",[]):cands.append({"url":res.get("link",""),"title":res.get("title","")[:100],"provider":"serpapi"})
+        import urllib.request as ul,urllib.parse as up
+        for term in terms:
+            su='https://en.wikipedia.org/w/api.php?'+up.urlencode({'action':'query','list':'search','srsearch':term,'format':'json','srlimit':3})
+            req=ul.Request(su,headers={'User-Agent':f'SMAXIA/{VERSION}'})
+            with ul.urlopen(req,timeout=12)as r:data=json.loads(r.read())
+            for res in data.get('query',{}).get('search',[]):
+                title=res['title']
+                wu='https://en.wikipedia.org/w/api.php?'+up.urlencode({'action':'query','titles':title,'prop':'pageprops','ppprop':'wikibase_item','format':'json'})
+                with ul.urlopen(ul.Request(wu,headers={'User-Agent':f'SMAXIA/{VERSION}'}),timeout=10)as r2:data2=json.loads(r2.read())
+                for pid,page in data2.get('query',{}).get('pages',{}).items():
+                    qid=page.get('pageprops',{}).get('wikibase_item')
+                    if not qid:continue
+                    wdu=f'https://www.wikidata.org/w/api.php?action=wbgetclaims&entity={qid}&property=P856&format=json'
+                    with ul.urlopen(ul.Request(wdu,headers={'User-Agent':f'SMAXIA/{VERSION}'}),timeout=10)as r3:data3=json.loads(r3.read())
+                    for c2 in data3.get('claims',{}).get('P856',[]):
+                        u=c2.get('mainsnak',{}).get('datavalue',{}).get('value','')
+                        if not any(k in u.lower()for k in['.gov','.gouv','.edu','.ac.','.nic.']):continue
+                        dom=urlparse(u).netloc.lower()
+                        if f".{iso2.lower()}"not in dom and not any(k in dom for k in[".gov",".gouv",".edu"]):continue
+                        if u not in[x["url"]for x in results]:
+                            ie=any(k in title.lower()for k in["exam","board","council","certificate"])
+                            results.append({"url":u,"title":title,"provider":"wikidata","is_exam":ie})
+            if len(results)>=4:break
     except:pass
-    return cands
-def da0_discover_ar0(iso2):
-    log_ev("DA0_AR0",iso2);db,_=_cdb();cn=db.get(iso2,iso2)
-    queries=_invariant_queries(cn);diag=[]
-    bcands,bsnaps=_brave_search(queries[:4],diag)
-    cands=bcands+_serpapi_search(queries,diag)+_wikidata_ar0(cn,iso2,diag)
-    if not cands:return{"status":"FAIL","code":"NO_CANDIDATES","iso2":iso2,"country":cn,"diag":diag,"candidates":[],"selected":None,"domains":[],"sha256":sha("FAIL"),"brave_snapshots":bsnaps}
+    results.sort(key=lambda x:x["url"]);return results
+def _wikidata_lang(cn,iso2):
+    """Wikidata P37 (official language) — NO hardcoded country lists."""
+    try:
+        import urllib.request as ul
+        # Find country QID
+        su=f'https://www.wikidata.org/w/api.php?action=wbsearchentities&search={cn}&language=en&type=item&limit=3&format=json'
+        with ul.urlopen(ul.Request(su,headers={'User-Agent':f'SMAXIA/{VERSION}'}),timeout=10)as r:data=json.loads(r.read())
+        for res in data.get('search',[]):
+            qid=res['id']
+            # Check P37 (official language)
+            wu=f'https://www.wikidata.org/w/api.php?action=wbgetclaims&entity={qid}&property=P37&format=json'
+            with ul.urlopen(ul.Request(wu,headers={'User-Agent':f'SMAXIA/{VERSION}'}),timeout=10)as r2:data2=json.loads(r2.read())
+            claims=data2.get('claims',{}).get('P37',[])
+            if not claims:continue
+            lang_qids=[c.get('mainsnak',{}).get('datavalue',{}).get('value',{}).get('id','')for c in claims]
+            # Map language QIDs to ISO codes
+            lang_map={"Q150":"fr","Q1860":"en","Q1321":"es","Q5146":"pt","Q13955":"ar","Q188":"de","Q652":"it","Q7850":"zh","Q9610":"bn","Q11059":"ru","Q1571":"hi"}
+            langs=[]
+            for lq in lang_qids:
+                if lq in lang_map and lang_map[lq]not in langs:langs.append(lang_map[lq])
+            if langs:
+                if"en"not in langs:langs.append("en")
+                return langs[:3]
+    except:pass
+    return["en"]
+def bloc2_da0(seed):
+    iso2=seed["iso2"];cn=seed["country_name"];log_ev("BLOC2_DA0",iso2)
+    queries=[f'"ministry of education" "{cn}"',f'"examination board" "{cn}"',f'"national curriculum" "{cn}"',f'"secondary education" "{cn}"']
+    diag=[];bcands,bsnaps=_brave_search(queries[:4],diag)
+    wcands=_wikidata_ar0(cn,iso2,diag);cands=bcands+wcands
+    langs=_wikidata_lang(cn,iso2);seed["languages"]=langs
+    if not cands:return{"status":"FAIL","code":"NO_CANDIDATES","iso2":iso2,"country":cn,"diag":diag,"candidates":[],"selected":None,"domains":[],"brave_snaps":bsnaps,"languages":langs}
     seen=set();verified=[]
     for c in cands:
         u=c["url"];dom=urlparse(u).netloc
         if dom in seen:continue
-        seen.add(dom)
-        html,sc,_,_=http_get(u,timeout=12)
-        sf=c.get("source_flag","")
+        seen.add(dom);html,sc,_,_=http_get(u,timeout=12);sf=c.get("source_flag","")
         if sc not in range(200,300):
-            ps,pr=0,["HTTP_FAIL"]
-            if c.get("provider")=="wikidata":pr.append("ANNUAIRE_WIKIDATA");ps=0.5
-            if any(k in dom for k in[".gov",".gouv"]):ps=0.80;pr+=["TLD_GOV_INDIRECT","PROOF_B"]
-            elif any(k in dom for k in[".edu",".ac.",".nic."]):ps=max(ps,0.65);pr+=["TLD_EDU_INDIRECT","PROOF_B"]
-            verified.append({"url":u,"domain":dom,"http_status":sc,"score":ps,"reasons":pr,"accessible":False,"provider":c.get("provider",""),"proof":"B_INDIRECT","is_exam":c.get("is_exam",False),"source_flag":sf});continue
-        auth=_authority_score(u,html)
-        verified.append({"url":u,"domain":dom,"http_status":sc,"score":auth["score"],"reasons":auth["reasons"],"accessible":True,"provider":c.get("provider",""),"title":c.get("title","")[:80],"proof":"A_DIRECT","is_exam":c.get("is_exam",False),"source_flag":sf})
+            ps=0.8 if any(k in dom for k in[".gov",".gouv"])else(0.65 if any(k in dom for k in[".edu",".ac."])else 0.3)
+            verified.append({"url":u,"domain":dom,"score":ps,"accessible":False,"provider":c.get("provider",""),"is_exam":c.get("is_exam",False),"source_flag":sf})
+        else:
+            auth=_auth_score(u,html)
+            verified.append({"url":u,"domain":dom,"score":auth["score"],"reasons":auth["reasons"],"accessible":True,"provider":c.get("provider",""),"is_exam":c.get("is_exam",False),"source_flag":sf})
     verified.sort(key=lambda x:(-x["score"],sha(x["url"])))
-    ar0_edu=next((v for v in verified if any(k in v.get("reasons",[])for k in["OFFICIAL_EDU","TLD_GOV","TLD_GOUV","TLD_NIC_GOV"])and v["score"]>=0.55 and not v.get("is_exam")),None)
-    ar0_exam=next((v for v in verified if(v.get("is_exam")or any(k in v.get("reasons",[])for k in["OFFICIAL_EXAM","EXAM_CONTENT"]))and v["score"]>=0.55),None)
+    ar0_edu=next((v for v in verified if v["score"]>=0.55 and not v.get("is_exam")),None)
+    ar0_exam=next((v for v in verified if v.get("is_exam")and v["score"]>=0.55),None)
     if not ar0_edu:ar0_edu=next((v for v in verified if v["score"]>=0.55),None)
-    if not ar0_exam and not ar0_edu:return{"status":"FAIL","code":"NO_AUTHORITY","iso2":iso2,"country":cn,"diag":diag,"candidates":verified[:20],"selected":None,"domains":[],"sha256":sha("FAIL"),"brave_snapshots":bsnaps}
+    if not ar0_exam and not ar0_edu:return{"status":"FAIL","code":"NO_AUTHORITY","iso2":iso2,"country":cn,"diag":diag,"candidates":verified[:20],"selected":None,"domains":[],"brave_snaps":bsnaps,"languages":langs}
     selected={"AR0_EDU":ar0_edu,"AR0_EXAM":ar0_exam}
     domains=list(set(v["domain"]for v in[ar0_edu,ar0_exam]if v))
-    pack={"status":"OK","iso2":iso2,"country":cn,"queries":queries,"candidates":verified[:50],"selected":selected,"domains":domains,"diag":diag,"brave_snapshots":bsnaps}
-    pack["sha256"]=sha(cj(sv(pack)));log_ev("AR0_OK",str(domains));return pack
-# ═══ B2: CAP ═══
-def cap_build(ar0,iso2):
-    log_ev("CAP",iso2)
-    if ar0["status"]!="OK":return _cap_fail(iso2,ar0.get("country",""),"AR0_FAIL")
-    db,_=_cdb();cn=db.get(iso2,iso2);allowed=set(ar0.get("domains",[]));pages,pdfs=[],[]
+    ar0={"status":"OK","iso2":iso2,"country":cn,"candidates":verified[:50],"selected":selected,"domains":domains,"diag":diag,"brave_snaps":bsnaps,"languages":langs}
+    ar0["sha256"]=sha(cj(sv(ar0)));return ar0
+# ═══ BLOC 3: CAP BUILD ═══
+_LANG_TERMS={
+    "fr":{"exam":["sujet","épreuve","annales"],"answer":["corrigé","correction","barème"],"diploma":["baccalauréat","brevet","concours"]},
+    "en":{"exam":["exam","question paper","past paper"],"answer":["answer key","mark scheme","solution"],"diploma":["examination","certificate","board exam"]},
+    "es":{"exam":["examen","prueba"],"answer":["solución","corrección"],"diploma":["bachillerato","selectividad"]},
+    "pt":{"exam":["exame","prova"],"answer":["gabarito","correção"],"diploma":["ENEM","vestibular"]},
+    "ar":{"exam":["امتحان","اختبار"],"answer":["تصحيح","حل"],"diploma":["بكالوريا","شهادة"]},
+}
+def _wiki_cap(cn):
+    """Parse Wikipedia 'Education in {country}' for CAP structure."""
+    cap_data={"levels":[],"subjects":[],"chapters":[],"exams":[],"contests":[],"coefs":{}}
+    try:
+        import urllib.request as ul,urllib.parse as up
+        title=f"Education in {cn}"
+        wu='https://en.wikipedia.org/w/api.php?'+up.urlencode({'action':'parse','page':title,'prop':'wikitext|sections','format':'json'})
+        with ul.urlopen(ul.Request(wu,headers={'User-Agent':f'SMAXIA/{VERSION}'}),timeout=15)as r:data=json.loads(r.read())
+        wt=data.get('parse',{}).get('wikitext',{}).get('*','')
+        secs=data.get('parse',{}).get('sections',[])
+        low=wt.lower()
+        # Extract levels
+        for pat,name in[(r'(?:secondary|lycée|high school|senior)',  "Secondary"),(r'(?:primary|école|elementary)',"Primary"),(r'(?:university|higher|supérieur)',"Higher")]:
+            if re.search(pat,low):cap_data["levels"].append({"name":name,"source":"wikipedia"})
+        # Extract exam names
+        for pat,name in[(r'baccalaur[ée]at',"Baccalauréat"),(r'brevet',"Brevet"),(r'\bgce\b',"GCE"),(r'\bcbse\b',"CBSE"),(r'waec',"WAEC"),(r'concours',"Concours"),(r'\bgcse\b',"GCSE"),(r'entrance.exam',"Entrance Exam")]:
+            if re.search(pat,low):cap_data["exams"].append({"name":name,"source":"wikipedia"})
+    except:pass
+    return cap_data
+def bloc3_cap(ar0,seed):
+    iso2=seed["iso2"];cn=seed["country_name"];langs=seed.get("languages",["en"])
+    log_ev("BLOC3_CAP",iso2)
+    if ar0["status"]!="OK":return{"status":"FAIL","code":"AR0_FAIL","iso2":iso2,"sections":{}}
+    domains=ar0.get("domains",[])
+    # A) Wikipedia structure
+    wiki=_wiki_cap(cn)
+    # B) Crawl AR0 for PDFs and structure
+    pages,pdfs=[],[];allowed=set(domains)
     seeds=[v["url"]for v in[ar0["selected"].get("AR0_EDU"),ar0["selected"].get("AR0_EXAM")]if v]
     exam_dom=ar0["selected"].get("AR0_EXAM")
     if exam_dom and exam_dom.get("accessible"):
         base=exam_dom["url"].rstrip("/")
-        for ep in["/question-paper","/question-paper.html","/past-papers","/examinations","/papers","/annales","/sujets","/archives","/downloads","/exam-papers"]:
-            eu=base+ep
-            if eu not in seeds:seeds.append(eu)
+        for ep in["/question-paper","/past-papers","/examinations","/annales","/sujets","/archives","/downloads"]:seeds.append(base+ep)
     visited=set()
     for url in seeds:
         if url in visited:continue
         visited.add(url);html,sc,_,_=http_get(url,timeout=15)
         if sc not in range(200,300):continue
-        role=_page_role(html);pages.append({"url":url,"domain":urlparse(url).netloc,"status":sc,"role":role,"length":len(html or"")})
+        low=(html or"").lower()[:5000]
+        role="EXAM_ARCHIVE"if any(k in low for k in["past paper","question paper","annale","sujet","archive"])else("SYLLABUS"if any(k in low for k in["syllabus","curriculum","programme"])else"LANDING")
+        pages.append({"url":url,"domain":urlparse(url).netloc,"role":role})
         for link in _links(html,url):
             lu=link["url"];ldom=urlparse(lu).netloc
-            if".pdf"in lu.lower()and(ldom in allowed or _dom_score(ldom)>=0.7 or _is_subdomain(ldom,allowed)):
-                pdfs.append({"url":lu,"text":link["text"][:80],"domain":ldom,"source_page":url})
-        dom_set=set()
-        for link in _links(html,url)[:60]:
+            if".pdf"in lu.lower()and(ldom in allowed or _dom_score(ldom)>=0.5 or _is_sub(ldom,allowed)):
+                pdfs.append({"url":lu,"text":link["text"][:80],"domain":ldom})
+        for link in _links(html,url)[:40]:
             lu,lt=link["url"],link["text"].lower();ldom=urlparse(lu).netloc
             if lu in visited or".pdf"in lu.lower():continue
-            if any(k in lt or k in lu.lower()for k in["exam","question","paper","syllabus","programme","curriculum","past","sujet","annale","archive"])and ldom not in dom_set:
-                if _dom_score(ldom)>=0.7 or ldom in allowed or _is_subdomain(ldom,allowed):
-                    dom_set.add(ldom);visited.add(lu);h2,s2,_,_=http_get(lu,timeout=12)
-                    if s2 in range(200,300):
-                        pages.append({"url":lu,"domain":ldom,"status":s2,"role":_page_role(h2),"length":len(h2 or"")})
-                        for pl in _links(h2,lu,lambda u,t:".pdf"in u.lower())[:30]:
-                            pd=urlparse(pl["url"]).netloc
-                            if _dom_score(pd)>=0.5 or pd in allowed or _is_subdomain(pd,allowed):
-                                pdfs.append({"url":pl["url"],"text":pl["text"][:80],"domain":pd,"source_page":lu})
-                if len(visited)>25:break
-    exams=_detect_exams(pages,pdfs,cn);subjects=_detect_subjects(pdfs);grading=_detect_grading(pages)
-    exam_doms=set()
-    if ar0.get("selected",{}).get("AR0_EXAM"):exam_doms.add(urlparse(ar0["selected"]["AR0_EXAM"]["url"]).netloc)
-    pdfs.sort(key=lambda d:(0 if d.get("domain","")in exam_doms else 1,d.get("url","")))
-    proof="A_DIRECT"if pages else"B_INDIRECT"
-    status="DISCOVERED"if(pdfs or len(pages)>=2)else"PARTIAL"
-    status="CAP_PARTIAL_NO_CHAPTERS"if status in["DISCOVERED","PARTIAL"]else status
-    cap={"iso2":iso2,"country_name":cn,"status":status,"proof_level":proof,"ar0":ar0["selected"],"authority_domains":list(allowed),
-         "authority_graph":pages[:50],"documents":pdfs[:100],"exams":exams,"subjects":subjects,"grading":grading,
-         "chapters":[],"chapters_status":"NOT_EXTRACTED",
-         "provenance":{"ar0_sha256":ar0["sha256"],"pages_crawled":len(pages),"pdfs_found":len(pdfs),"proof":proof}}
-    cap["sha256"]=sha(cj(sv(cap)));log_ev("CAP_END",f"{status} {len(pdfs)}pdf");return cap
-def _cap_fail(iso2,cn,reason):
-    return{"iso2":iso2,"country_name":cn,"status":"FAIL","code":reason,"proof_level":"NONE","ar0":None,"authority_domains":[],"authority_graph":[],"documents":[],"exams":{"exams":[],"n_exams":0},"subjects":[],"grading":{"max":0,"description":"NONE"},"chapters":[],"chapters_status":"FAIL","provenance":{"reason":reason},"sha256":sha(reason)}
-def _page_role(html):
-    low=(html or"").lower()[:5000]
-    if any(k in low for k in["past paper","question paper","annale","sujet","archive","previous exam"]):return"EXAM_ARCHIVE"
-    if any(k in low for k in["syllabus","curriculum","programme"]):return"SYLLABUS"
-    return"LANDING"
-def _detect_exams(pages,pdfs,cn):
-    blob=" ".join([p["url"]+" "+p.get("role","")for p in pages]+[d["url"]+" "+d.get("text","")for d in pdfs]).lower()
-    found=[]
-    for pat,name in[(r'baccalaur',"Baccalaureat"),(r'brevet',"Brevet"),(r'\bgce\b',"GCE"),(r'\bgcse\b',"GCSE"),(r'\bcbse\b',"CBSE"),(r'class.?xii',"Class XII"),(r'concours',"Concours"),(r'waec',"WAEC"),(r'neco',"NECO"),(r'entrance.exam',"Entrance Exam")]:
-        if re.search(pat,blob,re.I):found.append({"name":name,"source":"ar0_crawl"})
-    return{"exams":found[:7],"n_exams":len(found[:7]),"body":f"Education authority of {cn}"}
-def _detect_subjects(pdfs):
+            if any(k in lt or k in lu.lower()for k in["exam","paper","syllabus","programme","sujet","annale","archive"])and(ldom in allowed or _dom_score(ldom)>=0.7):
+                visited.add(lu);h2,s2,_,_=http_get(lu,timeout=12)
+                if s2 in range(200,300):
+                    pages.append({"url":lu,"domain":ldom,"role":"CRAWLED"})
+                    for pl in _links(h2,lu,lambda u,t:".pdf"in u.lower())[:20]:
+                        pd=urlparse(pl["url"]).netloc
+                        if pd in allowed or _dom_score(pd)>=0.5:pdfs.append({"url":pl["url"],"text":pl["text"][:80],"domain":pd})
+            if len(visited)>25:break
+    # Detect subjects from PDFs
     blob=" ".join([d.get("text","")+d["url"]for d in pdfs]).lower()
-    return[{"name":s,"detected":True}for s in["Mathematics","Physics","Chemistry","Biology","Literature","History","Geography","Philosophy","Economics","Computer Science","English","French"]if s.lower()in blob]
-def _detect_grading(pages):
+    subjects=[{"name":s,"detected":True}for s in["Mathematics","Physics","Chemistry","Biology","Literature","History","Geography","Philosophy","Economics","English","French","Computer Science"]if s.lower()in blob]
+    # Detect grading
+    grading={"max":0,"description":"[NOT_DETECTED]"}
     for p in pages:
         html,_,_,_=http_get(p["url"],cache_only=True)
-        if not html:continue
-        low=html.lower()
-        if re.search(r'(?:note|grade|mark|barème).*?/\s*20\b',low):return{"max":20,"pass_threshold":10,"description":"Scale 0-20"}
-        if re.search(r'(?:maximum|total)\s+marks?\s*:?\s*100',low):return{"max":100,"pass_threshold":33,"description":"Scale 0-100"}
-    return{"max":0,"description":"[NOT_DETECTED]"}
-def _is_subdomain(dom,roots):
-    for r in roots:
-        if dom==r or dom.endswith("."+r):return True
-    return False
-def _dom_score(dom):
-    for kw,v in[(".gov",0.9),(".gouv",0.9),(".nic.",0.85),(".edu",0.8),(".ac.",0.7)]:
-        if kw in dom.lower():return v
-    return 0.3
-# ═══ B3: VSP ═══
-def vsp_validate(cap):
-    ch=[]
-    def C(n,v):ch.append({"check":n,"pass":v})
-    C("iso2_valid",bool(re.match(r'^[A-Z]{2}$',cap.get("iso2",""))))
-    C("has_ar0",cap.get("ar0")is not None and any(v is not None for v in(cap.get("ar0")or{}).values()))
-    C("authority_domains",len(cap.get("authority_domains",[]))>=1)
-    C("authority_graph_or_proofB",len(cap.get("authority_graph",[]))>=1 or cap.get("proof_level")=="B_INDIRECT")
-    C("has_official_pdf",len([d for d in cap.get("documents",[])if".pdf"in d.get("url","").lower()])>=1)
-    ne=cap.get("exams",{}).get("n_exams",0);heb=cap.get("ar0")is not None and cap["ar0"].get("AR0_EXAM")is not None
-    C("has_exam_or_syllabus",ne>=1 or heb or any(p.get("role")in["SYLLABUS","EXAM_ARCHIVE"]for p in cap.get("authority_graph",[])))
-    C("no_simulation",not any(k in cj(cap).lower()for k in["estimated","simulated","hash-based","wiki_unavailable","random"]))
-    C("status_ok",cap.get("status")in["DISCOVERED","PARTIAL","CAP_PARTIAL_NO_CHAPTERS"])
-    return{"status":"PASS"if all(c["pass"]for c in ch)else"FAIL","checks":ch}
-# ═══ DA0 PDF DISCOVERY — BRAVE L2 FIRST ═══
-_LANG_TERMS={
-    "fr":{"exam":["sujet","épreuve","annales"],"answer":["corrigé","correction","barème"],"diploma":["baccalauréat","brevet","concours"]},
-    "en":{"exam":["exam","question paper","past paper"],"answer":["answer key","mark scheme","solution"],"diploma":["examination","certificate","board exam"]},
-    "es":{"exam":["examen","prueba"],"answer":["solución","corrección"],"diploma":["bachillerato","selectividad"]},
-    "pt":{"exam":["exame","prova","vestibular"],"answer":["gabarito","correção"],"diploma":["ENEM","vestibular"]},
-    "ar":{"exam":["امتحان","اختبار"],"answer":["تصحيح","حل"],"diploma":["بكالوريا","شهادة"]},
-}
-def _detect_lang(cn,doms):
-    cnl=cn.lower();langs=["en"]
-    fr_kw=["france","sénégal","senegal","maroc","morocco","tunisie","tunisia","algérie","algeria","côte d'ivoire","cameroun","cameroon","congo","mali","madagascar","burkina","bénin","benin","togo","guinée","gabon","haïti","belgique","suisse","luxembourg","canada","djibouti","tchad"]
-    pt_kw=["brasil","brazil","portugal","moçambique","angola"]
-    es_kw=["españa","spain","méxico","mexico","colombia","argentina","chile","perú","peru","venezuela","ecuador","bolivia","uruguay","paraguay","cuba"]
-    ar_kw=["egypt","morocco","algeria","tunisia","iraq","jordan","saudi","kuwait","qatar","libya","sudan","yemen","syria","lebanon"]
-    for kws,lang in[(fr_kw,"fr"),(pt_kw,"pt"),(es_kw,"es"),(ar_kw,"ar")]:
-        if any(k in cnl for k in kws):langs=[lang];break
-    for d in doms:
-        dl=d.lower()
-        if".gouv."in dl or".fr"in dl:
-            if"fr"not in langs:langs.append("fr")
-        elif".br"in dl or".pt"in dl:
-            if"pt"not in langs:langs.append("pt")
-    if"en"not in langs:langs.append("en")
-    return langs[:3]
-def _query_pack(cn,domains):
-    langs=_detect_lang(cn,domains);qs=[];year=datetime.now().year
+        if html and re.search(r'(?:note|barème).*?/\s*20\b',html.lower()):grading={"max":20,"description":"Scale 0-20"};break
+        if html and re.search(r'(?:maximum|total)\s+marks?\s*:?\s*100',html.lower()):grading={"max":100,"description":"Scale 0-100"};break
+    status="DISCOVERED"if pdfs else("PARTIAL"if pages else"FAIL")
+    cap={"A_METADATA":{"cap_id":f"CAP_{iso2}_{sha(cn)[:8]}","iso2":iso2,"country":cn,"languages":langs,"status":status},
+         "B_EDUCATION":{"levels":wiki["levels"],"subjects":subjects,"chapters":[],"chapters_status":"PENDING_EXTRACTION"},
+         "C_HARVEST":{"authority_domains":domains,"pages_crawled":len(pages),"pdfs_found":len(pdfs),"documents":pdfs[:100],"authority_graph":pages[:50]},
+         "D_KERNEL":{"atom_min_len":40,"cluster_min":2,"qc_target":15,"coverage_target":1.0},
+         "E_EXAMS":{"exams":wiki["exams"][:7],"contests":wiki["contests"][:7],"coefs":wiki["coefs"],"grading":grading}}
+    cap["sha256"]=sha(cj(sv(cap)));log_ev("CAP_END",f"{status} {len(pdfs)}pdf");return cap
+# ═══ BLOC 4: DA1 Harvest ═══
+def _query_pack(cn,domains,langs):
+    qs=[];year=datetime.now().year
     for dom in domains[:3]:
         for lang in langs:
             t=_LANG_TERMS.get(lang,_LANG_TERMS["en"])
-            eo=" OR ".join(f'"{x}"'for x in t["exam"][:2])
-            do=" OR ".join(f'"{x}"'for x in t["diploma"][:2])
-            ao=" OR ".join(f'"{x}"'for x in t["answer"][:2])
-            qs+=[f"site:{dom} filetype:pdf ({eo}) {year}",f"site:{dom} filetype:pdf ({eo}) {year-1}",
-                 f"site:{dom} filetype:pdf ({do})",f"site:{dom} filetype:pdf ({ao})"]
+            eo=" OR ".join(f'"{x}"'for x in t["exam"][:2]);ao=" OR ".join(f'"{x}"'for x in t["answer"][:2])
+            qs+=[f"site:{dom} filetype:pdf ({eo}) {year}",f"site:{dom} filetype:pdf ({eo}) {year-1}",f"site:{dom} filetype:pdf ({ao})"]
     for lang in langs[:2]:
         t=_LANG_TERMS.get(lang,_LANG_TERMS["en"])
-        qs+=[f"{cn} filetype:pdf {t['exam'][0]} {t['diploma'][0]} {year}",f"{cn} official {t['exam'][0]} PDF {year}"]
+        qs+=[f"{cn} filetype:pdf {t['exam'][0]} {t['diploma'][0]} {year}",f"{cn} filetype:pdf {t['answer'][0]} {year}"]
     return qs[:20]
-def _search_pdfs(queries,diag,max_r=30):
-    results=[];tried=[]
-    bcands,bsnaps=_brave_search(queries[:8],diag)
-    if bcands:tried.append("brave")
-    for c in bcands:
-        if".pdf"in c["url"].lower():results.append(c)
-    if len(results)<max_r:
-        sc=_serpapi_search(queries[:6],diag)
-        if sc:tried.append("serpapi")
-        for c in sc:
-            if".pdf"in c["url"].lower():results.append(c)
-    return results[:max_r],tried,bsnaps
-def da0_find_pdfs(ar0,cap):
-    log_ev("DA0_PDF");manifest,diag=[],[];cn=cap.get("country_name","");ar0_doms=cap.get("authority_domains",[])
-    keys={"brave":bool(os.environ.get("BRAVE_KEY")),"serpapi":bool(os.environ.get("SERPAPI_KEY")),"gcse":bool(os.environ.get("GOOGLE_CSE_KEY")and os.environ.get("GOOGLE_CSE_CX"))}
-    for d in cap.get("documents",[]):
-        manifest.append({"url":d["url"],"type":_clf_pdf(d["url"],d.get("text","")),"hash":sha(d["url"])[:32],"domain":d.get("domain",""),"text":d.get("text","")[:80],"provider":"ar0_crawl","auth_score":_dom_score(d.get("domain","")),"source_flag":"AR0_CRAWL"})
+def _clf_pdf(url,text):
+    low=(url+" "+text).lower()
+    return"corrige"if any(k in low for k in["corrig","correction","answer","solution","bareme","mark scheme","barème"])else"sujet"
+def _clf_type(url,text):
+    low=(url+" "+text).lower()
+    if any(k in low for k in["concours","competitive","entrance"]):return"CONCOURS"
+    if any(k in low for k in["dst","devoir","controle","test","interro"]):return"DST"
+    if any(k in low for k in["exercice","exercise","td","travaux"]):return"EXERCISE"
+    return"EXAM"
+def bloc4_da1(ar0,cap):
+    cn=cap["A_METADATA"]["country"];langs=cap["A_METADATA"]["languages"];domains=cap["C_HARVEST"]["authority_domains"]
+    log_ev("BLOC4_DA1")
+    manifest,diag=[],[]
+    # Layer 1: CAP crawl PDFs
+    for d in cap["C_HARVEST"].get("documents",[]):
+        manifest.append({"url":d["url"],"role":_clf_pdf(d["url"],d.get("text","")),"exam_type":_clf_type(d["url"],d.get("text","")),"hash":sha(d["url"])[:32],"domain":d.get("domain",""),"text":d.get("text","")[:80],"provider":"ar0_crawl","source_flag":"AR0_CRAWL","auth_score":_dom_score(d.get("domain",""))})
+    # Layer 2: Brave Search
     bsnaps=[]
-    if len(manifest)<10 and any(keys.values()):
-        queries=_query_pack(cn,ar0_doms);results,tried,bsnaps=_search_pdfs(queries,diag)
-        for r2 in results:
-            dom=urlparse(r2["url"]).netloc
-            if _is_subdomain(dom,ar0_doms)or _dom_score(dom)>=0.5 or any(k in r2.get("text","").lower()for k in["sujet","exam","paper","épreuve","corrigé","annale"]):
-                manifest.append({"url":r2["url"],"type":_clf_pdf(r2["url"],r2.get("text","")),"hash":sha(r2["url"])[:32],"domain":dom,"text":r2.get("text","")[:80],"provider":r2["provider"],"auth_score":_dom_score(dom),"source_flag":r2.get("source_flag","SERP")})
+    if len(manifest)<10 and _secret("BRAVE_KEY"):
+        queries=_query_pack(cn,domains,langs);bcands,bsnaps=_brave_search(queries[:8],diag)
+        for r2 in bcands:
+            if".pdf"in r2["url"].lower():
+                dom=urlparse(r2["url"]).netloc
+                if _is_sub(dom,domains)or _dom_score(dom)>=0.5 or any(k in r2.get("text","").lower()for k in["sujet","exam","paper","corrigé","annale"]):
+                    manifest.append({"url":r2["url"],"role":_clf_pdf(r2["url"],r2.get("text","")),"exam_type":_clf_type(r2["url"],r2.get("text","")),"hash":sha(r2["url"])[:32],"domain":dom,"text":r2.get("text","")[:80],"provider":"brave","source_flag":"BRAVE_L2","auth_score":_dom_score(dom)})
+    # Dedupe
     seen=set();unique=[]
     for p in manifest:
         if p["url"]not in seen:seen.add(p["url"]);unique.append(p)
     manifest=unique[:30]
-    cp=cap.get("provenance",{}).get("pages_crawled",0)
-    if not manifest:
-        mode="FAIL_DA0_RESTRICTED_NETWORK_KEY_REQUIRED"if cp==0 and not any(keys.values())else("FAIL_DA0_NO_SEARCH_API_KEY"if not any(keys.values())else"NO_SOURCES")
-    else:mode="REAL"
-    why={"cap_pdfs":cap.get("provenance",{}).get("pdfs_found",0),"cap_pages":cp,"keys_present":keys,"queries_run":len(diag)}
-    log_ev("DA0_PDF_END",f"{mode}:{len(manifest)}")
-    return{"mode":mode,"source_manifest":manifest,"strategy_log":{"mode":mode,"pdfs":len(manifest),"why_no_sources":why},"http_diag":diag,"authority_sources":[],"brave_snapshots":bsnaps}
-def _clf_pdf(url,text):
-    low=(url+" "+text).lower()
-    return"corrige"if any(k in low for k in["corrig","correction","answer","solution","bareme","mark scheme","key","barème"])else"sujet"
-# ═══ B4: CEP ═══
-def _cep_sim(su,cu):
-    sc=0;sl,cl=su.lower(),cu.lower()
-    if"/".join(sl.split("/")[:-1])=="/".join(cl.split("/")[:-1]):sc+=3
-    if urlparse(sl).netloc==urlparse(cl).netloc:sc+=1
-    sy=re.findall(r'20\d{2}',sl);cy=re.findall(r'20\d{2}',cl)
-    if sy and cy and set(sy)&set(cy):sc+=2
-    sc+=min(len(set(re.findall(r'[a-z]{4,}',sl))&set(re.findall(r'[a-z]{4,}',cl))),3);return sc
-def mk_cep(src):
-    m=src.get("source_manifest",[]);suj=[s for s in m if s["type"]=="sujet"];cor=[s for s in m if s["type"]=="corrige"]
-    pairs,unp,subj_only,quar=[],[],[],[];used=set()
+    mode="REAL"if manifest else"FAIL_DA1_NO_SOURCE"
+    # Pairing
+    suj=[s for s in manifest if s["role"]=="sujet"];cor=[s for s in manifest if s["role"]=="corrige"]
+    pairs,quar,unpaired=[],[],[];used=set()
     for s in suj:
-        cands=sorted([(j,_cep_sim(s["url"],c["url"]))for j,c in enumerate(cor)if j not in used],key=lambda x:-x[1])
+        cands=[]
+        for j,c in enumerate(cor):
+            if j in used:continue
+            sc=0;sl,cl=s["url"].lower(),c["url"].lower()
+            if"/".join(sl.split("/")[:-1])=="/".join(cl.split("/")[:-1]):sc+=3
+            if urlparse(sl).netloc==urlparse(cl).netloc:sc+=1
+            sy=re.findall(r'20\d{2}',sl);cy=re.findall(r'20\d{2}',cl)
+            if sy and cy and set(sy)&set(cy):sc+=2
+            sc+=min(len(set(re.findall(r'[a-z]{4,}',sl))&set(re.findall(r'[a-z]{4,}',cl))),3)
+            cands.append((j,sc))
+        cands.sort(key=lambda x:-x[1])
         if len(cands)>=2 and cands[0][1]>0 and cands[0][1]==cands[1][1]:
-            quar.append({"url":s["url"],"reason":"QUARANTINE_PAIRING_AMBIGUOUS","detail":f"tie={cands[0][1]}"});continue
+            quar.append({"url":s["url"],"reason":"QUARANTINE_PAIRING_AMBIGUOUS"});continue
         if cands and cands[0][1]>=1:
             j,bs=cands[0];c=cor[j];used.add(j)
-            pairs.append({"sujet":s["url"],"corrige":c["url"],"sujet_hash":s["hash"],"corrige_hash":c["hash"],"pair_id":f"CEP_{len(pairs):04d}","pair_score":bs,"pair_mode":"FULL","source_flag":s.get("source_flag","")})
+            pairs.append({"pair_id":f"P_{len(pairs):04d}","sujet_url":s["url"],"corrige_url":c["url"],"sujet_hash":s["hash"],"corrige_hash":c["hash"],"score":bs,"mode":"FULL","exam_type":s["exam_type"],"source_flag":s.get("source_flag","")})
         else:
-            subj_only.append({"sujet":s["url"],"corrige":"","sujet_hash":s["hash"],"corrige_hash":"","pair_id":f"CEP_{len(pairs)+len(subj_only):04d}","pair_score":0,"pair_mode":"SUBJECT_ONLY","source_flag":s.get("source_flag","")})
+            pairs.append({"pair_id":f"P_{len(pairs):04d}","sujet_url":s["url"],"corrige_url":"","sujet_hash":s["hash"],"corrige_hash":"","score":0,"mode":"SUBJECT_ONLY","exam_type":s["exam_type"],"source_flag":s.get("source_flag","")})
     for j,c in enumerate(cor):
-        if j not in used:unp.append({"url":c["url"],"reason":"no_sujet"})
-    all_p=pairs+subj_only
-    return{"pairs":all_p,"unpaired":unp,"quarantine":quar,"total_pairs":len(all_p),"full_pairs":len(pairs),"subject_only":len(subj_only),"quarantined":len(quar)}
-# ═══ B5: DA1 ═══
+        if j not in used:unpaired.append({"url":c["url"],"reason":"no_sujet_match"})
+    return{"mode":mode,"manifest":manifest,"pairs":pairs,"quarantine":quar,"unpaired":unpaired,"brave_snaps":bsnaps,"diag":diag,"stats":{"total":len(manifest),"sujets":len(suj),"corriges":len(cor),"pairs":len(pairs),"quarantined":len(quar)}}
+# ═══ BLOC 5: ATOMISATION ═══
 def _ocr(pdf_bytes):
     if not pdf_bytes:return"","no_data"
     try:
-        import pdfplumber,io
+        import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes))as pdf:
             txt="\n\n".join(p.extract_text()or""for p in pdf.pages[:15])
             if len(txt.strip())>50:return txt.strip(),"pdfplumber"
     except:pass
     return"","extraction_failed"
-def real_da1(cep):
-    log_ev("DA1");dl,texts=[],{}
-    for pair in cep.get("pairs",[])[:15]:
-        pid=pair["pair_id"];sd,ss,_,_=http_get(pair["sujet"],binary=True,timeout=20)
-        cd,cs=(http_get(pair["corrige"],binary=True,timeout=20)[:2])if pair["corrige"]else(None,-1)
-        dl.append({"pair_id":pid,"s_status":"OK"if ss in range(200,300)else f"FAIL_{ss}","c_status":"OK"if cs in range(200,300)else f"FAIL_{cs}","mode":pair.get("pair_mode","")})
-        st_,sm=_ocr(sd if isinstance(sd,bytes)else None);ct_,cm2=_ocr(cd if isinstance(cd,bytes)else None)
-        texts[pid]={"sujet_text":st_,"corrige_text":ct_,"sujet_ocr":sm,"corrige_ocr":cm2}
-    roc=sum(1 for t in texts.values()if t["sujet_ocr"]=="pdfplumber")
-    img=sum(1 for t in texts.values()if t["sujet_ocr"]in["extraction_failed","no_data"]and not t["sujet_text"])
-    log_ev("DA1_END",f"{len(dl)}p {roc}ocr");return{"dl_log":dl,"texts":texts,"text_mode":"OCR_REAL"if roc>0 else"OCR_NONE","real_ocr_count":roc,"image_detected":img}
-# ═══ B6: ATOMS ═══
-_HP=[r'roll\s*no',r'q\.?\s*p\.?\s*code',r'candidates?\s+must',r'time\s*(?:allowed|allotted)',r'maximum\s+marks',r'ne\s+rien\s+écrire',r'page\s+\d+\s+(?:of|de|sur)\s+\d+',r'P\.?\s*T\.?\s*O\.?']
+_HP=[r'roll\s*no',r'candidates?\s+must',r'time\s*(?:allowed|allotted)',r'maximum\s+marks',r'ne\s+rien\s+écrire',r'page\s+\d+\s+(?:of|de|sur)',r'P\.?\s*T\.?\s*O\.?']
 _IP=[r'answer\s+any\s+\d+',r'attempt\s+(?:all|any)',r'instructions?\s*:',r'general\s+instructions']
 def _is_hdr(text):
     low=text.lower()
-    if sum(1 for p in _HP if re.search(p,low))>=2:return True
-    if sum(1 for p in _IP if re.search(p,low))>=1 and not re.search(r'(?:what|why|how|explain|calculate|find|solve|prove)',low):return True
-    return False
+    return sum(1 for p in _HP if re.search(p,low))>=2 or(sum(1 for p in _IP if re.search(p,low))>=1 and not re.search(r'(?:what|why|how|explain|calculate|find|solve|prove)',low))
 def _split_q(text):
     if not text or len(text)<100:return[]
     ms=list(re.finditer(r'(?:^|\n)\s*(?:Q\.?\s*)?(\d{1,3})\s*[\.\)\-:]\s*(.+?)(?=(?:^|\n)\s*(?:Q\.?\s*)?\d{1,3}\s*[\.\)\-:]|\Z)',text,re.DOTALL|re.MULTILINE))
     if len(ms)>=3:
         parts=[m.group(0).strip()for m in ms if len(m.group(0).strip())>=40 and not _is_hdr(m.group(0))]
         if len(parts)>=2:return parts
-    for pat in[r'(?=(?:SECTION|Exercice|EXERCICE|Exercise|PARTIE)\s*[-:.]?\s*[A-Za-z0-9IViv])',r'(?=(?:QUESTION|Question)\s*\d)']:
+    for pat in[r'(?=(?:Exercice|EXERCICE|Exercise|SECTION|PARTIE)\s*[-:.]?\s*[A-Za-z0-9IViv])',r'(?=(?:QUESTION|Question)\s*\d)']:
         parts=[p.strip()for p in re.split(pat,text,flags=re.I)if len(p.strip())>=60 and not _is_hdr(p)]
         if len(parts)>=2:return parts
     parts=[p.strip()for p in text.split("\n\n")if len(p.strip())>=60 and not _is_hdr(p)]
@@ -436,322 +389,381 @@ def _split_q(text):
     if len(text)>=200 and not _is_hdr(text):return[text]
     return[]
 def _pts(text):
-    for pat in[r'[\(\[]\s*(\d{1,3})\s*(?:marks?|points?|pts?)\s*[\)\]]',r'(\d{1,3})\s*(?:marks?|points?)\b',r'[\(\[]\s*(\d{1,3})\s*[\)\]]',r'/\s*(\d{1,3})\b']:
+    for pat in[r'[\(\[]\s*(\d{1,3})\s*(?:marks?|points?|pts?)\s*[\)\]]',r'(\d{1,3})\s*(?:marks?|points?)\b',r'/\s*(\d{1,3})\b']:
         m=re.search(pat,text,re.I)
         if m:
             val=int([g for g in m.groups()if g][-1])
             if 1<=val<=200:return val
     return None
-def _cls_atom(text):
-    if not text or len(text)<20:return"NOISE"
-    if _is_hdr(text):return"INSTRUCTION"
-    low=text.lower()
-    if sum(1 for k in["what","why","how","explain","calculate","find","solve","prove","define","describe","write","list","state","discuss","qu'est","expliquer","calculer","démontrer","résoudre","?","marks","points"]if k in low)>=1:return"QUESTION"
-    if len(text)>=150:return"QUESTION"
-    return"FRAGMENT"
-def extract_atoms(texts):
-    atoms=[]
-    for pid in sorted(texts.keys()):
-        t=texts[pid];st_,ct_=t.get("sujet_text",""),t.get("corrige_text","")
+def bloc5_atoms(da1):
+    log_ev("BLOC5_ATOMS");atoms=[]
+    for pair in da1["pairs"][:15]:
+        pid=pair["pair_id"];sd,ss,_,_=http_get(pair["sujet_url"],binary=True,timeout=20)
+        cd,cs=None,-1
+        if pair["corrige_url"]:cd,cs,_,_=http_get(pair["corrige_url"],binary=True,timeout=20)
+        st_,sm=_ocr(sd if isinstance(sd,bytes)else None);ct_,cm2=_ocr(cd if isinstance(cd,bytes)else None)
         if not st_ or len(st_)<100:continue
         qb=_split_q(st_);cb=_split_q(ct_)if ct_ else[]
-        has_nums=any(re.match(r'\s*\d+[\.\)]',p)for p in qb);avg_len=sum(len(p)for p in qb)/max(len(qb),1)
-        conf=0.9 if has_nums and avg_len>100 else(0.7 if has_nums else(0.6 if avg_len>200 else 0.4))
+        has_nums=any(re.match(r'\s*\d+[\.\)]',p)for p in qb)
+        conf=0.9 if has_nums and len(qb)>=3 else(0.6 if has_nums else 0.4)
         qi_c=0
         for qi_idx,q in enumerate(qb):
-            cat=_cls_atom(q)
-            if cat in["NOISE","INSTRUCTION"]:continue
+            low=q.lower()
+            if _is_hdr(q):continue
+            is_q=any(k in low for k in["what","why","how","explain","calculate","find","solve","prove","define","describe","qu'est","expliquer","calculer","démontrer","?","marks","points"])or len(q)>=150
+            if not is_q:continue
             qi_c+=1;rb=cb[qi_idx]if qi_idx<len(cb)else""
-            atom={"Qi":{"id":f"{pid}_Q{qi_c}","pair_id":pid,"text":q.strip(),"points":_pts(q),"source_hash":sha(q.strip()),"category":cat,"split_confidence":round(conf,2)},
-                  "RQi":{"id":f"{pid}_R{qi_c}","pair_id":pid,"text":rb.strip(),"source_hash":sha(rb.strip())}}
-            if conf>=0.4:atoms.append(atom)
-    return atoms
-# ═══ B7: QC ═══
-def calc_qc(atoms):
-    qc=[]
+            posable_corrige=len(rb)>50;posable_eval=is_q
+            atoms.append({"qi_id":f"{pid}_Q{qi_c}","pair_id":pid,"qi_text":q.strip(),"rqi_text":rb.strip(),"points":_pts(q),
+                "qi_hash":sha(q.strip()),"rqi_hash":sha(rb.strip()),"confidence":round(conf,2),
+                "exam_type":pair.get("exam_type","EXAM"),"source_flag":pair.get("source_flag",""),
+                "posable":{"corrige":posable_corrige,"scope":True,"evaluable":posable_eval,"final":posable_corrige and posable_eval},
+                "chapter_code":"PENDING"})
+    log_ev("ATOMS_END",f"{len(atoms)}");return atoms
+# ═══ BLOC 6: IA1_MINER ═══
+def bloc6_miner(atoms):
+    log_ev("BLOC6_MINER");traces=[]
     for a in atoms:
-        qi,rqi=a["Qi"],a["RQi"];cat=qi.get("category","QUESTION")
-        chk={"qi_len":len(qi["text"])>=40,"is_question":cat in["QUESTION","FRAGMENT"],
-             "has_substance":(qi.get("points")and qi["points"]>0)or len(qi["text"])>=100,
-             "qi_no_placeholder":not any(k in qi["text"]for k in["[OCR_PENDING","[DL_FAIL","[PENDING"]),
-             "split_ok":qi.get("split_confidence",1.0)>=0.4}
-        valid=all(chk.values());reason="OK"if valid else next(k for k,v in chk.items()if not v)
-        qc_text=""
-        if valid:
-            raw=qi["text"][:200].strip()
-            qm=re.search(r'[^.!?]*\?',raw)
-            qc_text=qm.group(0).strip()if qm else raw[:120]
-        qc.append({"atom_id":qi["id"],"valid":valid,"reason":reason,"checks":chk,"qi_hash":qi["source_hash"],"rqi_hash":rqi["source_hash"],"points":qi.get("points")or 0,"category":cat,"qc_text":qc_text})
-    return qc
-# ═══ B8: FRT/ARI/TRIGGERS ═══
-def calc_frt(atoms,qc):
-    vids={q["atom_id"]for q in qc if q["valid"]};themes={}
+        if not a["posable"]["final"]:continue
+        rqi=a["rqi_text"];steps=[]
+        # Rule-based step extraction from RQi
+        parts=re.split(r'\n+',rqi)
+        for i,p in enumerate(parts):
+            p=p.strip()
+            if len(p)<20:continue
+            # Type each step
+            low=p.lower()
+            if any(k in low for k in["donc","thus","therefore","alors","d'où","hence"]):stype="CONCLUSION"
+            elif any(k in low for k in["calcul","compute","=","solve","résoudre"]):stype="COMPUTATION"
+            elif any(k in low for k in["appliq","apply","using","utilisant","formule"]):stype="APPLICATION"
+            elif any(k in low for k in["définit","define","soit","let","posons"]):stype="DEFINITION"
+            else:stype="REASONING"
+            steps.append({"step":i+1,"text":p[:200],"type":stype})
+        # SIG(q) = <Action, Property, Object, conteXt>
+        qi_low=a["qi_text"].lower()
+        action="CALCULATE"if any(k in qi_low for k in["calcul","compute","find","trouv"])else("PROVE"if any(k in qi_low for k in["prove","démontrer","montrer","show"])else("EXPLAIN"if any(k in qi_low for k in["explain","expliquer","justifier"])else"DETERMINE"))
+        sig_q={"A":action,"P":"","O":"","X":""}
+        traces.append({"qi_id":a["qi_id"],"steps":steps,"sig_q":sig_q,"n_steps":len(steps)})
+    log_ev("MINER_END",f"{len(traces)}");return traces
+# ═══ BLOC 7: CLUSTERING ═══
+def bloc7_clustering(atoms,traces):
+    log_ev("BLOC7_CLUSTER")
+    # Group by chapter_code + SIG action
+    trace_map={t["qi_id"]:t for t in traces}
+    groups={};quarantine=[]
     for a in atoms:
-        if a["Qi"]["id"]not in vids:continue
-        pid=a["Qi"]["pair_id"];themes.setdefault(pid,{"c":0,"p":0});themes[pid]["c"]+=1;themes[pid]["p"]+=(a["Qi"].get("points")or 0)
-    total=max(sum(t["c"]for t in themes.values()),1)
-    return[{"theme":k,"frequency":v["c"],"recurrence":1,"weight":round(v["c"]/total,4),"total_points":v["p"]}for k,v in sorted(themes.items())]
-def calc_ari(atoms,qc):
-    vids={q["atom_id"]for q in qc if q["valid"]};etot={};ecnt={}
-    for a in atoms:
-        if a["Qi"]["id"]in vids:pid=a["Qi"]["pair_id"];etot[pid]=etot.get(pid,0)+(a["Qi"].get("points")or 1);ecnt[pid]=ecnt.get(pid,0)+1
-    profiles=[]
-    for idx,a in enumerate(atoms):
-        qi,rqi=a["Qi"],a["RQi"]
-        if qi["id"]not in vids:continue
-        pid=qi["pair_id"];pts=qi.get("points")or 1;total=max(etot.get(pid,1),1);cnt=max(ecnt.get(pid,1),1)
-        tc=min(len(qi["text"])/500,1.0);hm=1.0 if re.search(r'[=+\-×÷∫∑√π²³]|calcul|solve|prove|démontrer',qi["text"],re.I)else 0.5
-        diff=round(min((pts/total)*0.4+tc*0.3+hm*0.3,0.99),3)
-        pf=min((idx%cnt+1)/cnt,1.0);ps2=min(pts/max(total/cnt,1),1.0);ha=0.3 if rqi["text"]else 0.0
-        disc=round(max(0.10,min(pf*0.3+ps2*0.3+tc*0.2+ha+0.1,0.95)),3)
-        profiles.append({"atom_id":qi["id"],"pair_id":pid,"difficulty":diff,"discrimination":disc,"points":pts,"exam_total":total})
-    return profiles
-def calc_triggers(ari,frt,f1,f2):
-    trig=[]
-    for p in ari:
-        if p["difficulty"]>0.7:trig.append({"trigger":"HIGH_DIFFICULTY","atom_id":p["atom_id"],"value":p["difficulty"],"severity":"WARN"})
-        if p["discrimination"]<0.2:trig.append({"trigger":"LOW_DISCRIMINATION","atom_id":p["atom_id"],"value":p["discrimination"],"severity":"INFO"})
-    for f in frt:
-        if f["weight"]>0.30:trig.append({"trigger":"HIGH_FREQ_THEME","theme":f["theme"],"value":f["weight"],"severity":"INFO"})
-    if f1.get("status")=="OK"and f2.get("status")=="OK":
-        gap=abs(f2.get("score",0)-f1.get("score",0))
-        if gap>0.15:trig.append({"trigger":"SCORE_GAP","value":round(gap,4),"f1":f1["score"],"f2":f2["score"],"severity":"WARN"})
-    return trig
-# ═══ B9: F1/F2 TEST_CLEAR ═══
-def compute_f1_clear(atoms,frt,qc):
-    va=[a for a in atoms if a["Qi"]["id"]in{q["atom_id"]for q in qc if q["valid"]}]
-    if not va:return _f_empty("F1")
-    ed={};
-    for a in va:pid=a["Qi"]["pair_id"];pts=a["Qi"].get("points")or 1;ed.setdefault(pid,{"s":0,"c":0});ed[pid]["s"]+=pts;ed[pid]["c"]+=1
-    cov=len(va)/max(len(atoms),1);div=min(len(ed)/5,1.0);pr=sum(1 for a in va if a["Qi"].get("points"))/max(len(va),1)
-    sc=round(min(cov*0.5+div*0.3+pr*0.2,1.0),4)
-    return{"score":sc,"status":"OK","formula_mode":"TEST_CLEAR","formula_version":"TEST_V2","approved":False,"source":"R&D","note":"CEO concession: formulas in clear for TEST.","n_exams":len(ed),"n_items":len(va),"coverage":round(cov,4),"diversity":round(div,4),"pts_ratio":round(pr,4)}
-def compute_f2_clear(f1,ari,triggers):
-    if f1.get("status")!="OK"or not ari:return _f_empty("F2")
-    ad=sum(p["difficulty"]for p in ari)/len(ari);adc=sum(p["discrimination"]for p in ari)/len(ari)
-    tp=min(sum(1 for t in triggers if t.get("severity")=="WARN")*0.02,0.15)
-    sc=round(max(0,min(f1["score"]*(0.4+adc*0.35+ad*0.25)-tp,1.0)),4);sp=round(adc*0.1,4)
-    return{"score":sc,"status":"OK","formula_mode":"TEST_CLEAR","formula_version":"TEST_V2","approved":False,"source":"R&D","note":"CEO concession: formulas in clear for TEST.","predicted_range":[round(max(0,sc-sp),4),round(min(1,sc+sp),4)],"avg_difficulty":round(ad,4),"avg_discrimination":round(adc,4)}
-def _f_empty(tag):return{"score":0,"status":"NO_DATA","formula_mode":"TEST_CLEAR","formula_version":"TEST_V2","approved":False,"note":"No valid data."}
-# ═══ GATES ═══
-def chk_branch():
-    try:src=Path(__file__).read_text(encoding="utf-8",errors="replace")
-    except:return{"pass":False}
-    sc=re.sub(r'"[^"]*"','X',src);sc=re.sub(r"'[^']*'",'X',sc);sc=re.sub(r"#.*$","",sc,flags=re.MULTILINE)
-    bad=[pat[:20]for pat in[r'if\s+.*country\s*==',r'if\s+iso2\s*==',r'match\s+iso2']if re.findall(pat,sc,re.I)]
-    return{"pass":len(bad)==0,"bad":bad}
-def run_gates(cap,vsp,src,cep,da1,atoms,frt,qc,f1,f2,ari,trig):
-    g=[]
-    def G(n,c,e):g.append({"gate":n,"verdict":"PASS"if c else"FAIL","evidence":e})
-    G("CHK_NO_BRANCH",chk_branch()["pass"],"scan")
-    G("GATE_AR0_AUTHORITY",cap.get("ar0")is not None and any(v is not None for v in(cap.get("ar0")or{}).values()),"ar0")
-    G("CHK_CAP_VSP",vsp.get("status")=="PASS","vsp")
-    nm=len(src.get("source_manifest",[]));G("GATE_SOURCES",nm>=1,f"pdfs={nm}")
-    G("GATE_CEP",cep.get("total_pairs",0)>=1,f"pairs={cep.get('total_pairs',0)}")
-    nt=sum(1 for t in da1.get("texts",{}).values()if len(t.get("sujet_text",""))>200)
-    G("GATE_DA1_TEXT",nt>=1,f"txt>200={nt}")
-    G("GATE_ATOMS",len(atoms)>=1,f"n={len(atoms)}")
-    vc=sum(1 for q in qc if q["valid"]);G("GATE_QC_SCHEMA",vc>=1,f"valid={vc}/{len(qc)}")
-    G("GATE_FRT",len(frt)>0,f"n={len(frt)}");G("GATE_ARI",len(ari)>0,f"n={len(ari)}")
-    G("GATE_TRIGGERS",True,"always_pass")
-    G("GATE_F1",f1.get("status")=="OK",f1.get("status",""));G("GATE_F2",f2.get("status")=="OK",f2.get("status",""))
-    em="TEST_CLEAR"if EXEC_MODE=="TEST"else"A2_PACK"
-    G("GATE_FORMULA_MODE",f1.get("formula_mode")==em and f2.get("formula_mode")==em,f"expect={em}")
-    G("GATE_DETERMINISM",True,"deferred")
-    bs=src.get("brave_snapshots",[]);G("GATE_BRAVE_SNAPSHOT",len(bs)==0 or all("response_hash"in s for s in bs),f"snaps={len(bs)}")
-    return{"gates":g,"global_verdict":"PASS"if all(x["verdict"]=="PASS"for x in g)else"FAIL"}
-def det_check(fn,iso2,rid,n=3):
-    sealed=sealed_ar0=sealed_cap=None
-    for name,var in[("Sources","sealed"),("AR0","sealed_ar0"),("CAP","sealed_cap")]:
-        fp=RUN_DIR/rid/f"{name}.json"
-        if fp.exists():
-            try:exec(f"{var}=json.loads(fp.read_text(encoding='utf-8'))")
-            except:pass
-    # Reload from files
-    sf=RUN_DIR/rid/"Sources.json";sealed=json.loads(sf.read_text(encoding="utf-8"))if sf.exists()else None
-    af=RUN_DIR/rid/"AR0.json";sealed_ar0=json.loads(af.read_text(encoding="utf-8"))if af.exists()else None
-    cf=RUN_DIR/rid/"CAP.json";sealed_cap=json.loads(cf.read_text(encoding="utf-8"))if cf.exists()else None
-    hashes=[]
-    for _ in range(n):
-        snap=fn(iso2,_replay=True,_sealed_src=sealed,_sealed_ar0=sealed_ar0,_sealed_cap=sealed_cap)["snapshot"]
-        hashes.append(sha(cj(sv(snap))))
-    return{"pass":len(set(hashes))==1,"hashes":hashes}
-# ═══ PIPELINE ═══
-def run_pipeline(iso2,_replay=False,_sealed_src=None,_sealed_ar0=None,_sealed_cap=None):
+        if not a["posable"]["final"]:continue
+        t=trace_map.get(a["qi_id"])
+        if not t:continue
+        key=f"{a['chapter_code']}_{t['sig_q']['A']}"
+        groups.setdefault(key,[]).append(a["qi_id"])
+    clusters=[];singletons=[]
+    for key,qids in sorted(groups.items()):
+        if len(qids)>=2:clusters.append({"cluster_id":f"CL_{len(clusters):04d}","key":key,"qi_ids":qids,"n":len(qids)})
+        else:singletons.append({"qi_id":qids[0],"reason":"SINGLETON","key":key})
+    log_ev("CLUSTER_END",f"{len(clusters)}cl {len(singletons)}sing");return{"clusters":clusters,"singletons":singletons}
+# ═══ BLOC 8: IA1_BUILDER ═══
+def bloc8_builder(clusters,atoms,traces):
+    log_ev("BLOC8_BUILDER");atom_map={a["qi_id"]:a for a in atoms};trace_map={t["qi_id"]:t for t in traces}
+    qc_list=[]
+    for cl in clusters["clusters"]:
+        qids=cl["qi_ids"];reps=[atom_map[q]for q in qids if q in atom_map]
+        if not reps:continue
+        # QC_text: derived from representative Qi (no template)
+        rep=reps[0];qi_text=rep["qi_text"][:200]
+        qm=re.search(r'[^.!?]*\?',qi_text)
+        qc_text=qm.group(0).strip()if qm else qi_text[:120]
+        # ARI from traces consensus
+        all_steps=[];all_types=[]
+        for q in qids:
+            t=trace_map.get(q)
+            if t:all_steps.extend(t["steps"]);all_types.extend([s["type"]for s in t["steps"]])
+        type_freq={};
+        for tt in all_types:type_freq[tt]=type_freq.get(tt,0)+1
+        ari={"steps_consensus":sorted(type_freq.items(),key=lambda x:-x[1])[:5],"n_steps_avg":round(len(all_steps)/max(len(qids),1),1)}
+        # FRT: 4 blocks from RQi
+        all_rqi=" ".join([atom_map[q]["rqi_text"]for q in qids if q in atom_map and atom_map[q]["rqi_text"]])[:2000]
+        frt={"usage":all_rqi[:200]if all_rqi else"","reponse_type":"analytical"if any(k in all_rqi.lower()for k in["calcul","=","résult"])else"descriptive",
+             "pieges":[],"conclusion":all_rqi[-200:]if len(all_rqi)>200 else""}
+        # Triggers
+        triggers=[]
+        for q in qids:
+            t=trace_map.get(q)
+            if t:
+                for s in t["steps"][:3]:triggers.append({"text":s["text"][:80],"type":s["type"],"from":q})
+        triggers=triggers[:7]
+        qc_list.append({"qc_id":f"QC_{len(qc_list):04d}","cluster_id":cl["cluster_id"],"qc_text":qc_text,
+            "qi_ids":qids,"ari":ari,"frt":frt,"triggers":triggers,"n_triggers":len(triggers),
+            "chapter":cl["key"].split("_")[0]if"_"in cl["key"]else cl["key"]})
+    log_ev("BUILDER_END",f"{len(qc_list)}");return qc_list
+# ═══ BLOC 9: IA2_JUDGE ═══
+def bloc9_judge(qc_list,atoms):
+    log_ev("BLOC9_JUDGE");results=[]
+    for qc in qc_list:
+        checks={"CHK_POSABLE_VALID":len(qc["qi_ids"])>=2,
+                 "CHK_QC_FORM":len(qc["qc_text"])>=20,
+                 "CHK_FRT_OK":bool(qc["frt"].get("usage")),
+                 "CHK_TRIGGERS_QUALITY":qc["n_triggers"]>=1,
+                 "CHK_ARI_TYPED":len(qc["ari"].get("steps_consensus",[]))>=1,
+                 "CHK_ANTI_SINGLETON":len(qc["qi_ids"])>=2}
+        verdict="PASS"if all(checks.values())else"FAIL"
+        results.append({"qc_id":qc["qc_id"],"verdict":verdict,"checks":checks})
+    log_ev("JUDGE_END",f"{sum(1 for r in results if r['verdict']=='PASS')}PASS");return results
+# ═══ BLOC 10: F1/F2 ═══
+def bloc10_scoring(atoms,qc_list,judge):
+    log_ev("BLOC10_F1F2")
+    passed={r["qc_id"]for r in judge if r["verdict"]=="PASS"}
+    valid_qc=[q for q in qc_list if q["qc_id"]in passed]
+    posable=[a for a in atoms if a["posable"]["final"]]
+    if not valid_qc or not posable:return{"f1":{"score":0,"status":"NO_DATA"},"f2":{"score":0,"status":"NO_DATA"},"granulo_k":[],"selected_qc":[]}
+    n_qc=len(valid_qc);n_posable=len(posable);n_atoms=len(atoms)
+    cov=len(set(qi for q in valid_qc for qi in q["qi_ids"]))/max(n_posable,1)
+    div=min(n_qc/15,1.0)
+    f1=round(min(cov*0.6+div*0.4,1.0),4)
+    f2=round(f1*0.85,4)
+    return{"f1":{"score":f1,"status":"OK","formula_mode":"TEST_CLEAR","n_qc":n_qc,"coverage":round(cov,4)},
+           "f2":{"score":f2,"status":"OK","formula_mode":"TEST_CLEAR","predicted_range":[round(f2-0.05,4),round(min(f2+0.05,1),4)]},
+           "granulo_k":valid_qc[:15],"selected_qc":[q["qc_id"]for q in valid_qc[:15]]}
+# ═══ BLOC 11: COVERAGE + SEAL ═══
+def bloc11_coverage(atoms,qc_list,judge,scoring):
+    log_ev("BLOC11_COVERAGE")
+    passed={r["qc_id"]for r in judge if r["verdict"]=="PASS"}
+    valid_qc=[q for q in qc_list if q["qc_id"]in passed]
+    posable=[a for a in atoms if a["posable"]["final"]]
+    # Map each posable Qi to its QC mère
+    qc_map={};
+    for q in valid_qc:
+        for qi in q["qi_ids"]:qc_map[qi]=q["qc_id"]
+    covered,orphans=[],[]
+    for a in posable:
+        if a["qi_id"]in qc_map:covered.append({"qi_id":a["qi_id"],"qc_id":qc_map[a["qi_id"]]})
+        else:orphans.append({"qi_id":a["qi_id"],"reason":"NO_QC_MOTHER"})
+    rate=len(covered)/max(len(posable),1)
+    sealed=rate>=1.0
+    # Saturation check
+    saturated=len(orphans)==0 and len(valid_qc)>=2
+    return{"coverage_rate":round(rate,4),"covered":len(covered),"orphans_count":len(orphans),"orphans":orphans[:20],
+           "posable_total":len(posable),"sealed":sealed,"saturated":saturated,
+           "seal_hash":sha(cj(sv({"qc":[q["qc_id"]for q in valid_qc],"cov":round(rate,4)})))if sealed else None}
+# ═══ PIPELINE ORCHESTRATOR ═══
+def run_full_pipeline(iso2,_replay=False):
     st.session_state["_sil"]=_replay;log_ev("PIPELINE",iso2)
-    ar0=_sealed_ar0 if _sealed_ar0 is not None else da0_discover_ar0(iso2)
-    cap=_sealed_cap if _sealed_cap is not None else cap_build(ar0,iso2)
-    rid=f"RUN_{iso2}_{sha(cj(sv(cap)))[:8]}";vsp=vsp_validate(cap)
-    if _sealed_src is not None:sources={"mode":"REPLAY","source_manifest":_sealed_src,"strategy_log":{"mode":"REPLAY"},"http_diag":[],"authority_sources":[],"brave_snapshots":[]}
-    elif _replay:sources={"mode":"REPLAY","source_manifest":[],"strategy_log":{"mode":"REPLAY"},"http_diag":[],"authority_sources":[],"brave_snapshots":[]}
-    else:sources=da0_find_pdfs(ar0,cap)
-    cep=mk_cep(sources)
-    if _replay or _sealed_src is not None:
-        da1={"dl_log":[],"texts":{},"text_mode":"OCR_NONE","real_ocr_count":0,"image_detected":0}
-        for pair in cep.get("pairs",[])[:15]:
-            pid=pair["pair_id"];sd,ss,_,_=http_get(pair["sujet"],binary=True,cache_only=True)
-            cd,cs=(http_get(pair["corrige"],binary=True,cache_only=True)[:2])if pair["corrige"]else(None,-1)
-            da1["dl_log"].append({"pair_id":pid,"s":f"C_{ss}","c":f"C_{cs}"})
-            st_,sm=_ocr(sd if isinstance(sd,bytes)else None);ct_,cm2=_ocr(cd if isinstance(cd,bytes)else None)
-            da1["texts"][pid]={"sujet_text":st_,"corrige_text":ct_,"sujet_ocr":sm,"corrige_ocr":cm2}
-        da1["real_ocr_count"]=sum(1 for t in da1["texts"].values()if t["sujet_ocr"]=="pdfplumber")
-        da1["text_mode"]="OCR_REAL"if da1["real_ocr_count"]>0 else"OCR_NONE"
-    else:da1=real_da1(cep)
-    atoms=extract_atoms(da1["texts"]);qc=calc_qc(atoms);frt=calc_frt(atoms,qc);ari=calc_ari(atoms,qc)
-    if EXEC_MODE=="TEST":
-        f1=compute_f1_clear(atoms,frt,qc);trig0=calc_triggers(ari,frt,f1,_f_empty("F2"));f2=compute_f2_clear(f1,ari,trig0)
-    else:
-        a2d=Path("A2_V3_1");mf=a2d/"manifest.json"
-        if mf.exists():
-            mn=json.loads(mf.read_text(encoding="utf-8"))
-            for fn2,info in mn.get("files",{}).items():
-                fp=a2d/fn2;actual=hashlib.sha256(fp.read_bytes()).hexdigest()
-                if actual!=info.get("sha256",""):f1={"score":0,"status":"A2_HASH_MISMATCH","formula_mode":"A2_PACK"};f2=f1;trig0=[];break
-            else:
-                entry=mn.get("entry","formula");spec=importlib.util.spec_from_file_location("a2",str(a2d/f"{entry}.py"))
-                mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
-                f1=mod.compute_f1(atoms,frt,qc);f1["formula_mode"]="A2_PACK";f1["approved"]=True
-                trig0=calc_triggers(ari,frt,f1,_f_empty("F2"));f2=mod.compute_f2(f1,ari,trig0);f2["formula_mode"]="A2_PACK";f2["approved"]=True
-        else:f1={"score":0,"status":"A2_MISSING","formula_mode":"FAIL"};f2=f1;trig0=[]
-    triggers=calc_triggers(ari,frt,f1,f2)
-    gr=run_gates(cap,vsp,sources,cep,da1,atoms,frt,qc,f1,f2,ari,triggers)
-    snap=sv({"cap":cap,"vsp":vsp,"src":sources["source_manifest"],"cep":cep,"atoms":atoms,"frt":frt,"qc":qc,"f1":f1,"f2":f2,"ari":ari,"trig":triggers,"gates":gr})
-    if _replay:st.session_state["_sil"]=False;return{"snapshot":snap}
-    al=[("AR0",ar0),("CAP",cap),("VSP",vsp),("Sources",sources["source_manifest"]),("BraveSnapshots",sources.get("brave_snapshots",[])),("CEP",cep),("DA1",da1["dl_log"]),("Atoms",atoms),("QC",qc),("FRT",frt),("ARI",ari),("Triggers",triggers),("F1",f1),("F2",f2),("Gates",gr),("BranchReport",chk_branch()),("UI_LOG",st.session_state.get("ui_ev",[]))]
+    seed=bloc1_activate(iso2)
+    if seed["status"]!="OK":st.session_state["_sil"]=False;return{"error":f"GATE_ISO2_VALID FAIL: {iso2}"}
+    ar0=bloc2_da0(seed)
+    cap=bloc3_cap(ar0,seed)
+    da1=bloc4_da1(ar0,cap)
+    atoms=bloc5_atoms(da1)
+    traces=bloc6_miner(atoms)
+    clusters=bloc7_clustering(atoms,traces)
+    qc_list=bloc8_builder(clusters,atoms,traces)
+    judge=bloc9_judge(qc_list,atoms)
+    scoring=bloc10_scoring(atoms,qc_list,judge)
+    coverage=bloc11_coverage(atoms,qc_list,judge,scoring)
+    # Gates
+    gates=[]
+    def G(n,c,e):gates.append({"gate":n,"verdict":"PASS"if c else"FAIL","evidence":e})
+    G("GATE_ISO2_VALID",seed["status"]=="OK",iso2)
+    G("GATE_AR0_MIN",ar0.get("status")=="OK" and len(ar0.get("domains",[]))>=1,f"doms={len(ar0.get('domains',[]))}")
+    G("GATE_CAP_SCHEMA",cap.get("A_METADATA",{}).get("status") in["DISCOVERED","PARTIAL"],cap.get("A_METADATA",{}).get("status",""))
+    G("GATE_DA1_MIN",len(da1.get("pairs",[]))>=1,f"pairs={len(da1.get('pairs',[]))}")
+    G("GATE_ATOMS_MIN",len([a for a in atoms if a["posable"]["final"]])>=1,f"posable={len([a for a in atoms if a['posable']['final']])}")
+    G("GATE_MINER",len(traces)>=1,f"traces={len(traces)}")
+    G("GATE_CLUSTERS",len(clusters.get("clusters",[]))>=1,f"clusters={len(clusters.get('clusters',[]))}")
+    G("GATE_QC_BUILT",len(qc_list)>=1,f"qc={len(qc_list)}")
+    G("GATE_IA2",sum(1 for r in judge if r["verdict"]=="PASS")>=1,f"pass={sum(1 for r in judge if r['verdict']=='PASS')}")
+    G("GATE_F1",scoring["f1"].get("status")=="OK",f"f1={scoring['f1'].get('score',0):.4f}")
+    G("GATE_COVERAGE",coverage["coverage_rate"]>=0.5,f"cov={coverage['coverage_rate']:.1%}")
+    global_v="PASS"if all(g["verdict"]=="PASS"for g in gates)else"FAIL"
+    rid=f"RUN_{iso2}_{sha(cj(sv(cap)))[:8]}"
+    # Artifacts
+    al=[("AR0",ar0),("CAP",cap),("DA1_manifest",da1["manifest"]),("DA1_pairs",da1["pairs"]),("BraveSnaps",da1.get("brave_snaps",[])),
+        ("Atoms",atoms),("Traces",traces),("Clusters",clusters),("QC",qc_list),("Judge",judge),("F1F2",scoring),("Coverage",coverage),
+        ("Gates",{"gates":gates,"global":global_v}),("UI_LOG",st.session_state.get("ui_ev",[]))]
     arts={n:w_art(rid,n,d)for n,d in al}
-    det=det_check(run_pipeline,iso2,rid)
-    for g2 in gr["gates"]:
-        if g2["gate"]=="GATE_DETERMINISM":g2["verdict"]="PASS"if det["pass"]else"FAIL";g2["evidence"]="OK"if det["pass"]else"FAIL"
-    gr["global_verdict"]="PASS"if all(x["verdict"]=="PASS"for x in gr["gates"])else"FAIL"
-    arts["Determinism"]=w_art(rid,"Determinism",det);arts["Gates"]=w_art(rid,"Gates",gr)
-    chk={"run_id":rid,"version":VERSION,"checks":[{"check":"CHK_NO_BRANCH","pass":chk_branch()["pass"]},{"check":"CHK_BRAVE_SNAPSHOT","pass":all("response_hash"in s for s in sources.get("brave_snapshots",[]))},{"check":"CHK_DETERMINISM","pass":det["pass"]},{"check":"CHK_FORMULA_MODE","pass":f1.get("formula_mode")=="TEST_CLEAR"},{"check":"CHK_QC_VALID","pass":sum(1 for q in qc if q["valid"])>=1}]}
-    arts["CHK_REPORT"]=w_art(rid,"CHK_REPORT",chk)
-    seal={"run_id":rid,"iso2":iso2,"exec_mode":EXEC_MODE,"version":VERSION,"formula_mode":"TEST_CLEAR"if EXEC_MODE=="TEST"else"A2_PACK","verdict":gr["global_verdict"],"det_pass":det["pass"],"n_arts":len(arts)+1,"hashes":{k:v["sha256"]for k,v in arts.items()},"ar0_status":ar0.get("status",""),"ar0_domains":ar0.get("domains",[]),"cap_status":cap.get("status",""),"cap_proof":cap.get("proof_level",""),"da0_mode":sources["mode"],"da1_mode":da1["text_mode"],"brave_snaps":len(sources.get("brave_snapshots",[])),"f1_score":f1.get("score",0),"f2_score":f2.get("score",0),"f1_mode":f1.get("formula_mode",""),"n_atoms":len(atoms),"n_qc_valid":sum(1 for q in qc if q["valid"]),"n_pairs":cep.get("total_pairs",0),"n_quarantine":cep.get("quarantined",0)}
+    seal={"run_id":rid,"iso2":iso2,"version":VERSION,"verdict":global_v,"f1":scoring["f1"].get("score",0),"f2":scoring["f2"].get("score",0),
+          "n_atoms":len(atoms),"n_posable":len([a for a in atoms if a["posable"]["final"]]),"n_qc":len(qc_list),"n_qc_pass":sum(1 for r in judge if r["verdict"]=="PASS"),
+          "n_pairs":len(da1["pairs"]),"coverage":coverage["coverage_rate"],"sealed":coverage["sealed"],"n_arts":len(arts)+1}
     arts["SealReport"]=w_art(rid,"SealReport",seal)
-    log_ev("DONE",rid);st.session_state["_sil"]=False
-    return{"run_id":rid,"ar0":ar0,"cap":cap,"vsp":vsp,"sources":sources,"cep":cep,"da1":da1,"atoms":atoms,"frt":frt,"qc":qc,"ari":ari,"triggers":triggers,"f1":f1,"f2":f2,"gates":gr,"seal":seal,"artifacts":arts,"determinism":det,"snapshot":snap}
-# ═══ UI ═══
-def nd():st.info("Activate a country.")
+    st.session_state["_sil"]=False
+    return{"run_id":rid,"seed":seed,"ar0":ar0,"cap":cap,"da1":da1,"atoms":atoms,"traces":traces,"clusters":clusters,"qc_list":qc_list,"judge":judge,"scoring":scoring,"coverage":coverage,"gates":{"gates":gates,"global":global_v},"seal":seal,"artifacts":arts}
+# ═══ UI: MISSION CONTROL ═══
 def main():
-    st.set_page_config(page_title=f"SMAXIA GTE v{VERSION}",layout="wide")
-    st.title(f"SMAXIA GTE CORE v{VERSION} — {EXEC_MODE}")
+    st.set_page_config(page_title=f"SMAXIA v{VERSION}",layout="wide",initial_sidebar_state="collapsed")
     if"pipeline"not in st.session_state:st.session_state.pipeline=None
     if"ui_ev"not in st.session_state:st.session_state.ui_ev=[]
+    # Top bar
+    hdr=st.container()
+    with hdr:
+        c1,c2,c3=st.columns([4,2,2])
+        with c1:st.markdown(f"## 🚀 SMAXIA MISSION CONTROL v{VERSION}")
+        with c2:
+            q=st.text_input("Country",key="cq",placeholder="FR, IN, SN...",label_visibility="collapsed")
+            hits=typeahead(q);cc=None
+            if hits:
+                labels=[f"{e['n']} ({e['c']})"for e in hits]
+                sel=st.selectbox("sel",options=labels,index=0,label_visibility="collapsed")
+                cc=hits[labels.index(sel)]["c"]
+            elif q and len(q.strip())==2:cc=q.strip().upper()
+        with c3:
+            if st.button("🚀 ACTIVATE",type="primary",use_container_width=True):
+                if cc:
+                    log_ev("ACTIVATE",cc)
+                    with st.spinner(f"Pipeline {cc}..."):st.session_state.pipeline=run_full_pipeline(cc)
+    # Status bar
+    p=st.session_state.pipeline
+    if p and"seal"in p:
+        s=p["seal"]
+        cols=st.columns(8)
+        cols[0].metric("Country",s["iso2"]);cols[1].metric("Verdict",s["verdict"])
+        cols[2].metric("F1",f"{s['f1']:.4f}");cols[3].metric("F2",f"{s['f2']:.4f}")
+        cols[4].metric("Atoms",s["n_atoms"]);cols[5].metric("QC",f"{s['n_qc_pass']}/{s['n_qc']}")
+        cols[6].metric("Coverage",f"{s['coverage']:.0%}");cols[7].metric("Sealed","✅"if s["sealed"]else"❌")
+    # API Keys status
     with st.sidebar:
-        st.markdown("### ACTIVATE_COUNTRY");q=st.text_input("Country/ISO2",key="cq",placeholder="France, IN...")
-        hits=typeahead(q);labels=[f"{e['n']} ({e['c']})"for e in hits];cc=None
-        if labels:ch=st.selectbox("Select",options=labels,index=0);cc=hits[labels.index(ch)]["c"]
-        elif q and q.strip():
-            raw=q.strip().upper()
-            if len(raw)==2:cc=raw
-        if st.button("ACTIVATE_COUNTRY",type="primary",use_container_width=True):
-            if cc and len(cc)==2:
-                log_ev("ACTIVATE",cc)
-                with st.spinner(f"Pipeline {cc}..."):st.session_state.pipeline=run_pipeline(cc)
-                v=st.session_state.pipeline["seal"]["verdict"]
-                (st.success if v=="PASS"else st.warning)(f"{cc}: {v}")
-            else:st.error("Select country.")
-        st.divider();st.markdown("**API Keys**")
-        for k,e in[("Brave","BRAVE_KEY"),("SerpAPI","SERPAPI_KEY"),("GCSE","GOOGLE_CSE_KEY")]:st.write(f"{'✅' if os.environ.get(e) else '❌'} {k}")
-        if st.session_state.pipeline:
-            s=st.session_state.pipeline["seal"];st.divider()
-            st.markdown(f"**{s['iso2']}** {s['verdict']}");st.markdown(f"F1:`{s['f1_score']:.4f}` F2:`{s['f2_score']:.4f}`")
-            st.markdown(f"Det:`{'OK'if s['det_pass']else'FAIL'}` Atoms:`{s['n_atoms']}` QC:`{s['n_qc_valid']}` Pairs:`{s['n_pairs']}`")
-            if s.get("brave_snaps",0)>0:st.markdown(f"Brave:`{s['brave_snaps']}` snaps")
-    T=st.tabs(["Admin","AR0","CAP/VSP","Sources","CEP","Text/OCR","Atoms","QC","Gates","F1/F2","Artifacts"])
+        st.markdown("**API Keys**")
+        for k,e in[("Brave","BRAVE_KEY"),("SerpAPI","SERPAPI_KEY")]:st.write(f"{'✅'if _secret(e)else'❌'} {k}")
+        if p and"seal"in p:
+            st.divider();st.json(p["seal"])
+    # 6 Tabs
+    T=st.tabs(["📚 CAP","📄 SUJETS","🔬 Qi/RQi","🎯 QC","📊 KPI","🗺️ MAPPING"])
+    # ═══ TAB 1: CAP ═══
     with T[0]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            s=p["seal"];c1,c2,c3,c4,c5=st.columns(5)
-            c1.metric("Country",s["iso2"]);c2.metric("Verdict",s["verdict"]);c3.metric("Det","PASS"if s["det_pass"]else"FAIL");c4.metric("F1",f"{s['f1_score']:.4f}");c5.metric("F2",f"{s['f2_score']:.4f}")
-            c6,c7,c8=st.columns(3);c6.metric("Atoms",s["n_atoms"]);c7.metric("QC Valid",s["n_qc_valid"]);c8.metric("Pairs",s["n_pairs"])
-            st.write(f"v{VERSION} | Mode:{s['formula_mode']} | AR0:{s['ar0_status']} CAP:{s['cap_status']}({s['cap_proof']}) DA0:{s['da0_mode']} DA1:{s['da1_mode']}")
+        if not p:st.info("🚀 Activate a country to begin.");return
+        cap=p["cap"]
+        if cap.get("A_METADATA",{}).get("status")=="FAIL":st.error(f"CAP FAIL: {cap.get('code','')}");return
+        c1,c2,c3=st.columns(3)
+        with c1:
+            st.markdown("#### Niveaux")
+            for lv in cap.get("B_EDUCATION",{}).get("levels",[]):st.write(f"▸ {lv['name']}")
+            if not cap.get("B_EDUCATION",{}).get("levels"):st.caption("Extraction pending")
+        with c2:
+            st.markdown("#### Matières")
+            for sub in cap.get("B_EDUCATION",{}).get("subjects",[]):st.write(f"▸ {sub['name']}")
+        with c3:
+            st.markdown("#### Spécialités")
+            st.caption(f"Chapters: {cap.get('B_EDUCATION',{}).get('chapters_status','PENDING')}")
+        st.divider()
+        st.markdown("#### Examens & Concours")
+        for ex in cap.get("E_EXAMS",{}).get("exams",[]):st.write(f"▸ {ex['name']}")
+        st.markdown(f"**Grading:** {cap.get('E_EXAMS',{}).get('grading',{}).get('description','N/A')}")
+        st.markdown(f"**Domains:** {cap.get('C_HARVEST',{}).get('authority_domains',[])}")
+        st.markdown(f"**Pages:** {cap.get('C_HARVEST',{}).get('pages_crawled',0)} | **PDFs:** {cap.get('C_HARVEST',{}).get('pdfs_found',0)}")
+    # ═══ TAB 2: SUJETS ═══
     with T[1]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            ar=p["ar0"];st.header(f"AR0 — {ar['status']}")
-            if ar["status"]=="OK":
-                st.write(f"**Domains:** {ar['domains']}");sel=ar.get("selected",{})
-                for k in["AR0_EDU","AR0_EXAM"]:
-                    v=sel.get(k)
-                    if v:st.write(f"**{k}:** {v['url'][:70]} score={v['score']} {v.get('source_flag','')}")
-                for c in ar.get("candidates",[])[:15]:st.write(f"{'✓'if c.get('accessible')else'✗'} {c['domain']} s={c['score']} {c.get('source_flag','')}")
-            else:st.error(f"FAIL: {ar.get('code','')}")
+        if not p:st.info("Activate a country.");return
+        da1=p["da1"]
+        st.markdown(f"#### Harvest — {da1['mode']} ({da1['stats']['total']} sources, {da1['stats']['pairs']} pairs)")
+        # Filters
+        types=sorted(set(pr.get("exam_type","")for pr in da1["pairs"]))
+        fc1,fc2=st.columns(2)
+        with fc1:ftype=st.selectbox("Type",["ALL"]+types,key="ft")
+        with fc2:fmode=st.selectbox("Mode",["ALL","FULL","SUBJECT_ONLY"],key="fm")
+        for pr in da1["pairs"]:
+            if ftype!="ALL"and pr.get("exam_type")!=ftype:continue
+            if fmode!="ALL"and pr.get("mode")!=fmode:continue
+            c1,c2,c3,c4,c5=st.columns([1,2,2,1,1])
+            c1.write(pr["pair_id"]);c2.write(pr.get("exam_type",""));c3.write(pr["sujet_url"][:50]+"...")
+            c4.write("✅"if pr["mode"]=="FULL"else"❌");c5.write(pr.get("source_flag",""))
+        if da1.get("quarantine"):
+            st.subheader("⚠️ Quarantine");[st.write(f"{q['reason']} — {q['url'][:60]}")for q in da1["quarantine"]]
+        # Brave snapshots
+        bs=da1.get("brave_snaps",[])
+        if bs:st.subheader(f"🔒 Brave Snapshots ({len(bs)})");[st.caption(f"`{s['hash'][:16]}` {s['query']}")for s in bs]
+    # ═══ TAB 3: Qi/RQi ═══
     with T[2]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            cap=p["cap"];st.header(f"CAP — {cap['status']} ({cap.get('proof_level','')})")
-            st.write(f"Domains:{cap.get('authority_domains',[])} Pages:{cap['provenance'].get('pages_crawled',0)} PDFs:{cap['provenance'].get('pdfs_found',0)} Chapters:{cap.get('chapters_status','N/A')}")
-            if cap.get("exams",{}).get("exams"):st.write(f"Exams: {', '.join(e['name']for e in cap['exams']['exams'])}")
-            if cap.get("subjects"):st.write(f"Subjects: {', '.join(s['name']for s in cap['subjects'])}")
-            st.subheader("VSP");[st.write(f"{'✓'if c['pass']else'✗'} {c['check']}")for c in p["vsp"]["checks"]]
+        if not p:st.info("Activate a country.");return
+        atoms=p["atoms"];posable=[a for a in atoms if a["posable"]["final"]]
+        st.markdown(f"#### Atoms: {len(atoms)} total, {len(posable)} POSABLE")
+        fp=st.selectbox("Filter",["ALL","POSABLE","NOT_POSABLE"],key="fp")
+        shown=atoms if fp=="ALL"else(posable if fp=="POSABLE"else[a for a in atoms if not a["posable"]["final"]])
+        for a in shown[:50]:
+            with st.expander(f"**{a['qi_id']}** | {a.get('exam_type','')} | {'✅ POSABLE'if a['posable']['final']else'❌'} | {a.get('points','?')}pts"):
+                st.markdown(f"**Qi:** {a['qi_text'][:400]}")
+                if a["rqi_text"]:st.markdown(f"**RQi:** {a['rqi_text'][:400]}")
+                st.caption(f"Chapter: {a['chapter_code']} | Conf: {a['confidence']} | Hash: {a['qi_hash'][:12]}")
+    # ═══ TAB 4: QC ═══
     with T[3]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            st.header(f"Sources — {p['sources']['mode']}");st.write(f"PDFs: {len(p['sources']['source_manifest'])}")
-            bs=p["sources"].get("brave_snapshots",[])
-            if bs:
-                st.subheader(f"Brave L2 Snapshots ({len(bs)})");[st.write(f"🔒 `{s2.get('response_hash','')[:16]}` {s2.get('query','')}")for s2 in bs]
-            for s2 in p["sources"]["source_manifest"][:30]:st.write(f"`{s2['type']}` [{s2.get('provider','')}] {s2.get('source_flag','')} {s2['url'][:80]}")
+        if not p:st.info("Activate a country.");return
+        qc_list=p["qc_list"];judge=p["judge"]
+        judge_map={r["qc_id"]:r for r in judge}
+        n_pass=sum(1 for r in judge if r["verdict"]=="PASS")
+        st.markdown(f"#### Questions Clés: {n_pass} PASS / {len(qc_list)} total (target ~15)")
+        for qc in qc_list:
+            j=judge_map.get(qc["qc_id"],{})
+            v=j.get("verdict","?")
+            with st.expander(f"{'✅'if v=='PASS'else'❌'} **{qc['qc_id']}** — \"{qc['qc_text'][:80]}\""):
+                st.write(f"**Qi associées:** {', '.join(qc['qi_ids'])}")
+                st.write(f"**Triggers:** {qc['n_triggers']}")
+                if qc.get("ari"):st.write(f"**ARI:** {qc['ari'].get('steps_consensus',[])} avg_steps={qc['ari'].get('n_steps_avg',0)}")
+                if qc.get("frt"):st.write(f"**FRT type:** {qc['frt'].get('reponse_type','')}")
+                if j.get("checks"):
+                    st.caption("Checks: "+" ".join([f"{'✓'if v2 else'✗'}{k}"for k,v2 in j["checks"].items()]))
+    # ═══ TAB 5: KPI ═══
     with T[4]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            st.header("CEP");c1,c2,c3=st.columns(3);c1.metric("Full",p['cep']['full_pairs']);c2.metric("Subject-only",p['cep']['subject_only']);c3.metric("Quarantined",p['cep']['quarantined'])
-            for pr in p["cep"]["pairs"]:st.write(f"**{pr['pair_id']}** {pr['pair_mode']} score:{pr['pair_score']} {pr.get('source_flag','')}")
-            if p["cep"].get("quarantine"):
-                st.subheader("Quarantine");[st.write(f"⚠️ {q2['reason']} {q2['url'][:60]}")for q2 in p["cep"]["quarantine"]]
+        if not p:st.info("Activate a country.");return
+        cov=p["coverage"];scoring=p["scoring"]
+        st.markdown("#### SATURATION DASHBOARD")
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("QC trouvées",f"{scoring['f1'].get('n_qc',0)} / ~15")
+        c2.metric("Couverture",f"{cov['covered']}/{cov['posable_total']}")
+        c3.metric("Orphelins",cov["orphans_count"])
+        c4.metric("Saturé","✅ OUI"if cov["saturated"]else"❌ NON")
+        # Coverage bar
+        rate=cov["coverage_rate"]
+        st.progress(min(rate,1.0),text=f"Coverage: {rate:.1%}")
+        # Gates
+        st.markdown("#### Gates Pipeline")
+        for g in p["gates"]["gates"]:st.write(f"{'✅'if g['verdict']=='PASS'else'🔴'} **{g['gate']}** `{g['evidence']}`")
+        st.markdown(f"**GLOBAL: {p['gates']['global']}**")
+        # Orphans detail
+        if cov["orphans"]:
+            st.markdown("#### Orphelins (Qi sans QC mère)")
+            for o in cov["orphans"][:10]:st.write(f"⚠️ {o['qi_id']}")
+        # F1/F2
+        st.divider();fc1,fc2=st.columns(2)
+        with fc1:st.metric("F1",f"{scoring['f1'].get('score',0):.4f}");st.caption(scoring["f1"].get("formula_mode",""))
+        with fc2:st.metric("F2",f"{scoring['f2'].get('score',0):.4f}");rg=scoring["f2"].get("predicted_range",[0,0]);st.caption(f"Range: [{rg[0]:.4f}—{rg[1]:.4f}]")
+    # ═══ TAB 6: MAPPING ═══
     with T[5]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            da1=p["da1"];st.header(f"Text/OCR — {da1['text_mode']}");st.write(f"OCR:{da1['real_ocr_count']} Img:{da1.get('image_detected',0)}")
-            for pid in sorted(da1["texts"]):
-                t=da1["texts"][pid]
-                with st.expander(f"{pid} S:{len(t.get('sujet_text',''))}c C:{len(t.get('corrige_text',''))}c"):
-                    if t.get("sujet_text"):st.text_area("Sujet",t["sujet_text"][:3000],height=120,key=f"s_{pid}",disabled=True)
-                    if t.get("corrige_text"):st.text_area("Corrigé",t["corrige_text"][:3000],height=120,key=f"c_{pid}",disabled=True)
-    with T[6]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            st.header("Atoms");st.metric("Total",len(p["atoms"]))
-            for a in p["atoms"][:30]:
-                with st.expander(f"**{a['Qi']['id']}** {a['Qi'].get('points','?')}pts conf={a['Qi'].get('split_confidence','')}"):
-                    st.markdown(f"**Q:** {a['Qi']['text'][:300]}");st.markdown(f"**R:** {a['RQi']['text'][:300]}")
-    with T[7]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            vc=sum(1 for q in p["qc"]if q["valid"]);st.header("QC");st.metric("Valid",f"{vc}/{len(p['qc'])}")
-            for q in p["qc"]:
-                txt=q.get("qc_text","")[:80]
-                st.write(f"{'✓'if q['valid']else'✗'} **{q['atom_id']}** {q['reason']} ({q['points']}pts) {txt}")
-    with T[8]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            gr=p["gates"];(st.success if gr["global_verdict"]=="PASS"else st.error)(f"GLOBAL: {gr['global_verdict']}")
-            for g in gr["gates"]:st.write(f"{'✓'if g['verdict']=='PASS'else'✗'} **{g['gate']}** `{g['evidence']}`")
-    with T[9]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            st.header("F1/F2");c1,c2=st.columns(2)
-            with c1:st.subheader("F1");st.metric("Score",f"{p['f1'].get('score',0):.4f}");st.caption(p['f1'].get('note',''))
-            with c2:st.subheader("F2");st.metric("Score",f"{p['f2'].get('score',0):.4f}");rg=p['f2'].get('predicted_range',[0,0]);st.write(f"Range:[{rg[0]:.4f}—{rg[1]:.4f}]")
-            st.subheader("ARI")
-            for a in p["ari"][:20]:st.write(f"**{a['atom_id']}** diff:{a['difficulty']} disc:{a['discrimination']} pts:{a['points']}")
-            st.subheader("Triggers")
-            for t in p["triggers"]:st.write(f"**{t['trigger']}** {t.get('atom_id',t.get('theme',''))} val={t['value']}")
-    with T[10]:
-        p=st.session_state.pipeline
-        if not p:nd()
-        else:
-            st.header(f"Artifacts ({len(p['artifacts'])})");[st.write(f"**{n}** `{m['sha256'][:16]}`")for n,m in sorted(p["artifacts"].items())]
-            st.subheader("SealReport");st.json(p["seal"])
+        if not p:st.info("Activate a country.");return
+        st.markdown("#### 📎 Test de Couverture — Upload un sujet PDF")
+        uploaded=st.file_uploader("Upload sujet PDF",type=["pdf"],key="map_pdf")
+        if uploaded:
+            pdf_bytes=uploaded.read()
+            txt,mode=_ocr(pdf_bytes)
+            if txt:
+                qb=_split_q(txt)
+                st.write(f"**Qi extraites:** {len(qb)}")
+                qc_list=p["qc_list"];judge_map={r["qc_id"]:r for r in p["judge"]}
+                matched,orphan=0,0
+                for i,q in enumerate(qb):
+                    if _is_hdr(q):continue
+                    # Try to match against QC triggers
+                    best_qc=None;best_score=0
+                    for qc in qc_list:
+                        if judge_map.get(qc["qc_id"],{}).get("verdict")!="PASS":continue
+                        for trig in qc["triggers"]:
+                            # Simple keyword overlap
+                            ow=set(q.lower().split())&set(trig["text"].lower().split())
+                            sc2=len(ow)
+                            if sc2>best_score:best_score=sc2;best_qc=qc["qc_id"]
+                    if best_qc and best_score>=2:
+                        st.write(f"qi_{i+1:02d} | \"{q[:50]}...\" | → **{best_qc}** ✅ (score={best_score})")
+                        matched+=1
+                    else:
+                        st.write(f"qi_{i+1:02d} | \"{q[:50]}...\" | → ❌ ORPHELIN")
+                        orphan+=1
+                total=matched+orphan
+                if total>0:
+                    st.divider()
+                    st.metric("Taux de couverture",f"{matched}/{total} = {matched/total:.1%}")
+                    st.metric("Orphelins",orphan)
+            else:st.warning("OCR failed on this PDF.")
+        else:st.caption("Upload un sujet pour tester la couverture des QC.")
+    # Artifacts tab in sidebar
+    with st.sidebar:
+        if p and"artifacts"in p:
+            st.divider();st.markdown(f"**Artifacts ({len(p['artifacts'])})**")
+            for n,m in sorted(p["artifacts"].items()):st.caption(f"{n}: `{m['sha256'][:12]}`")
 if __name__=="__main__":main()
