@@ -325,12 +325,15 @@ def bloc4_da1(ar0,cap):
             for lang in langs:
                 t=_LANG_TERMS.get(lang,_LANG_TERMS["en"])
                 eo=" OR ".join(f'"{x}"'for x in t["exam"][:2]);ao=" OR ".join(f'"{x}"'for x in t["answer"][:2])
-                qs+=[f"site:{dom} filetype:pdf ({eo}) {year}",f"site:{dom} filetype:pdf ({eo}) {year-1}",f"site:{dom} filetype:pdf ({ao})"]
+                do=" OR ".join(f'"{x}"'for x in t["diploma"][:2])
+                qs+=[f"site:{dom} filetype:pdf ({eo}) ({do})",f"site:{dom} filetype:pdf ({ao}) ({do})"]
         for lang in langs[:2]:
             t=_LANG_TERMS.get(lang,_LANG_TERMS["en"])
-            qs+=[f"{cn} filetype:pdf {t['exam'][0]} {t['diploma'][0]} {year}"]
-            qs+=[f"{cn} filetype:pdf {t['answer'][0]} {year}"]
-            qs+=[f"{cn} filetype:pdf {t['answer'][0]} {year-1}"]
+            # Targeted queries for real exam papers (not admin bulletins)
+            qs+=[f"filetype:pdf {t['exam'][0]} {t['diploma'][0]} {cn} {year}"]
+            qs+=[f"filetype:pdf {t['answer'][0]} {t['diploma'][0]} {cn} {year}"]
+            qs+=[f"filetype:pdf {t['answer'][0]} {t['diploma'][0]} {cn} {year-1}"]
+            qs+=[f"filetype:pdf {t['exam'][0]} {t['diploma'][0]} mathematiques {cn}"]
         bcands,bsnaps=_brave_search(qs[:10],diag)
         for r2 in bcands:
             if".pdf"in r2["url"].lower():
@@ -411,6 +414,8 @@ def bloc5_atoms(da1):
         if pair["corrige_url"]:cd,cs,_,_=http_get(pair["corrige_url"],binary=True,timeout=20)
         st_,sm=_ocr(sd if isinstance(sd,bytes)else None);ct_,cm2=_ocr(cd if isinstance(cd,bytes)else None)
         if not st_ or len(st_)<100:continue
+        # Auto-detect subject from PDF text (invariant, not hardcoded)
+        chap=_auto_chapter(st_)
         qb=_split_q(st_);cb=_split_q(ct_)if ct_ else[]
         has_nums=any(re.match(r'\s*\d+[\.\)]',p)for p in qb)
         conf=0.9 if has_nums and len(qb)>=3 else(0.6 if has_nums else 0.4)
@@ -418,15 +423,27 @@ def bloc5_atoms(da1):
         for qi_idx,q in enumerate(qb):
             if _is_hdr(q):continue
             low=q.lower()
-            is_q=any(k in low for k in["what","why","how","explain","calculate","find","solve","prove","define","describe","qu'est","expliquer","calculer","démontrer","?","marks","points"])or len(q)>=150
+            is_q=any(k in low for k in["what","why","how","explain","calculate","find","solve","prove","define","describe","qu'est","expliquer","calculer","démontrer","montrer","déterminer","résoudre","justifier","?","marks","points"])or len(q)>=150
             if not is_q:continue
             qi_c+=1;rb=cb[qi_idx]if qi_idx<len(cb)else""
             atoms.append({"qi_id":f"{pid}_Q{qi_c}","pair_id":pid,"qi_text":q.strip(),"rqi_text":rb.strip(),"points":_pts(q),
                 "qi_hash":sha(q.strip()),"rqi_hash":sha(rb.strip()),"confidence":round(conf,2),
                 "exam_type":pair.get("exam_type","EXAM"),"source_flag":pair.get("source_flag",""),
                 "posable":{"corrige":len(rb)>50,"scope":True,"evaluable":is_q,"final":is_q},
-                "chapter_code":"PENDING"})
+                "chapter_code":chap})
     return atoms
+def _auto_chapter(text):
+    """Auto-detect chapter/subject from PDF text. NOT hardcoded — keyword scan."""
+    low=text[:3000].lower()
+    # Detect by content keywords (invariant patterns, works any country)
+    for kw,ch in[("mathématiques","MATH"),("mathematics","MATH"),("physique","PHYS"),("physics","PHYS"),
+        ("chimie","CHEM"),("chemistry","CHEM"),("biologie","BIO"),("biology","BIO"),
+        ("économi","ECON"),("economics","ECON"),("histoir","HIST"),("history","HIST"),
+        ("géograph","GEO"),("geography","GEO"),("philosoph","PHILO"),("philosophy","PHILO"),
+        ("français","FR_LIT"),("littératur","FR_LIT"),("english","ENG"),("informatique","CS"),
+        ("computer","CS"),("svt","SVT"),("sciences de la vie","SVT")]:
+        if kw in low:return ch
+    return"AUTO_CLUSTER"
 # ═══ BLOCS 6-11 ═══
 def bloc6_miner(atoms):
     traces=[]
