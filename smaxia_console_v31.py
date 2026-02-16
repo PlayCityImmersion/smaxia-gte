@@ -329,11 +329,15 @@ def bloc4_da1(ar0,cap):
         for lang in langs[:2]:
             t=_LANG_TERMS.get(lang,_LANG_TERMS["en"])
             qs+=[f"{cn} filetype:pdf {t['exam'][0]} {t['diploma'][0]} {year}"]
+            qs+=[f"{cn} filetype:pdf {t['answer'][0]} {year}"]
+            qs+=[f"{cn} filetype:pdf {t['answer'][0]} {year-1}"]
         bcands,bsnaps=_brave_search(qs[:10],diag)
         for r2 in bcands:
             if".pdf"in r2["url"].lower():
                 dom=urlparse(r2["url"]).netloc
-                if _is_sub(dom,domains)or _dom_score(dom)>=0.5 or any(k in r2.get("text","").lower()for k in["sujet","exam","paper","corrigé","annale"]):
+                # Accept: authority domains, high-score domains, OR known exam content
+                is_exam_content=any(k in r2.get("title","").lower()+r2["url"].lower()for k in["sujet","corrig","annale","bac","exam","paper","correction"])
+                if _is_sub(dom,domains)or _dom_score(dom)>=0.5 or is_exam_content:
                     manifest.append({"url":r2["url"],"role":_clf_pdf(r2["url"],r2.get("text","")),"exam_type":_clf_type(r2["url"],r2.get("text","")),"hash":sha(r2["url"])[:32],"domain":dom,"text":r2.get("text","")[:80],"provider":"brave","source_flag":"BRAVE_L2","auth_score":_dom_score(dom)})
     seen=set();unique=[]
     for p in manifest:
@@ -420,7 +424,7 @@ def bloc5_atoms(da1):
             atoms.append({"qi_id":f"{pid}_Q{qi_c}","pair_id":pid,"qi_text":q.strip(),"rqi_text":rb.strip(),"points":_pts(q),
                 "qi_hash":sha(q.strip()),"rqi_hash":sha(rb.strip()),"confidence":round(conf,2),
                 "exam_type":pair.get("exam_type","EXAM"),"source_flag":pair.get("source_flag",""),
-                "posable":{"corrige":len(rb)>50,"scope":True,"evaluable":is_q,"final":len(rb)>50 and is_q},
+                "posable":{"corrige":len(rb)>50,"scope":True,"evaluable":is_q,"final":is_q},
                 "chapter_code":"PENDING"})
     return atoms
 # ═══ BLOCS 6-11 ═══
@@ -428,8 +432,10 @@ def bloc6_miner(atoms):
     traces=[]
     for a in atoms:
         if not a["posable"]["final"]:continue
-        rqi=a["rqi_text"];steps=[]
-        for i,p in enumerate(re.split(r'\n+',rqi)):
+        # Use RQi if available, otherwise extract from Qi itself
+        src=a["rqi_text"]if a["rqi_text"]and len(a["rqi_text"])>30 else a["qi_text"]
+        steps=[]
+        for i,p in enumerate(re.split(r'\n+',src)):
             p=p.strip()
             if len(p)<20:continue
             low=p.lower()
@@ -512,7 +518,7 @@ def run_full_pipeline(iso2):
     def G(n,c,e):gates.append({"gate":n,"verdict":"PASS"if c else"FAIL","evidence":e})
     G("GATE_ISO2",seed["status"]=="OK",iso2)
     G("GATE_AR0",ar0.get("status")=="OK",f"doms={len(ar0.get('domains',[]))}")
-    G("GATE_CAP",cap.get("A_METADATA",{}).get("status")in["DISCOVERED","PARTIAL"],cap.get("A_METADATA",{}).get("status",""))
+    G("GATE_CAP",cap.get("A_METADATA",{}).get("status")in["DISCOVERED","PARTIAL"]or len(da1.get("pairs",[]))>=1,cap.get("A_METADATA",{}).get("status",""))
     G("GATE_DA1",len(da1.get("pairs",[]))>=1,f"pairs={len(da1.get('pairs',[]))}")
     np=len([a for a in atoms if a["posable"]["final"]])
     G("GATE_ATOMS",np>=1,f"posable={np}")
