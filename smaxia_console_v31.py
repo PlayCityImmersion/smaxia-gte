@@ -68,6 +68,19 @@ def css():
 .streamlit-expanderHeader{background:var(--c)!important;color:#e3f2fd!important;border-radius:7px!important;font-size:.82rem!important}
 hr{border-color:var(--bd)!important}
 .stSelectbox label,.stTextInput label{color:var(--bl)!important;font-size:.74rem!important}
+/* Hide radio dots — active item = bright color */
+[data-testid="stSidebar"] .stRadio > div{gap:0!important}
+[data-testid="stSidebar"] .stRadio > div > label{padding:.28rem .6rem!important;border-radius:6px!important;margin:1px 0!important;cursor:pointer!important;transition:all .15s!important}
+[data-testid="stSidebar"] .stRadio > div > label:hover{background:rgba(100,181,246,.08)!important}
+[data-testid="stSidebar"] .stRadio > div > label[data-checked="true"]{background:rgba(100,181,246,.12)!important}
+[data-testid="stSidebar"] .stRadio > div > label[data-checked="true"] span{color:#e3f2fd!important;font-weight:600!important}
+[data-testid="stSidebar"] .stRadio > div > label > div:first-child{display:none!important}
+/* Fix file uploader bg */
+[data-testid="stSidebar"] [data-testid="stFileUploader"]{background:transparent!important}
+[data-testid="stSidebar"] [data-testid="stFileUploader"] section{background:var(--bg2)!important;border:1px dashed rgba(255,255,255,.12)!important;border-radius:8px!important}
+[data-testid="stSidebar"] [data-testid="stFileUploader"] button{background:rgba(100,181,246,.1)!important;color:var(--bl)!important;border:1px solid rgba(100,181,246,.2)!important}
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"]{background:var(--bg2)!important}
+[data-testid="stSidebar"] .uploadedFile{background:var(--c)!important;border:1px solid var(--bd)!important;border-radius:6px!important}
 </style>""",unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════
@@ -427,22 +440,35 @@ def main():
     PAGES_CEO=["📊 Chapitres Status","🔬 QC Explorer","🗺️ Mapping Qi→QC","🧪 Test Sujet","🎯 Prédictions","💡 Best Ideas"]
     with st.sidebar:
         st.markdown("### 🔒 SMAXIA")
-        # Run
-        runs_base="./runs";av=scan_runs(runs_base)
-        if av:
-            sel=st.selectbox("📂 Run",av,key="sr")
-            rd=os.path.join(runs_base,sel)
-        else:rd=os.path.join(runs_base,"latest")
-        with st.expander("⚙️ Avancé"):
-            cp=st.text_input("Chemin custom","",key="cp")
-            if cp:rd=cp
-        # CAP
+        # ── CAP status (compact) ──
         cap=st.session_state.get("cap_data")
+        rd=os.path.join("./runs","latest")
+        av=scan_runs("./runs")
+        if av:rd=os.path.join("./runs",av[0])
         if not cap:
             for p in scan_caps(rd):
                 cap=load_json(p)
                 if cap:st.session_state["cap_data"]=cap;break
-        cap_up=st.file_uploader("📤 CAP JSON",type=["json"],key="cup")
+        if cap:
+            m=cap.get("A_METADATA",{})
+            fl={"FR":"🇫🇷","MA":"🇲🇦","SN":"🇸🇳","CI":"🇨🇮","TN":"🇹🇳"}.get(m.get("country_code",""),"🌍")
+            st.markdown(f"**{fl} {m.get('country_name_local','')}** · K{m.get('kernel_version','')}")
+            if m.get("status")=="SEALED":st.markdown('<span class="b-se">✓ SEALED</span>',unsafe_allow_html=True)
+        st.markdown("---")
+        # ── NAVIGATION (top priority) ──
+        st.markdown('<div class="ns">SMAXIA PIPELINE</div>',unsafe_allow_html=True)
+        p1=st.radio("p1",PAGES_PIPE,key="n1",label_visibility="collapsed")
+        st.markdown('<div class="ns">VALIDATION CEO</div>',unsafe_allow_html=True)
+        p2=st.radio("p2",PAGES_CEO,key="n2",label_visibility="collapsed")
+        # ── FILE LOADING (bottom) ──
+        st.markdown("---")
+        with st.expander("⚙️ Avancé"):
+            if av:
+                sel=st.selectbox("📂 Run",av,key="sr")
+                rd=os.path.join("./runs",sel)
+            cp=st.text_input("Chemin custom","",key="cp")
+            if cp:rd=cp
+        cap_up=st.file_uploader("📤 CAP JSON",type=["json"],key="cup",label_visibility="collapsed")
         if cap_up:
             try:
                 b=cap_up.read();cap=json.loads(b.decode("utf-8"));st.session_state["cap_data"]=cap
@@ -450,17 +476,6 @@ def main():
                 except:pass
                 st.success("✅ CAP chargé")
             except Exception as e:st.error(f"❌ {e}")
-        if cap:
-            m=cap.get("A_METADATA",{})
-            fl={"FR":"🇫🇷","MA":"🇲🇦","SN":"🇸🇳","CI":"🇨🇮","TN":"🇹🇳"}.get(m.get("country_code",""),"🌍")
-            st.markdown(f"**{fl} {m.get('country_name_local','')}** · K{m.get('kernel_version','')}")
-            if m.get("status")=="SEALED":st.markdown('<span class="b-se">✓ SEALED</span>',unsafe_allow_html=True)
-        st.markdown("---")
-        # Navigation
-        st.markdown('<div class="ns">SMAXIA PIPELINE</div>',unsafe_allow_html=True)
-        p1=st.radio("p1",PAGES_PIPE,key="n1",label_visibility="collapsed")
-        st.markdown('<div class="ns">VALIDATION CEO</div>',unsafe_allow_html=True)
-        p2=st.radio("p2",PAGES_CEO,key="n2",label_visibility="collapsed")
     # Track active
     for k in["n1","n2"]:
         pk=f"_p_{k}"
