@@ -700,34 +700,47 @@ def main():
     with st.sidebar:
         st.markdown("### 🌍 SMAXIA Admin")
 
-        # Run selector (clean CEO style)
+        # Run selector
         runs_base = "./runs"
         available = scan_runs(runs_base)
         if available:
-            sel_run = st.selectbox("📂 Run", available, key="sel_r",
-                                   help="Sélectionnez un run dans ./runs/")
+            sel_run = st.selectbox("📂 Run", available, key="sel_r")
             rd = os.path.join(runs_base, sel_run)
         else:
-            rd = ""
+            rd = os.path.join(runs_base, "latest")
 
-        # Advanced settings (collapsed)
         with st.expander("⚙️ Avancé"):
             custom_base = st.text_input("Runs base", value=runs_base, key="cb")
             if custom_base != runs_base:
-                runs_base = custom_base
-                available = scan_runs(runs_base)
-                if available:
-                    sel2 = st.selectbox("Run", available, key="sel_r2")
-                    rd = os.path.join(runs_base, sel2)
+                av2 = scan_runs(custom_base)
+                if av2:
+                    sel2 = st.selectbox("Run", av2, key="sel_r2")
+                    rd = os.path.join(custom_base, sel2)
             custom_path = st.text_input("Chemin custom", value="", key="cp")
             if custom_path: rd = custom_path
 
-        # CAP status badges
-        caps = scan_caps(rd) if rd else []
-        has_cap = len(caps) > 0
-        has_ces = art_exists(rd, "CES_State.json") if rd else False
+        # ── CAP LOADING (3 sources: session_state > filesystem > upload) ──
+        cap = None
 
-        # Status badges
+        # Source 1: session_state (persists on Streamlit Cloud across reruns)
+        if "cap_data" in st.session_state and st.session_state["cap_data"]:
+            cap = st.session_state["cap_data"]
+
+        # Source 2: filesystem (local mode)
+        if cap is None:
+            caps = scan_caps(rd)
+            if caps:
+                if len(caps) > 1:
+                    sel_cap = st.selectbox("🌍 Pays", [os.path.basename(c) for c in caps], key="sc")
+                    cap = load_json(os.path.join(rd, sel_cap))
+                else:
+                    cap = load_json(caps[0])
+                if cap:
+                    st.session_state["cap_data"] = cap
+
+        # Source 3: upload
+        has_cap = cap is not None
+        has_ces = art_exists(rd, "CES_State.json")
         cap_badge = "✅ CAP" if has_cap else "❌ CAP"
         ces_badge = "✅ CES" if has_ces else "⏳ CES"
         st.markdown(f"<div style='display:flex;gap:0.5rem;margin:0.3rem 0'>"
@@ -735,24 +748,24 @@ def main():
                     f"<span style='font-size:0.75rem;font-weight:700'>{ces_badge}</span></div>",
                     unsafe_allow_html=True)
 
-        # Upload CAP
-        if not has_cap:
-            cap_up = st.file_uploader("📤 Upload CAP", type=["json"], key="cup")
-            if cap_up and rd:
-                os.makedirs(rd, exist_ok=True)
-                dest = os.path.join(rd, cap_up.name)
-                with open(dest, "wb") as f: f.write(cap_up.read())
-                st.success(f"✅ Sauvé: {dest}")
-                st.rerun()
-
-        # Load CAP
-        cap = None
-        if caps:
-            if len(caps) > 1:
-                sel_cap = st.selectbox("🌍 Pays", [os.path.basename(c) for c in caps], key="sc")
-                cap = load_json(os.path.join(rd, sel_cap))
-            else:
-                cap = load_json(caps[0])
+        cap_up = st.file_uploader("📤 Upload CAP JSON", type=["json"], key="cup")
+        if cap_up:
+            try:
+                cap_bytes = cap_up.read()
+                new_cap = json.loads(cap_bytes.decode("utf-8"))
+                st.session_state["cap_data"] = new_cap
+                cap = new_cap
+                has_cap = True
+                # Also try to save to disk (works local, may fail cloud — that's OK)
+                try:
+                    os.makedirs(rd, exist_ok=True)
+                    with open(os.path.join(rd, cap_up.name), "wb") as f:
+                        f.write(cap_bytes)
+                except Exception:
+                    pass  # Cloud filesystem — expected
+                st.success("✅ CAP chargé !")
+            except Exception as e:
+                st.error(f"❌ JSON invalide: {e}")
 
         if cap:
             m = cap.get("A_METADATA", {})
