@@ -1,744 +1,745 @@
 # ═══════════════════════════════════════════════════════════════════
-# SMAXIA COMMAND CENTER — Admin Console Premium v1.0
-# Fusion Opus + Manus + GPT design | Kernel V10.6.3
-# Usage: streamlit run smaxia_command_center.py
+# SMAXIA COMMAND CENTER — Admin Console Premium v2.0
+# 7 corrections GPT + Design Manus
+# Usage: streamlit run smaxia_command_center_v2.py
 # ═══════════════════════════════════════════════════════════════════
 import streamlit as st
-import json, zlib, base64, hashlib, os, glob
+import json, os, glob, datetime
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════
-# 1. CAP DATA — EMBEDDED (compressed b64)
+# 1. DATA LOADERS — CAP = FILE SCELLÉ ONLY (FIX #1: zéro embedded)
 # ═══════════════════════════════════════════════════════════════════
-_CAP_B64 = """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"""
+def scan_run_dirs(base="./runs"):
+    if not os.path.isdir(base):
+        return []
+    return sorted([d for d in os.listdir(base)
+                   if os.path.isdir(os.path.join(base, d))], reverse=True)
 
-@st.cache_data
-def load_cap_embedded():
-    raw = zlib.decompress(base64.b64decode(_CAP_B64))
-    return json.loads(raw.decode("utf-8"))
-
-@st.cache_data
-def load_cap_file(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def get_cap():
-    """Load CAP: from ./runs/ if available, else embedded."""
-    run_dir = st.session_state.get("run_dir", "")
-    if run_dir:
-        caps = glob.glob(os.path.join(run_dir, "CAP_*.json"))
-        if caps:
-            return load_cap_file(caps[0])
-    return load_cap_embedded()
-
-# ═══════════════════════════════════════════════════════════════════
-# 2. CES ARTEFACT LOADER (reads from ./runs/<run_id>/ if exists)
-# ═══════════════════════════════════════════════════════════════════
-CES_FILES = [
-    "CES_State.json", "QC_Index.json", "Qi_Index.json",
-    "CoverageReport.json", "CoverageTimeline.json",
-    "QuarantineLedger.json", "CHK_REPORT.json",
-    "SealReport.json", "DeterminismReport_3runs.json",
-    "PairingReport_G2.json", "OcrReport_G3.json",
-    "AtomTrace_G4.json", "DedupReport_G5.json",
-]
-
-def load_artefact(name):
-    run_dir = st.session_state.get("run_dir", "")
-    if run_dir:
-        p = os.path.join(run_dir, name)
-        if os.path.exists(p):
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
+def load_json(path):
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     return None
 
-def artefact_status(name):
-    run_dir = st.session_state.get("run_dir", "")
-    if run_dir:
-        p = os.path.join(run_dir, name)
-        return "✅" if os.path.exists(p) else "❌ MISSING"
-    return "⏳ En attente"
+def find_cap(run_dir):
+    if not run_dir or not os.path.isdir(run_dir):
+        return None
+    caps = glob.glob(os.path.join(run_dir, "CAP_*.json"))
+    return caps[0] if caps else None
+
+def load_artefact(run_dir, name):
+    if not run_dir:
+        return None
+    p = os.path.join(run_dir, name)
+    return load_json(p)
+
+def load_qc_detail(run_dir, qc_id):
+    if not run_dir:
+        return None
+    p = os.path.join(run_dir, "QC_Details", f"{qc_id}.json")
+    return load_json(p)
+
+def load_qi_text(run_dir, qi_id):
+    if not run_dir:
+        return None
+    p = os.path.join(run_dir, "Qi_Text", f"{qi_id}.json")
+    return load_json(p)
+
+def artefact_exists(run_dir, name):
+    if not run_dir:
+        return False
+    return os.path.exists(os.path.join(run_dir, name))
 
 # ═══════════════════════════════════════════════════════════════════
-# 3. CSS INJECTION — Dark Premium Theme (Manus style)
+# 2. CSS — Dark Premium (Manus fusion)
 # ═══════════════════════════════════════════════════════════════════
 def inject_css():
     st.markdown("""<style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
 
-    /* === GLOBAL === */
     .stApp, [data-testid="stAppViewContainer"], .main .block-container {
         background: #0a0e27 !important; color: #e0e0e0 !important;
         font-family: 'Inter', sans-serif !important;
     }
-    .main .block-container { padding-top: 1rem !important; max-width: 1400px !important; }
-
-    /* === SIDEBAR === */
+    .main .block-container { padding-top: 0.8rem !important; max-width: 1400px !important; }
     [data-testid="stSidebar"] {
         background: #0f1329 !important;
         border-right: 1px solid rgba(255,255,255,0.06) !important;
     }
     [data-testid="stSidebar"] * { color: #b0bec5 !important; }
-    [data-testid="stSidebar"] .stRadio label { font-size: 0.9rem !important; }
-    [data-testid="stSidebar"] .stRadio label:hover { color: #e3f2fd !important; }
-    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,
     [data-testid="stSidebar"] h3 { color: #90caf9 !important; }
 
-    /* === HEADER GRADIENT === */
-    .smx-header {
+    .smx-hdr {
         background: linear-gradient(135deg, #1a237e 0%, #0d47a1 50%, #01579b 100%);
-        padding: 1.4rem 1.8rem; border-radius: 14px; margin-bottom: 1.2rem;
+        padding: 1.2rem 1.6rem; border-radius: 14px; margin-bottom: 1rem;
         border: 1px solid rgba(255,255,255,0.1);
         box-shadow: 0 8px 32px rgba(0,0,0,0.4);
     }
-    .smx-header h1 { color: #fff !important; font-size: 1.6rem; font-weight: 800; margin: 0; }
-    .smx-header p { color: #90caf9; font-size: 0.85rem; margin: 0.2rem 0 0; }
+    .smx-hdr h1 { color:#fff!important; font-size:1.5rem; font-weight:800; margin:0; }
+    .smx-hdr p  { color:#90caf9; font-size:0.82rem; margin:0.15rem 0 0; }
 
-    /* === STAT CARDS === */
-    .smx-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.8rem; margin-bottom: 1.2rem; }
+    .smx-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:0.7rem; margin-bottom:1rem; }
     .smx-card {
         background: linear-gradient(135deg, #1a1f3e, #151933);
         border: 1px solid rgba(255,255,255,0.08); border-radius: 12px;
-        padding: 1rem; text-align: center; transition: transform 0.2s;
+        padding: 0.9rem; text-align: center; transition: transform 0.2s;
     }
     .smx-card:hover { transform: translateY(-2px); }
-    .smx-card .val {
-        font-size: 2rem; font-weight: 800; color: #64b5f6;
-        font-family: 'JetBrains Mono', monospace; letter-spacing: -1px;
+    .smx-card .v {
+        font-size:1.9rem; font-weight:800; color:#64b5f6;
+        font-family:'JetBrains Mono',monospace; letter-spacing:-1px;
     }
-    .smx-card .lbl {
-        font-size: 0.65rem; color: #78909c; font-weight: 600;
-        letter-spacing: 1.5px; text-transform: uppercase; margin-top: 0.2rem;
+    .smx-card .l {
+        font-size:0.6rem; color:#78909c; font-weight:600;
+        letter-spacing:1.5px; text-transform:uppercase; margin-top:0.15rem;
     }
 
-    /* === CYCLE BARS === */
-    .cycle-bar { padding: 0.6rem 1rem; border-radius: 8px; margin: 0.4rem 0;
-        font-weight: 700; font-size: 0.9rem; color: #fff; }
-    .cycle-hs  { background: linear-gradient(90deg, #1565c0, #0d47a1); }
-    .cycle-preu { background: linear-gradient(90deg, #2e7d32, #1b5e20); }
-    .cycle-uni { background: linear-gradient(90deg, #e65100, #bf360c); }
+    .cyc { padding:0.5rem 0.9rem; border-radius:8px; margin:0.35rem 0;
+        font-weight:700; font-size:0.88rem; color:#fff; }
+    .cyc-hs  { background:linear-gradient(90deg,#1565c0,#0d47a1); }
+    .cyc-preu { background:linear-gradient(90deg,#2e7d32,#1b5e20); }
+    .cyc-uni { background:linear-gradient(90deg,#e65100,#bf360c); }
 
-    /* === CLASS CARDS === */
-    .class-card {
-        background: #151933; border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 10px; padding: 0.7rem 1rem; margin: 0.3rem 0;
+    .cc {
+        background:#151933; border:1px solid rgba(255,255,255,0.06);
+        border-radius:10px; padding:0.6rem 0.9rem; margin:0.25rem 0;
         transition: border-color 0.2s;
     }
-    .class-card:hover { border-color: rgba(100,181,246,0.3); }
+    .cc:hover { border-color:rgba(100,181,246,0.3); }
 
-    /* === BADGES === */
-    .badge-off { display: inline-block; background: #1b5e20; color: #a5d6a7;
-        padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.65rem; font-weight: 700; }
-    .badge-can { display: inline-block; background: #e65100; color: #ffcc80;
-        padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.65rem; font-weight: 700; }
-    .badge-seal { display: inline-block; background: linear-gradient(135deg, #1b5e20, #2e7d32);
-        color: #fff; padding: 0.3rem 0.8rem; border-radius: 15px;
-        font-weight: 700; font-size: 0.75rem; letter-spacing: 1px; }
-    .badge-exam { display: inline-block; background: #311b92; color: #b39ddb;
-        padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; margin: 2px; }
-    .badge-conc { display: inline-block; background: #1a237e; color: #90caf9;
-        padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; margin: 2px; }
-    .badge-pass { color: #66bb6a; font-weight: 700; }
-    .badge-fail { color: #ef5350; font-weight: 700; }
-    .badge-pending { color: #ffa726; font-weight: 700; }
+    .b-off { display:inline-block; background:#1b5e20; color:#a5d6a7;
+        padding:0.1rem 0.5rem; border-radius:4px; font-size:0.63rem; font-weight:700; }
+    .b-can { display:inline-block; background:#e65100; color:#ffcc80;
+        padding:0.1rem 0.5rem; border-radius:4px; font-size:0.63rem; font-weight:700; }
+    .b-seal { display:inline-block; background:linear-gradient(135deg,#1b5e20,#2e7d32);
+        color:#fff; padding:0.25rem 0.7rem; border-radius:15px;
+        font-weight:700; font-size:0.72rem; letter-spacing:1px; }
+    .b-exam { display:inline-block; background:#311b92; color:#b39ddb;
+        padding:0.1rem 0.5rem; border-radius:4px; font-size:0.68rem; font-weight:600; margin:2px; }
+    .b-conc { display:inline-block; background:#1a237e; color:#90caf9;
+        padding:0.1rem 0.5rem; border-radius:4px; font-size:0.68rem; font-weight:600; margin:2px; }
 
-    /* === SHA256 BOX === */
-    .sha-box {
-        background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
-        padding: 0.5rem 0.8rem; font-family: 'JetBrains Mono', monospace;
-        font-size: 0.7rem; color: #7ee787; word-break: break-all; margin: 0.4rem 0;
+    .sha {
+        background:#0d1117; border:1px solid #30363d; border-radius:6px;
+        padding:0.45rem 0.7rem; font-family:'JetBrains Mono',monospace;
+        font-size:0.68rem; color:#7ee787; word-break:break-all; margin:0.35rem 0;
     }
 
-    /* === COVERAGE BAR === */
-    .cov-outer { background: #1a1f3e; border-radius: 6px; height: 20px; width: 100%; overflow: hidden; }
-    .cov-inner { height: 100%; border-radius: 6px; transition: width 0.3s; }
+    .g-pass { color:#66bb6a; font-weight:700; }
+    .g-fail { color:#ef5350; font-weight:700; }
+    .g-unk  { color:#ffa726; font-weight:700; }
+    .g-row  { padding:0.35rem 0; font-size:0.83rem; border-bottom:1px solid rgba(255,255,255,0.04); }
 
-    /* === GATE ROW === */
-    .gate-row { padding: 0.4rem 0; font-size: 0.85rem; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    .cov-o { background:#1a1f3e; border-radius:6px; height:18px; width:100%; overflow:hidden; }
+    .cov-i { height:100%; border-radius:6px; transition:width 0.3s; }
 
-    /* === IDEA CARDS === */
     .idea-card {
-        background: linear-gradient(135deg, #1a1f3e, #0f1329);
-        border-left: 4px solid #ffd740; border-radius: 0 10px 10px 0;
-        padding: 0.8rem 1rem; margin: 0.5rem 0;
+        background:linear-gradient(135deg,#1a1f3e,#0f1329);
+        border-left:4px solid #ffd740; border-radius:0 10px 10px 0;
+        padding:0.7rem 1rem; margin:0.4rem 0;
     }
 
-    /* === TABS === */
-    .stTabs [data-baseweb="tab-list"] { gap: 4px; }
+    .stTabs [data-baseweb="tab-list"] { gap:4px; }
     .stTabs [data-baseweb="tab"] {
-        background: #151933 !important; color: #90caf9 !important;
-        border-radius: 8px 8px 0 0 !important; border: 1px solid rgba(255,255,255,0.06) !important;
+        background:#151933!important; color:#90caf9!important;
+        border-radius:8px 8px 0 0!important; border:1px solid rgba(255,255,255,0.06)!important;
     }
-    .stTabs [aria-selected="true"] {
-        background: #1a237e !important; color: #fff !important;
-    }
-
-    /* === EXPANDERS === */
-    .streamlit-expanderHeader {
-        background: #151933 !important; color: #e3f2fd !important;
-        border-radius: 8px !important;
-    }
-
-    /* === DATAFRAME === */
-    .stDataFrame { background: #151933 !important; }
-
-    /* === MISC === */
-    hr { border-color: rgba(255,255,255,0.06) !important; }
-    .stSelectbox label, .stTextInput label, .stRadio label { color: #90caf9 !important; }
+    .stTabs [aria-selected="true"] { background:#1a237e!important; color:#fff!important; }
+    .streamlit-expanderHeader { background:#151933!important; color:#e3f2fd!important; border-radius:8px!important; }
+    hr { border-color:rgba(255,255,255,0.06)!important; }
+    .stSelectbox label,.stTextInput label,.stRadio label,.stFileUploader label { color:#90caf9!important; }
+    .warn-box { background:rgba(255,167,38,0.08); border:1px solid rgba(255,167,38,0.25);
+        border-radius:8px; padding:0.6rem 0.9rem; margin:0.5rem 0; font-size:0.83rem; }
+    .sat-saturated { color:#66bb6a; font-weight:700; }
+    .sat-continue  { color:#ffa726; font-weight:700; }
     </style>""", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════
-# 4. HTML HELPERS
+# 3. HTML HELPERS
 # ═══════════════════════════════════════════════════════════════════
-def h(tag, text, **attrs):
-    a = " ".join(f'{k}="{v}"' for k, v in attrs.items())
-    return f"<{tag} {a}>{text}</{tag}>"
+def hdr(t, sub=""):
+    return f'<div class="smx-hdr"><h1>{t}</h1><p>{sub}</p></div>'
 
-def header(title, subtitle=""):
-    return f'<div class="smx-header"><h1>{title}</h1><p>{subtitle}</p></div>'
+def cards(items):
+    h = ""
+    for it in items:
+        v, l = it[0], it[1]
+        c = it[2] if len(it) > 2 else "#64b5f6"
+        h += f'<div class="smx-card"><div class="v" style="color:{c}">{v}</div><div class="l">{l}</div></div>'
+    return f'<div class="smx-metrics">{h}</div>'
 
-def stat_cards(items):
-    """items = [(value, label, color?), ...]"""
-    cards = ""
-    for item in items:
-        v, l = item[0], item[1]
-        c = item[2] if len(item) > 2 else "#64b5f6"
-        cards += f'<div class="smx-card"><div class="val" style="color:{c}">{v}</div><div class="lbl">{l}</div></div>'
-    return f'<div class="smx-metrics">{cards}</div>'
+def src_badge(t):
+    return '<span class="b-off">OFFICIEL</span>' if t == "OFFICIEL" else '<span class="b-can">CANONIQUE</span>'
 
-def badge(text, cls):
-    return f'<span class="badge-{cls}">{text}</span>'
-
-def source_badge(stype):
-    if stype == "OFFICIEL":
-        return '<span class="badge-off">OFFICIEL</span>'
-    return '<span class="badge-can">CANONIQUE</span>'
-
-def cov_bar(pct, width="100%"):
+def cov_bar(pct, w="100%"):
     pct = min(max(pct, 0), 100)
-    if pct >= 95: c = "#66bb6a"
-    elif pct >= 75: c = "#ffa726"
-    else: c = "#ef5350"
-    return (f'<div class="cov-outer" style="width:{width}">'
-            f'<div class="cov-inner" style="width:{pct}%;background:{c}"></div></div>')
+    c = "#66bb6a" if pct >= 95 else ("#ffa726" if pct >= 75 else "#ef5350")
+    return f'<div class="cov-o" style="width:{w}"><div class="cov-i" style="width:{pct}%;background:{c}"></div></div>'
 
-def sha_box(h):
-    return f'<div class="sha-box">{h}</div>'
+def gate_icon(status):
+    if status == "PASS": return "✅", "g-pass"
+    if status == "FAIL": return "❌", "g-fail"
+    return "⏳", "g-unk"
+
+# CAP helpers
+def levels_for(edu, cid):
+    return sorted([l for l in edu["levels"] if l["cycle_id"] == cid], key=lambda x: x["order"])
+
+def subjects_for(edu, lc):
+    return [s for s in edu["subjects"] if s["level_code"] == lc]
+
+def exam_for(exams, lc):
+    return next((e for e in exams if e.get("level_code") == lc), None)
+
+def cyc_cls(cid):
+    return {"CYCLE_HS": "cyc-hs", "CYCLE_PREU": "cyc-preu", "CYCLE_UNI": "cyc-uni"}.get(cid, "")
 
 # ═══════════════════════════════════════════════════════════════════
-# 5. CAP HELPERS
+# 4. PAGES
 # ═══════════════════════════════════════════════════════════════════
-def cap_stats(cap):
-    meta = cap["A_METADATA"]
-    edu = cap["B_EDUCATION_SYSTEM"]
+
+# ──── 4.1 DASHBOARD ────
+def pg_dashboard(cap, rd):
+    m = cap["A_METADATA"]; edu = cap["B_EDUCATION_SYSTEM"]
     exams = cap["E_EXAMS_CONCOURS"]["exams_and_contests"]
-    cycles = edu["cycles"]
-    levels = edu["levels"]
-    subjects = edu["subjects"]
-    total_ch = sum(s["chapter_count"] for s in subjects)
-    off = sum(1 for s in subjects if s.get("source_type") == "OFFICIEL")
-    can = sum(1 for s in subjects if s.get("source_type") == "CANONIQUE")
-    return {
-        "meta": meta, "cycles": cycles, "levels": levels, "subjects": subjects,
-        "exams": exams, "total_ch": total_ch, "off": off, "can": can,
-    }
+    tot_ch = sum(s["chapter_count"] for s in edu["subjects"])
+    off = sum(1 for s in edu["subjects"] if s.get("source_type") == "OFFICIEL")
+    can = sum(1 for s in edu["subjects"] if s.get("source_type") == "CANONIQUE")
 
-def levels_for_cycle(edu, cycle_id):
-    return sorted(
-        [l for l in edu["levels"] if l["cycle_id"] == cycle_id],
-        key=lambda x: x["order"]
-    )
-
-def subjects_for_level(edu, level_code):
-    return [s for s in edu["subjects"] if s["level_code"] == level_code]
-
-def cycle_css(cid):
-    return {"CYCLE_HS": "cycle-hs", "CYCLE_PREU": "cycle-preu", "CYCLE_UNI": "cycle-uni"}.get(cid, "")
-
-def exam_for_level(exams, level_code):
-    for e in exams:
-        if e.get("level_code") == level_code:
-            return e
-    return None
-
-# ═══════════════════════════════════════════════════════════════════
-# 6. PAGES
-# ═══════════════════════════════════════════════════════════════════
-
-# ---- 6.1 DASHBOARD ----
-def page_dashboard(cap):
-    s = cap_stats(cap)
-    meta = s["meta"]
-    st.markdown(header(
-        f"🇫🇷 SMAXIA — CAP {meta['country_name_local']} Scellé",
-        f"Country Academic Pack • Kernel {meta['kernel_version']} • {meta['source_doctrine']} • Zéro Invention"
+    st.markdown(hdr(
+        f"🇫🇷 SMAXIA — CAP {m['country_name_local']} Scellé",
+        f"Kernel {m['kernel_version']} • {m['source_doctrine']} • Zéro Invention"
     ), unsafe_allow_html=True)
 
-    # KPI row 1 — CAP
-    st.markdown(stat_cards([
-        (len(s["cycles"]), "Cycles"),
-        (meta["total_classes"], "Classes"),
-        (meta["total_subjects_go"], "Matières GO"),
-        (s["total_ch"], "Chapitres"),
-        (len(s["exams"]), "Examens"),
+    st.markdown(cards([
+        (len(edu["cycles"]), "Cycles"), (m["total_classes"], "Classes"),
+        (m["total_subjects_go"], "Matières GO"), (tot_ch, "Chapitres"),
+        (len(exams), "Examens"),
     ]), unsafe_allow_html=True)
 
-    # Cycles
-    col1, col2 = st.columns([3, 2])
-    with col1:
+    c1, c2 = st.columns([3, 2])
+    with c1:
         st.markdown("#### 📈 Répartition par Cycle")
-        for c in s["cycles"]:
-            lvls = levels_for_cycle(cap["B_EDUCATION_SYSTEM"], c["cycle_id"])
-            subs = [su for l in lvls for su in subjects_for_level(cap["B_EDUCATION_SYSTEM"], l["level_code"])]
-            chs = sum(su["chapter_count"] for su in subs)
-            st.markdown(
-                f'<div class="cycle-bar {cycle_css(c["cycle_id"])}">'
-                f'{c["cycle_name_local"]} ({c["cycle_name_en"]}) — '
-                f'{len(lvls)} classes · {len(subs)} matières · {chs} chapitres</div>',
-                unsafe_allow_html=True
-            )
-
-    with col2:
+        for c in edu["cycles"]:
+            lv = levels_for(edu, c["cycle_id"])
+            su = [s for l in lv for s in subjects_for(edu, l["level_code"])]
+            ch = sum(s["chapter_count"] for s in su)
+            st.markdown(f'<div class="cyc {cyc_cls(c["cycle_id"])}">'
+                        f'{c["cycle_name_local"]} ({c["cycle_name_en"]}) — '
+                        f'{len(lv)} classes · {len(su)} matières · {ch} chap.</div>', unsafe_allow_html=True)
+    with c2:
         st.markdown("#### 🔐 Intégrité")
-        st.markdown(sha_box(f"📋 {meta['cap_fingerprint_sha256']}"), unsafe_allow_html=True)
-        st.markdown(f"""
-        📜 Doctrine: **{meta['source_doctrine']}**  
-        🏛️ Juridiction: **{meta['jurisdiction_model']}**  
-        📅 Année: **{meta['academic_year']}**  
-        🔖 Statut: {badge('✓ SEALED', 'seal') if meta['status']=='SEALED' else badge('NOT SEALED', 'fail')}
-        """, unsafe_allow_html=True)
-        st.markdown(f"{source_badge('OFFICIEL')} **{s['off']}** matières &nbsp; {source_badge('CANONIQUE')} **{s['can']}** matières", unsafe_allow_html=True)
+        st.markdown(f'<div class="sha">📋 {m["cap_fingerprint_sha256"]}</div>', unsafe_allow_html=True)
+        seal = '<span class="b-seal">✓ SEALED</span>' if m["status"] == "SEALED" else '<span class="g-fail">⚠ NOT SEALED</span>'
+        st.markdown(f"📜 **{m['source_doctrine']}** · 🏛️ **{m['jurisdiction_model']}** · "
+                    f"📅 **{m['academic_year']}** · {seal}", unsafe_allow_html=True)
+        st.markdown(f"{src_badge('OFFICIEL')} **{off}** &nbsp; {src_badge('CANONIQUE')} **{can}**", unsafe_allow_html=True)
 
-    # CES Pipeline status
+    # ── CES Pipeline (FIX #5: CoverageTimeline chart) ──
     st.markdown("---")
     st.markdown("#### 🚀 Pipeline CES HARVEST")
-    ces = load_artefact("CES_State.json")
+    ces = load_artefact(rd, "CES_State.json")
     if ces:
-        st.markdown(stat_cards([
-            (ces.get("pdf_count", "N/A"), "PDFs collectés"),
-            (ces.get("pairs_count", "N/A"), "Paires"),
-            (ces.get("qi_count", "N/A"), "Qi totales"),
-            (ces.get("qc_count", "N/A"), "QC générées"),
+        st.markdown(cards([
+            (ces.get("pdf_count", "N/A"), "PDFs"), (ces.get("pairs_count", "N/A"), "Paires"),
+            (ces.get("qi_count", "N/A"), "Qi"), (ces.get("qc_count", "N/A"), "QC"),
             (f"{ces.get('coverage_avg', 0):.0f}%", "Couverture moy."),
+            (ces.get("orphans_total", "N/A"), "Orphelins"),
         ]), unsafe_allow_html=True)
+
+        # Coverage Timeline chart
+        timeline = load_artefact(rd, "CoverageTimeline.json")
+        if timeline and isinstance(timeline, list) and len(timeline) > 0:
+            import pandas as pd
+            df = pd.DataFrame(timeline)
+            if "date" in df.columns and "coverage" in df.columns:
+                st.markdown("##### 📊 Évolution Couverture")
+                st.line_chart(df.set_index("date")["coverage"], use_container_width=True)
+            if "orphans" in df.columns:
+                st.markdown("##### 📉 Évolution Orphelins")
+                st.line_chart(df.set_index("date")["orphans"], use_container_width=True)
+        else:
+            st.caption("📊 CoverageTimeline.json non trouvé — les graphes apparaîtront après les premiers runs.")
     else:
-        st.info("⏳ **CES HARVEST non lancé** — Aucun artefact CES détecté. "
-                "Les données QC/FRT/ARI/TRIGGERS apparaîtront ici après E1 COLLECT.")
+        st.info("⏳ **CES HARVEST non lancé** — Les KPIs et graphes apparaîtront après E1 COLLECT.")
 
-# ---- 6.2 CAP EXPLORER ----
-def page_cap_explorer(cap):
-    s = cap_stats(cap)
-    edu = cap["B_EDUCATION_SYSTEM"]
-    st.markdown(header("📚 CAP Explorer",
-        f"{s['meta']['total_classes']} classes · {s['meta']['total_subjects_go']} matières · {s['total_ch']} chapitres"),
-        unsafe_allow_html=True)
+# ──── 4.2 CAP EXPLORER ────
+def pg_cap(cap, rd):
+    m = cap["A_METADATA"]; edu = cap["B_EDUCATION_SYSTEM"]
+    exams = cap["E_EXAMS_CONCOURS"]["exams_and_contests"]
+    tot_ch = sum(s["chapter_count"] for s in edu["subjects"])
+    st.markdown(hdr("📚 CAP Explorer",
+        f"{m['total_classes']} classes · {m['total_subjects_go']} matières · {tot_ch} chapitres"), unsafe_allow_html=True)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏫 Niveaux & Classes", "📘 Matières", "📖 Chapitres", "🎓 Examens/Concours", "🔗 Sources"])
+    t1, t2, t3, t4, t5 = st.tabs(["🏫 Niveaux", "📘 Matières", "📖 Chapitres", "🎓 Examens", "🔗 Sources"])
 
-    # --- Niveaux ---
-    with tab1:
+    with t1:
         for c in edu["cycles"]:
-            lvls = levels_for_cycle(edu, c["cycle_id"])
-            st.markdown(f'<div class="cycle-bar {cycle_css(c["cycle_id"])}">'
-                        f'{c["cycle_name_local"]} — {len(lvls)} classes</div>', unsafe_allow_html=True)
-            for l in lvls:
-                subs = subjects_for_level(edu, l["level_code"])
-                chs = sum(su["chapter_count"] for su in subs)
-                ex = exam_for_level(s["exams"], l["level_code"])
-                exam_html = ""
-                if ex and ex.get("exam"):
-                    exam_html = f' <span class="badge-exam">🎯 {ex["exam"]["exam_name"]}</span>'
-                conc_html = ""
-                if ex and ex.get("contests_top"):
-                    conc_html = " ".join(f'<span class="badge-conc">🏆 #{c["rank"]} {c["name"]}</span>'
-                                          for c in ex["contests_top"][:5])
-                st.markdown(f"""<div class="class-card">
+            lv = levels_for(edu, c["cycle_id"])
+            st.markdown(f'<div class="cyc {cyc_cls(c["cycle_id"])}">{c["cycle_name_local"]} — {len(lv)} classes</div>', unsafe_allow_html=True)
+            for l in lv:
+                su = subjects_for(edu, l["level_code"])
+                ch = sum(s["chapter_count"] for s in su)
+                ex = exam_for(exams, l["level_code"])
+                eh = f' <span class="b-exam">🎯 {ex["exam"]["exam_name"]}</span>' if ex and ex.get("exam") else ""
+                ch_html = " ".join(f'<span class="b-conc">🏆#{c["rank"]} {c["name"]}</span>'
+                                   for c in (ex.get("contests_top") or [])[:5]) if ex else ""
+                st.markdown(f"""<div class="cc">
                     <b style="color:#e3f2fd">{l['level_name_local']}</b>
-                    <span style="color:#546e7a;font-size:0.8rem"> ({l['level_code']})</span>
-                    <div style="color:#546e7a;font-size:0.75rem">{l.get('voie','')}</div>
-                    <div style="color:#90caf9;font-size:0.8rem;margin-top:0.2rem">
-                        📘 {len(subs)} matières · 📖 {chs} chapitres</div>
-                    {exam_html}{f'<div style="margin-top:0.2rem">{conc_html}</div>' if conc_html else ''}
+                    <span style="color:#546e7a;font-size:0.78rem"> ({l['level_code']})</span>
+                    <div style="color:#546e7a;font-size:0.72rem">{l.get('voie','')}</div>
+                    <div style="color:#90caf9;font-size:0.78rem;margin-top:0.15rem">📘 {len(su)} mat. · 📖 {ch} chap.</div>
+                    {eh}{f'<div style="margin-top:0.15rem">{ch_html}</div>' if ch_html else ''}
                 </div>""", unsafe_allow_html=True)
 
-    # --- Matières ---
-    with tab2:
-        search = st.text_input("🔍 Rechercher une matière", key="subj_search")
+    with t2:
+        q = st.text_input("🔍 Rechercher matière", key="s_s")
         for su in edu["subjects"]:
-            lname = next((l["level_name_local"] for l in edu["levels"] if l["level_code"] == su["level_code"]), su["level_code"])
-            full = f"{lname} — {su['subject_name_local']}"
-            if search and search.lower() not in full.lower():
+            ln = next((l["level_name_local"] for l in edu["levels"] if l["level_code"] == su["level_code"]), su["level_code"])
+            full = f"{ln} — {su['subject_name_local']}"
+            if q and q.lower() not in full.lower():
                 continue
-            st.markdown(f"""<div class="class-card">
-                <b style="color:#e3f2fd">{lname}</b> — {su['subject_name_local']}
-                ({su['chapter_count']} chap.) {source_badge(su.get('source_type',''))}
-                <div style="color:#546e7a;font-size:0.7rem">{su.get('source_ref','')}</div>
-            </div>""", unsafe_allow_html=True)
+            st.markdown(f'<div class="cc"><b style="color:#e3f2fd">{ln}</b> — {su["subject_name_local"]} '
+                        f'({su["chapter_count"]} chap.) {src_badge(su.get("source_type",""))}'
+                        f'<div style="color:#546e7a;font-size:0.68rem">{su.get("source_ref","")}</div></div>',
+                        unsafe_allow_html=True)
 
-    # --- Chapitres ---
-    with tab3:
-        search_ch = st.text_input("🔍 Rechercher un chapitre", key="ch_search")
+    with t3:
+        q2 = st.text_input("🔍 Rechercher chapitre", key="c_s")
         for su in edu["subjects"]:
-            lname = next((l["level_name_local"] for l in edu["levels"] if l["level_code"] == su["level_code"]), su["level_code"])
-            chapters_match = [ch for ch in su["chapters"]
-                              if not search_ch or search_ch.lower() in ch["chapter_name"].lower()
-                              or search_ch.lower() in su["subject_name_local"].lower()
-                              or search_ch.lower() in lname.lower()]
-            if not chapters_match:
+            ln = next((l["level_name_local"] for l in edu["levels"] if l["level_code"] == su["level_code"]), su["level_code"])
+            chs = [ch for ch in su["chapters"]
+                   if not q2 or q2.lower() in ch["chapter_name"].lower()
+                   or q2.lower() in su["subject_name_local"].lower() or q2.lower() in ln.lower()]
+            if not chs:
                 continue
-            with st.expander(f"**{lname} — {su['subject_name_local']}** ({len(su['chapters'])} chap.) {su.get('source_type','')}"):
-                for ch in chapters_match:
-                    st.markdown(
-                        f'<span style="color:#64b5f6;font-weight:700;font-family:JetBrains Mono">'
-                        f'{str(ch["chapter_number"]).zfill(2)}</span> '
-                        f'{ch["chapter_name"]}'
-                        f' <span style="color:#546e7a;font-size:0.7rem">'
-                        f'[QC: ⏳ | Qi: 0 | Cov: 0%]</span>',
-                        unsafe_allow_html=True
-                    )
+            with st.expander(f"**{ln} — {su['subject_name_local']}** ({len(su['chapters'])} chap.) {su.get('source_type','')}"):
+                for ch in chs:
+                    st.markdown(f'<span style="color:#64b5f6;font-weight:700;font-family:JetBrains Mono">'
+                                f'{str(ch["chapter_number"]).zfill(2)}</span> {ch["chapter_name"]}',
+                                unsafe_allow_html=True)
 
-    # --- Examens ---
-    with tab4:
+    with t4:
         for c in edu["cycles"]:
-            lvls = levels_for_cycle(edu, c["cycle_id"])
-            st.markdown(f'<div class="cycle-bar {cycle_css(c["cycle_id"])}">{c["cycle_name_local"]}</div>', unsafe_allow_html=True)
-            for l in lvls:
-                ex = exam_for_level(s["exams"], l["level_code"])
-                if not ex: continue
-                exam_html = f'<span class="badge-exam">🎯 {ex["exam"]["exam_name"]}</span>' if ex.get("exam") else ""
-                conc_html = " ".join(f'<span class="badge-conc">🏆 #{c["rank"]} {c["name"]}</span>'
-                                      for c in (ex.get("contests_top") or []))
-                st.markdown(f"""<div class="class-card">
-                    <b style="color:#e3f2fd">{l['level_name_local']}</b>
-                    <span style="color:#546e7a;font-size:0.8rem">({l['level_code']})</span>
-                    {exam_html}
-                    <div style="margin-top:0.2rem">{conc_html}</div>
-                </div>""", unsafe_allow_html=True)
+            lv = levels_for(edu, c["cycle_id"])
+            st.markdown(f'<div class="cyc {cyc_cls(c["cycle_id"])}">{c["cycle_name_local"]}</div>', unsafe_allow_html=True)
+            for l in lv:
+                ex = exam_for(exams, l["level_code"])
+                if not ex:
+                    continue
+                eh = f'<span class="b-exam">🎯 {ex["exam"]["exam_name"]}</span>' if ex.get("exam") else ""
+                ch = " ".join(f'<span class="b-conc">🏆#{c["rank"]} {c["name"]}</span>' for c in (ex.get("contests_top") or []))
+                st.markdown(f'<div class="cc"><b style="color:#e3f2fd">{l["level_name_local"]}</b> '
+                            f'<span style="color:#546e7a;font-size:0.78rem">({l["level_code"]})</span> '
+                            f'{eh}<div style="margin-top:0.15rem">{ch}</div></div>', unsafe_allow_html=True)
 
-    # --- Sources ---
-    with tab5:
+    with t5:
         src = cap["C_HARVEST_SOURCES"]
-        for s_ in src["sources"]:
-            pc = {"A": "#66bb6a", "B": "#ffa726", "C": "#ef5350"}.get(s_["proof"], "#fff")
-            st.markdown(f"""<div class="class-card">
-                <b style="color:#e3f2fd">{s_['source_id']}</b> — {s_['domain']}
-                <div style="color:#90caf9;font-size:0.8rem">📋 {s_['scope']}</div>
-                <div style="font-size:0.8rem">
-                    🏅 Authority: <b>{s_['authority_score']}</b> ·
-                    Proof: <span style="color:{pc};font-weight:700">{s_['proof']}</span> ·
-                    Niveaux: {', '.join(s_['levels_covered'][:5])}{'...' if len(s_['levels_covered'])>5 else ''}
-                </div>
-            </div>""", unsafe_allow_html=True)
+        for s in src["sources"]:
+            pc = {"A": "#66bb6a", "B": "#ffa726", "C": "#ef5350"}.get(s["proof"], "#fff")
+            st.markdown(f'<div class="cc"><b style="color:#e3f2fd">{s["source_id"]}</b> — {s["domain"]}'
+                        f'<div style="color:#90caf9;font-size:0.78rem">📋 {s["scope"]}</div>'
+                        f'<div style="font-size:0.78rem">🏅 {s["authority_score"]} · '
+                        f'Proof: <span style="color:{pc};font-weight:700">{s["proof"]}</span> · '
+                        f'{", ".join(s["levels_covered"][:5])}{"..." if len(s["levels_covered"])>5 else ""}</div></div>',
+                        unsafe_allow_html=True)
         r = src["scraping_rules"]
-        st.markdown("#### ⚙️ Scraping Rules")
-        st.markdown(stat_cards([
-            (f"{r['rate_limit_ms']}ms", "Rate Limit"),
-            (r['max_concurrent'], "Max Concurrent"),
-            ("✅", "Robots.txt"),
-        ]), unsafe_allow_html=True)
+        st.markdown(cards([(f'{r["rate_limit_ms"]}ms', "Rate Limit"), (r["max_concurrent"], "Max Conc."), ("✅", "Robots.txt")]),
+                    unsafe_allow_html=True)
 
-# ---- 6.3 CES MONITOR ----
-def page_ces_monitor(cap):
-    st.markdown(header("🚀 CES HARVEST Monitor", "Pipeline status · Gates · Saturation"), unsafe_allow_html=True)
+# ──── 4.3 CES MONITOR ────
+def pg_ces(cap, rd):
+    st.markdown(hdr("🚀 CES HARVEST Monitor", "Pipeline · Gates · Saturation"), unsafe_allow_html=True)
+    ces = load_artefact(rd, "CES_State.json")
+    expected = ["CES_State.json", "QC_Index.json", "Qi_Index.json", "CoverageReport.json",
+                "CoverageTimeline.json", "QuarantineLedger.json", "CHK_REPORT.json",
+                "SealReport.json", "DeterminismReport_3runs.json",
+                "PairingReport_G2.json", "OcrReport_G3.json", "AtomTrace_G4.json", "DedupReport_G5.json"]
 
-    ces = load_artefact("CES_State.json")
     if not ces:
-        st.warning("⏳ **CES HARVEST non lancé** — Aucun run détecté.")
-        st.markdown("Quand E1 COLLECT sera exécuté, cette page affichera :")
-        st.markdown("""
-        - Sources harvest actives + status (rate limit, robots.txt)  
-        - Pipeline status par gate G0→G10  
-        - Saturation STOP_RULE (SR0→SR5) par chapitre  
-        - Quarantine counters par gate  
-        """)
-        # Show expected artefacts
-        st.markdown("#### 📦 Artefacts attendus")
-        for f in CES_FILES:
-            st.markdown(f"&nbsp;&nbsp; {artefact_status(f)} `{f}`", unsafe_allow_html=True)
-        return
+        st.warning("⏳ **CES HARVEST non lancé** — Aucun artefact détecté.")
+    else:
+        st.json(ces)
 
-    # If CES exists, render real data
-    st.json(ces)
+    st.markdown("#### 📦 Artefacts")
+    for f in expected:
+        icon = "✅" if artefact_exists(rd, f) else "❌"
+        st.markdown(f"&nbsp;&nbsp; {icon} `{f}`", unsafe_allow_html=True)
 
-# ---- 6.4 CHAPTERS & QC ----
-def page_chapters_qc(cap):
-    st.markdown(header("📊 Chapitres & QC", "Couverture · Saturation · QC par chapitre"), unsafe_allow_html=True)
-
+# ──── 4.4 CHAPTERS & QC + STOP_RULE (FIX #4) ────
+def pg_chapters(cap, rd):
+    st.markdown(hdr("📈 Chapitres & QC", "Couverture · Saturation · STOP_RULE"), unsafe_allow_html=True)
     edu = cap["B_EDUCATION_SYSTEM"]
-    # Cycle/Level/Subject filter
+
+    # Filters
     c1, c2, c3 = st.columns(3)
-    cycle_names = {c["cycle_id"]: c["cycle_name_local"] for c in edu["cycles"]}
+    cn = {c["cycle_id"]: c["cycle_name_local"] for c in edu["cycles"]}
     with c1:
-        sel_cycle = st.selectbox("Cycle", ["Tous"] + list(cycle_names.values()), key="ch_cycle")
-    sel_cycle_id = next((k for k, v in cycle_names.items() if v == sel_cycle), None)
-
-    levels_filtered = edu["levels"]
-    if sel_cycle_id:
-        levels_filtered = [l for l in edu["levels"] if l["cycle_id"] == sel_cycle_id]
-    level_names = {l["level_code"]: l["level_name_local"] for l in levels_filtered}
+        sc = st.selectbox("Cycle", ["Tous"] + list(cn.values()), key="f_c")
+    scid = next((k for k, v in cn.items() if v == sc), None)
+    lf = edu["levels"] if not scid else [l for l in edu["levels"] if l["cycle_id"] == scid]
+    ln = {l["level_code"]: l["level_name_local"] for l in lf}
     with c2:
-        sel_level = st.selectbox("Niveau", ["Tous"] + list(level_names.values()), key="ch_level")
-    sel_level_code = next((k for k, v in level_names.items() if v == sel_level), None)
-
-    subjects_filtered = edu["subjects"]
-    if sel_level_code:
-        subjects_filtered = [s for s in subjects_filtered if s["level_code"] == sel_level_code]
-    elif sel_cycle_id:
-        lc = [l["level_code"] for l in levels_filtered]
-        subjects_filtered = [s for s in subjects_filtered if s["level_code"] in lc]
-    subj_names = {s["subject_id"]: s["subject_name_local"] for s in subjects_filtered}
+        sl = st.selectbox("Niveau", ["Tous"] + list(ln.values()), key="f_l")
+    slc = next((k for k, v in ln.items() if v == sl), None)
+    sf = edu["subjects"]
+    if slc:
+        sf = [s for s in sf if s["level_code"] == slc]
+    elif scid:
+        lcs = [l["level_code"] for l in lf]
+        sf = [s for s in sf if s["level_code"] in lcs]
+    sn = {s["subject_id"]: s["subject_name_local"] for s in sf}
     with c3:
-        sel_subj = st.selectbox("Matière", ["Toutes"] + list(subj_names.values()), key="ch_subj")
-    sel_subj_id = next((k for k, v in subj_names.items() if v == sel_subj), None)
+        ss = st.selectbox("Matière", ["Toutes"] + list(sn.values()), key="f_s")
+    ssid = next((k for k, v in sn.items() if v == ss), None)
+    if ssid:
+        sf = [s for s in sf if s["subject_id"] == ssid]
 
-    if sel_subj_id:
-        subjects_filtered = [s for s in subjects_filtered if s["subject_id"] == sel_subj_id]
+    qc_idx = load_artefact(rd, "QC_Index.json") or {}
+    sat_report = load_artefact(rd, "SaturationReport.json") or {}
 
-    # QC Index
-    qc_index = load_artefact("QC_Index.json") or {}
-
-    # Render chapters
-    for su in subjects_filtered:
+    for su in sf:
         lname = next((l["level_name_local"] for l in edu["levels"] if l["level_code"] == su["level_code"]), "")
-        with st.expander(f"**{lname} — {su['subject_name_local']}** ({su['chapter_count']} chapitres)"):
+        with st.expander(f"**{lname} — {su['subject_name_local']}** ({su['chapter_count']} chap.)"):
             for ch in su["chapters"]:
-                ch_key = f"{su['subject_id']}_CH{str(ch['chapter_number']).zfill(2)}"
-                qc_data = qc_index.get(ch_key, {})
-                qi_count = qc_data.get("qi_count", 0)
-                qc_count = qc_data.get("qc_count", 0)
-                cov = qc_data.get("coverage", 0)
-                orphans = qc_data.get("orphans", 0)
-                status = qc_data.get("status", "⏳ En attente")
+                ck = f"{su['subject_id']}_CH{str(ch['chapter_number']).zfill(2)}"
+                qd = qc_idx.get(ck, {})
+                sd = sat_report.get(ck, {})
+                qi = qd.get("qi_count", 0)
+                qc = qd.get("qc_count", 0)
+                cv = qd.get("coverage", 0)
+                orph = qd.get("orphans", 0)
+                # STOP_RULE fields (FIX #4)
+                dqc = sd.get("delta_qc", "—")
+                orph_new = sd.get("orphans_new", "—")
+                win_n = sd.get("window_pairs_N", "—")
+                sat_status = sd.get("status", "UNKNOWN")
 
-                col_a, col_b, col_c, col_d, col_e = st.columns([4, 1, 1, 2, 1])
-                with col_a:
+                ca, cb, cc_, cd, ce, cf = st.columns([3, 0.8, 0.8, 1.5, 0.8, 1.2])
+                with ca:
                     st.markdown(f'<span style="color:#64b5f6;font-weight:700">'
                                 f'{str(ch["chapter_number"]).zfill(2)}</span> {ch["chapter_name"]}',
                                 unsafe_allow_html=True)
-                with col_b:
-                    st.markdown(f"**QC:** {qc_count}")
-                with col_c:
-                    st.markdown(f"**Qi:** {qi_count}")
-                with col_d:
-                    st.markdown(cov_bar(cov), unsafe_allow_html=True)
-                    st.caption(f"{cov}%")
-                with col_e:
-                    st.markdown(f"<small>{status}</small>", unsafe_allow_html=True)
+                with cb:
+                    st.metric("QC", qc)
+                with cc_:
+                    st.metric("Qi", qi)
+                with cd:
+                    st.markdown(cov_bar(cv), unsafe_allow_html=True)
+                    st.caption(f"{cv}%")
+                with ce:
+                    st.metric("Orph.", orph)
+                with cf:
+                    if sat_status == "SATURATED":
+                        st.markdown('<span class="sat-saturated">✅ SATURÉ</span>', unsafe_allow_html=True)
+                    elif sat_status == "CONTINUE":
+                        st.markdown('<span class="sat-continue">🔄 CONTINUE</span>', unsafe_allow_html=True)
+                    else:
+                        st.markdown('<span class="g-unk">⏳</span>', unsafe_allow_html=True)
 
-# ---- 6.5 QC DETAIL ----
-def page_qc_detail(cap):
-    st.markdown(header("🔬 QC Detail", "FRT · ARI · TRIGGERS — Vue opaque (IP protégée)"), unsafe_allow_html=True)
+                # STOP_RULE detail (FIX #4)
+                if sd:
+                    st.caption(f"ΔQC={dqc} · Orph.new={orph_new} · Window={win_n}")
 
-    qc_index = load_artefact("QC_Index.json")
-    if not qc_index:
-        st.info("⏳ **Aucune QC générée** — En attente CES HARVEST E1→E6.")
+# ──── 4.5 QC DETAIL — structured (FIX #6) ────
+def pg_qc_detail(cap, rd):
+    st.markdown(hdr("🔬 QC Detail", "FRT · ARI · TRIGGERS — Opaque (IP protégée)"), unsafe_allow_html=True)
+
+    qc_idx = load_artefact(rd, "QC_Index.json")
+    if not qc_idx:
+        st.info("⏳ **Aucune QC** — En attente CES HARVEST.")
         st.markdown("""
-        Quand les QC seront générées, cette page affichera pour chaque QC :  
-        - **QC_ID** + chapitre + contribution couverture  
-        - **FRT** : ID + SHA256 + lien artefact *(formule opaque — IP SMAXIA)*  
-        - **ARI** : ID + SHA256 + lien artefact *(formule opaque — IP SMAXIA)*  
-        - **TRIGGERS** : liste IDs + SHA256 *(mécaniques opaques)*  
-        - **Qi children** : liste des Qi associées  
-        - **Correctness** : verdict IA2 judge (PASS/FAIL)  
+        Quand les QC seront générées, cette page affichera pour chaque QC :
+        - **QC_ID** + chapitre + couverture
+        - **FRT** : ID + SHA256 + lien artefact *(formule opaque — IP SMAXIA)*
+        - **ARI** : ID + SHA256 + lien artefact *(formule opaque)*
+        - **TRIGGERS** : IDs + SHA256 *(mécaniques opaques)*
+        - **Qi children** : liste + preview texte
+        - **Correctness** : verdict judge (PASS/FAIL)
         """)
         return
 
-    # If QC_Index exists, allow selection
-    qc_ids = list(qc_index.keys())
-    sel = st.selectbox("Sélectionner QC", qc_ids)
-    if sel:
-        qc = qc_index[sel]
-        st.json(qc)
+    # List all QCs from all chapters
+    all_qcs = []
+    for ck, data in qc_idx.items():
+        for qid in data.get("qc_ids", []):
+            all_qcs.append((ck, qid))
+    if not all_qcs:
+        st.warning("QC_Index chargé mais aucun qc_id trouvé.")
+        return
 
-# ---- 6.6 MAPPING Qi→QC ----
-def page_mapping(cap):
-    st.markdown(header("🗺️ Mapping Qi → QC", "Orphelins · Couverture · Heatmap"), unsafe_allow_html=True)
+    sel_ch = st.selectbox("Chapitre", list(set(ck for ck, _ in all_qcs)), key="qcd_ch")
+    ch_qcs = [qid for ck, qid in all_qcs if ck == sel_ch]
+    sel_qc = st.selectbox("QC", ch_qcs, key="qcd_qc")
 
-    qi_index = load_artefact("Qi_Index.json")
-    if not qi_index:
+    if sel_qc:
+        detail = load_qc_detail(rd, sel_qc)
+        if detail:
+            # Structured display
+            st.markdown(f"##### QC: `{sel_qc}`")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                frt = detail.get("frt", {})
+                st.markdown(f'<div class="cc" style="border-left:3px solid #42a5f5">'
+                            f'<b style="color:#42a5f5">FRT</b><br>'
+                            f'ID: <code>{frt.get("id","N/A")}</code><br>'
+                            f'SHA: <code style="font-size:0.6rem">{frt.get("sha256","N/A")[:24]}...</code><br>'
+                            f'<span style="color:#78909c;font-size:0.7rem">Artefact: {frt.get("artefact","N/A")}</span>'
+                            f'</div>', unsafe_allow_html=True)
+            with c2:
+                ari = detail.get("ari", {})
+                st.markdown(f'<div class="cc" style="border-left:3px solid #66bb6a">'
+                            f'<b style="color:#66bb6a">ARI</b><br>'
+                            f'ID: <code>{ari.get("id","N/A")}</code><br>'
+                            f'SHA: <code style="font-size:0.6rem">{ari.get("sha256","N/A")[:24]}...</code><br>'
+                            f'<span style="color:#78909c;font-size:0.7rem">Artefact: {ari.get("artefact","N/A")}</span>'
+                            f'</div>', unsafe_allow_html=True)
+            with c3:
+                trigs = detail.get("triggers", [])
+                trig_html = "<br>".join(f'<code>{t.get("id","?")}</code>' for t in trigs[:5]) if trigs else "N/A"
+                st.markdown(f'<div class="cc" style="border-left:3px solid #ffa726">'
+                            f'<b style="color:#ffa726">TRIGGERS ({len(trigs)})</b><br>'
+                            f'{trig_html}'
+                            f'</div>', unsafe_allow_html=True)
+
+            # Qi children (FIX #6)
+            qi_ids = detail.get("qi_children", [])
+            if qi_ids:
+                st.markdown(f"##### Qi associées ({len(qi_ids)})")
+                for qiid in qi_ids[:20]:
+                    qi_data = load_qi_text(rd, qiid)
+                    preview = qi_data.get("text", "")[:120] + "..." if qi_data else "⏳ fichier non trouvé"
+                    st.markdown(f'<div class="cc"><code style="color:#64b5f6">{qiid}</code>'
+                                f'<div style="color:#b0bec5;font-size:0.78rem">{preview}</div></div>',
+                                unsafe_allow_html=True)
+
+            # Correctness
+            corr = detail.get("correctness", {})
+            if corr:
+                v = corr.get("verdict", "UNKNOWN")
+                ic, cl = gate_icon(v)
+                st.markdown(f"**Correctness judge:** {ic} <span class='{cl}'>{v}</span> "
+                            f"(confiance: {corr.get('confidence','N/A')})", unsafe_allow_html=True)
+        else:
+            st.warning(f"Fichier `QC_Details/{sel_qc}.json` non trouvé.")
+
+# ──── 4.6 MAPPING ────
+def pg_mapping(cap, rd):
+    st.markdown(hdr("🗺️ Mapping Qi → QC", "Orphelins · Couverture"), unsafe_allow_html=True)
+    qi_idx = load_artefact(rd, "Qi_Index.json")
+    cov = load_artefact(rd, "CoverageReport.json")
+    if not qi_idx and not cov:
         st.info("⏳ **Aucune Qi indexée** — En attente CES HARVEST.")
+    if cov and isinstance(cov, dict):
+        st.markdown("#### Couverture par chapitre")
+        for ck, data in sorted(cov.items()):
+            cv = data.get("coverage", 0)
+            orph = data.get("orphans", 0)
+            st.markdown(f'`{ck}` — {cov_bar(cv, "60%")} {cv}% · Orphelins: {orph}', unsafe_allow_html=True)
 
-    st.markdown("#### 🧪 Sélection")
-    exam_type = st.selectbox("Type d'épreuve", ["Tous", "Bac", "DST", "Interro", "Concours"])
-    st.caption("Quand le pipeline sera actif, cette page permettra de filtrer par niveau/matière/chapitre "
-               "et visualiser le mapping Qi→QC avec heatmap couverture.")
+# ──── 4.7 TESTS A/B (FIX #7) ────
+def pg_tests(cap, rd):
+    st.markdown(hdr("🧪 Tests Orphelins & Couverture",
+        "Test A : sujet traité | Test B : sujet nouveau"), unsafe_allow_html=True)
 
-# ---- 6.7 TESTS ----
-def page_tests(cap):
-    st.markdown(header("🧪 Tests Orphelins & Couverture",
-        "Test A : sujet déjà traité | Test B : sujet nouveau"), unsafe_allow_html=True)
+    ta, tb = st.tabs(["Test A — Sujet traité", "Test B — Sujet nouveau"])
 
-    tab_a, tab_b = st.tabs(["Test A — Sujet traité", "Test B — Sujet nouveau"])
+    with ta:
+        st.markdown("**Objectif** : pour un sujet déjà traité, vérifier **Qi_orphelin = 0**.")
+        st.markdown('<div class="warn-box">⚠️ Lit depuis <code>MappingReport_&lt;doc_id&gt;.json</code> '
+                    'dans le run directory. Aucune exécution locale.</div>', unsafe_allow_html=True)
+        doc_id = st.text_input("doc_id du sujet traité", key="ta_doc")
+        if doc_id and st.button("▶ Charger MappingReport", key="ta_btn"):
+            mr = load_artefact(rd, f"MappingReport_{doc_id}.json")
+            if mr:
+                orphans = mr.get("orphans", [])
+                total_qi = mr.get("qi_total", 0)
+                mapped = mr.get("qi_mapped", 0)
+                st.markdown(cards([
+                    (total_qi, "Qi totales"), (mapped, "Qi mappées"),
+                    (len(orphans), "Qi orphelines", "#ef5350" if orphans else "#66bb6a"),
+                    (f"{mr.get('coverage',0):.0f}%", "Couverture"),
+                ]), unsafe_allow_html=True)
+                if orphans:
+                    st.error(f"❌ **{len(orphans)} Qi orphelines** — couverture insuffisante")
+                    for o in orphans[:20]:
+                        st.markdown(f'<div class="cc"><code>{o.get("qi_id","?")}</code> — '
+                                    f'{o.get("text_preview","N/A")[:100]}</div>', unsafe_allow_html=True)
+                else:
+                    st.success("✅ **Qi_orphelin = 0** — Couverture complète !")
+                # Show chapters covered
+                chapters = mr.get("chapters_covered", [])
+                if chapters:
+                    st.markdown("**Chapitres couverts :**")
+                    for ch in chapters:
+                        st.markdown(f'<span class="b-conc">{ch}</span>', unsafe_allow_html=True)
+            else:
+                st.error(f"❌ `MappingReport_{doc_id}.json` non trouvé dans {rd}")
 
-    with tab_a:
-        st.markdown("""
-        **Objectif** : pour un sujet déjà traité par le système, vérifier que **Qi_orphelin = 0**.
-        
-        Si des Qi restent orphelines après traitement, c'est que la couverture QC est insuffisante
-        sur certains chapitres.
-        """)
-        ces = load_artefact("CES_State.json")
-        if not ces:
-            st.warning("⏳ Aucun sujet traité — CES HARVEST non lancé.")
-        else:
-            doc_id = st.text_input("doc_id du sujet traité")
-            if doc_id and st.button("▶ Lancer Test A"):
-                st.info("Recherche dans les artefacts...")
+    with tb:
+        st.markdown("**Objectif** : pour un sujet **jamais vu**, tester la couverture QC.")
+        st.markdown('<div class="warn-box">⚠️ Le pipeline CES n\'est pas exécuté localement. '
+                    'L\'upload crée une requête <code>TestRequest.json</code> dans le run directory '
+                    'pour traitement asynchrone par le pipeline.</div>', unsafe_allow_html=True)
+        uploaded = st.file_uploader("📄 Upload PDF sujet", type=["pdf"], key="tb_up")
+        if uploaded and st.button("▶ Créer TestRequest", key="tb_btn"):
+            if not rd or not os.path.isdir(rd):
+                st.error("❌ Run directory invalide — impossible de créer TestRequest.")
+            else:
+                import hashlib
+                pdf_bytes = uploaded.read()
+                pdf_sha = hashlib.sha256(pdf_bytes).hexdigest()
+                req = {
+                    "type": "TEST_B_NEW_SUBJECT",
+                    "filename": uploaded.name,
+                    "pdf_sha256": pdf_sha,
+                    "pdf_size_bytes": len(pdf_bytes),
+                    "requested_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    "status": "PENDING",
+                    "requested_by": "CEO_UI",
+                }
+                out_path = os.path.join(rd, f"TestRequest_{pdf_sha[:12]}.json")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(req, f, indent=2, ensure_ascii=False)
+                # Save PDF
+                pdf_dir = os.path.join(rd, "test_pdfs")
+                os.makedirs(pdf_dir, exist_ok=True)
+                with open(os.path.join(pdf_dir, uploaded.name), "wb") as f:
+                    f.write(pdf_bytes)
+                st.success(f"✅ TestRequest créé : `{out_path}`")
+                st.json(req)
+                st.info("Le pipeline CES traitera cette requête au prochain run. "
+                        "Résultat dans `MappingReport_{doc_id}.json`.")
 
-    with tab_b:
-        st.markdown("""
-        **Objectif** : pour un sujet **jamais vu**, vérifier que le système couvre toutes les Qi.
-        
-        Upload un PDF → extraction Qi → mapping Qi→QC → comptage orphelins → verdict **SMAXIA READY ?**
-        """)
-        ces = load_artefact("CES_State.json")
-        if not ces:
-            st.warning("⏳ Pipeline CES non actif — impossible de tester un nouveau sujet.")
-        else:
-            uploaded = st.file_uploader("📄 Upload PDF sujet", type=["pdf"])
-            if uploaded and st.button("▶ Lancer Test B"):
-                st.info("Extraction Qi en cours...")
+# ──── 4.8 GATES & INTEGRITY (FIX #2: zéro PASS hardcodé) ────
+def pg_gates(cap, rd):
+    m = cap["A_METADATA"]
+    st.markdown(hdr("🔐 Gates & Intégrité",
+        f"SHA256 · Conformité Kernel {m['kernel_version']}"), unsafe_allow_html=True)
 
-# ---- 6.8 GATES & INTEGRITY ----
-def page_gates(cap):
-    meta = cap["A_METADATA"]
-    st.markdown(header("🔐 Gates & Intégrité",
-        f"SHA256 · Déterminisme · Conformité Kernel {meta['kernel_version']}"), unsafe_allow_html=True)
-
-    # SHA256
     st.markdown("#### 🔍 Empreinte CAP")
-    st.markdown(sha_box(meta["cap_fingerprint_sha256"]), unsafe_allow_html=True)
+    st.markdown(f'<div class="sha">{m["cap_fingerprint_sha256"]}</div>', unsafe_allow_html=True)
 
-    # CAP Gates
-    st.markdown("#### 🚦 Gates CAP (structurelles)")
-    cap_gates = [
-        ("GATE_CAP_SCHEMA", "5/5 sections présentes", True),
-        ("GATE_CAP_SECTIONS_COMPLETE", "A→E complètes", True),
-        ("GATE_LEVEL_EXAM_COMPLETENESS", f"{len(cap['E_EXAMS_CONCOURS']['exams_and_contests'])}/{meta['total_classes']} entries", True),
-        ("GATE_SOURCE_TYPE_COVERAGE", f"{cap_stats(cap)['total_ch']}/{meta['total_chapters']} chapitres sourcés", True),
-        ("GATE_COUNTRY_BRANCHING", "Zéro branchement pays", True),
-        ("GATE_CAS1_ONLY", f"Doctrine {meta['source_doctrine']} active", True),
-    ]
-    for name, detail, passed in cap_gates:
-        icon = "✅" if passed else "❌"
-        cls = "pass" if passed else "fail"
-        st.markdown(f'<div class="gate-row">{icon} <span class="badge-{cls}">{name}</span> — {detail}</div>',
+    # FIX #2: ALL gates read from CHK_REPORT.json — no hardcoded PASS
+    chk = load_artefact(rd, "CHK_REPORT.json") or {}
+
+    st.markdown("#### 🚦 Gates (depuis CHK_REPORT.json)")
+    if not chk:
+        st.markdown('<div class="warn-box">⚠️ <code>CHK_REPORT.json</code> non trouvé. '
+                    'Toutes les gates = <b>UNKNOWN</b>. Règle B4 : toute gate sans artefact = FAIL automatique.</div>',
                     unsafe_allow_html=True)
-
-    # CES Gates
-    st.markdown("#### 🚦 Gates CES HARVEST")
-    ces_gates = [
-        "G0_SOURCES_VALID", "G1_SCRAPE_COMPLETE", "G2_PAIRING",
-        "G3_OCR", "G4_ATOMIZE", "G5_DEDUP", "G6_CORRECTNESS",
-        "G6.5_JUDGE", "G7_COVERAGE_MIN", "G8_SEAL_QC",
-        "G9_PREDICT", "G10_SEAL_CES",
-    ]
-    chk = load_artefact("CHK_REPORT.json") or {}
-    for g in ces_gates:
-        status = chk.get(g, None)
-        if status == "PASS":
-            st.markdown(f'<div class="gate-row">✅ <span class="badge-pass">{g}</span> — PASS</div>', unsafe_allow_html=True)
-        elif status == "FAIL":
-            st.markdown(f'<div class="gate-row">❌ <span class="badge-fail">{g}</span> — FAIL</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="gate-row">⏳ <span class="badge-pending">{g}</span> — En attente lancement</div>', unsafe_allow_html=True)
+        st.markdown('<div class="g-row">Aucune gate chargée — fournir CHK_REPORT.json dans le run directory.</div>',
+                    unsafe_allow_html=True)
+    else:
+        pass_c = fail_c = unk_c = 0
+        for name, status in chk.items():
+            ic, cl = gate_icon(status)
+            st.markdown(f'<div class="g-row">{ic} <span class="{cl}">{name}</span> — {status}</div>',
+                        unsafe_allow_html=True)
+            if status == "PASS": pass_c += 1
+            elif status == "FAIL": fail_c += 1
+            else: unk_c += 1
+        st.markdown(cards([
+            (pass_c, "PASS", "#66bb6a"), (fail_c, "FAIL", "#ef5350"), (unk_c, "UNKNOWN", "#ffa726"),
+        ]), unsafe_allow_html=True)
 
     # Determinism
     st.markdown("#### 🔄 Déterminisme")
-    det = load_artefact("DeterminismReport_3runs.json")
+    det = load_artefact(rd, "DeterminismReport_3runs.json")
     if det:
         st.json(det)
     else:
-        st.info("⏳ DeterminismReport non disponible — sera généré après 3 runs identiques.")
+        st.info("⏳ DeterminismReport non disponible — généré après 3 runs identiques.")
 
-    # Doctrine
+    # Doctrine reminder
     st.markdown("#### 📜 Doctrine")
     st.markdown("""
     🔒 **CAS 1 ONLY** — Zéro reconstruction, zéro invention  
     🔒 **Zéro Hardcode Pays** — Tout piloté par CAP  
     🔒 **Déterminisme** — 3 runs identiques requis  
-    🔒 **Scellabilité** — JSON canonical + SHA256  
-    🔒 **Auditabilité** — Artefacts + preuves + pointeurs  
     🔒 **B4** — Toute gate sans artefact = FAIL automatique  
     """)
 
-# ---- 6.9 QUARANTINE ----
-def page_quarantine(cap):
-    st.markdown(header("🔶 Quarantine Ledger", "Items en quarantaine · Résolution"), unsafe_allow_html=True)
-
-    ql = load_artefact("QuarantineLedger.json")
+# ──── 4.9 QUARANTINE ────
+def pg_quarantine(cap, rd):
+    st.markdown(hdr("🔶 Quarantine Ledger", "Items en quarantaine · Résolution"), unsafe_allow_html=True)
+    ql = load_artefact(rd, "QuarantineLedger.json")
     if not ql:
-        st.info("⏳ Aucun item en quarantaine — CES HARVEST non lancé ou 0 anomalie.")
-        st.markdown("Quand le pipeline sera actif, chaque item quarantiné sera listé avec : "
-                    "ID, gate d'origine, raison, sévérité, pointeurs (pdf_sha/page/locator), statut (open/resolved).")
+        st.info("⏳ Aucun item en quarantaine.")
         return
+    if isinstance(ql, list):
+        import pandas as pd
+        df = pd.DataFrame(ql)
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.json(ql)
 
-    import pandas as pd
-    df = pd.DataFrame(ql)
-    st.dataframe(df, use_container_width=True)
-
-# ---- 6.10 BEST IDEAS ----
-def page_ideas():
-    st.markdown(header("💡 BEST IDEAS", "Avantages irrattrapables SMAXIA — 10 idées game-changer"), unsafe_allow_html=True)
-    ideas = [
-        ("🎯 Proof of Kill Rate™", "Afficher pour chaque chapitre un indicateur public : '95.2% des questions de ton prochain examen sont couvertes par ces QC.' Aucun concurrent ne peut faire ça sans CAS 1 ONLY + gates déterministes.", "AVANTAGE IRRATTRAPABLE", "Produit"),
-        ("🌍 170 Pays = 170 Monopoles Locaux", "Chaque CAP scellé est un monopole de fait. Le premier pays activé verrouille le marché.", "WINNER TAKES ALL", "Stratégie"),
-        ("📊 PrediNote : Prédire la note", "ARI + couverture QC + taux de réussite = prédiction ±1 point. Le Saint-Graal de l'EdTech.", "VIRAL", "Produit"),
-        ("🏆 Classement National SMAX Score", "Position anonyme par matière/chapitre. Compétition saine + motivation + rétention.", "RÉTENTION x3", "Engagement"),
-        ("🔄 Boucle Virale 'Défi Chapitre'", "Défier un ami sur un chapitre. L'ami DOIT télécharger pour répondre. K-factor > 1.", "ACQUISITION GRATUITE", "Growth"),
-        ("🎓 Certification SMAXIA", "100% couverture + ≥90% réussite = certificat vérifiable QR + SHA256.", "EFFET DE RÉSEAU", "Monétisation"),
-        ("👨‍🏫 Dashboard Professeur (B2B2C)", "Dashboard gratuit pour profs : progression classe, chapitres faibles. 1 prof = 30-150 élèves.", "CANAL B2B", "Distribution"),
-        ("⚡ Mode Urgence 'J-7 Examen'", "Parcours optimisé ciblant chapitres faibles + QC tombables. Conversion maximale.", "CONVERSION PAYANTE", "Monétisation"),
-        ("🧬 Génome de l'Examen™", "Cartographie exacte des familles de questions, fréquence, poids. La carte des mines.", "PR + VIRALITÉ", "Marketing"),
-        ("🌐 API SMAXIA pour Éditeurs", "API payante : éditeurs intègrent QC/FRT/ARI. De app à infrastructure mondiale.", "PLATEFORME", "Business Model"),
-    ]
-    for title, txt, impact, cat in ideas:
-        st.markdown(f"""<div class="idea-card">
-            <div style="display:flex;justify-content:space-between;align-items:center">
-                <b style="color:#ffd740;font-size:1rem">{title}</b>
-                <span class="badge-exam">{cat}</span>
-            </div>
-            <div style="color:#b0bec5;font-size:0.85rem;margin-top:0.3rem;line-height:1.5">{txt}</div>
-            <div style="color:#64b5f6;font-weight:700;font-size:0.8rem;margin-top:0.3rem">💎 {impact}</div>
-        </div>""", unsafe_allow_html=True)
+# ──── 4.10 DEV NOTES (FIX #3: Best Ideas → LOCKED) ────
+def pg_devnotes():
+    st.markdown(hdr("🔒 Dev Notes", "Espace verrouillé — Aucun claim sans KPI scellé"), unsafe_allow_html=True)
+    st.markdown('<div class="warn-box">⚠️ <b>Page VERROUILLÉE</b> — Les idées stratégiques et claims marketing '
+                'ne peuvent être affichés que s\'ils sont adossés à un <code>KPI_Report.json</code> scellé avec preuves. '
+                'Aucun pourcentage, aucune prédiction, aucun claim sans artefact.</div>', unsafe_allow_html=True)
+    st.markdown("Cette page sera déverrouillée quand :")
+    st.markdown("""
+    - `KPI_Report.json` existe dans le run directory
+    - Chaque claim est adossé à un gate PASS + artefact SHA256
+    - Le panel a validé (GO unanime)
+    """)
 
 # ═══════════════════════════════════════════════════════════════════
-# 7. MAIN — SIDEBAR + ROUTING
+# 5. MAIN
 # ═══════════════════════════════════════════════════════════════════
 def main():
-    st.set_page_config(
-        page_title="SMAXIA Command Center",
-        page_icon="🔒",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+    st.set_page_config(page_title="SMAXIA Command Center", page_icon="🔒",
+                       layout="wide", initial_sidebar_state="expanded")
     inject_css()
 
-    cap = get_cap()
-    meta = cap["A_METADATA"]
-
-    # ---- SIDEBAR ----
+    # ── SIDEBAR ──
     with st.sidebar:
         st.markdown("### 🔒 SMAXIA Command Center")
-        st.markdown(f"**Pays:** {meta['country_code']} — {meta['country_name_local']}")
-        st.markdown(f"**Kernel:** {meta['kernel_version']}")
-        st.markdown(f"**CAP:** {meta['version']}")
-        sealed = meta.get("status") == "SEALED"
-        if sealed:
-            st.markdown('<span class="badge-seal">✓ SEALED</span>', unsafe_allow_html=True)
+
+        # Run directory
+        st.markdown("---")
+        base = st.text_input("📁 Runs base", value="./runs", key="base_dir")
+        available = scan_run_dirs(base)
+        if available:
+            sel_run = st.selectbox("Run", available, key="sel_run")
+            rd = os.path.join(base, sel_run)
         else:
-            st.markdown('<span class="badge-fail">⚠ NOT SEALED</span>', unsafe_allow_html=True)
+            rd = st.text_input("📁 Run path", value="./runs/latest", key="run_manual")
+
+        st.session_state["run_dir"] = rd
+
+        # CAP loading (FIX #1: file only, no embedded)
+        cap_path = find_cap(rd)
+        cap_upload = None
+        if not cap_path:
+            st.warning("⚠️ Aucun CAP_*.json dans le run dir.")
+            cap_upload = st.file_uploader("📄 Upload CAP JSON", type=["json"], key="cap_up")
+
+        cap = None
+        if cap_path:
+            cap = load_json(cap_path)
+            st.success(f"✅ CAP: `{os.path.basename(cap_path)}`")
+        elif cap_upload:
+            cap = json.loads(cap_upload.read().decode("utf-8"))
+            st.success(f"✅ CAP uploadé: `{cap_upload.name}`")
+
+        if cap:
+            m = cap.get("A_METADATA", {})
+            st.markdown(f"**Pays:** {m.get('country_code','?')} — {m.get('country_name_local','?')}")
+            st.markdown(f"**Kernel:** {m.get('kernel_version','?')}")
+            st.markdown(f"**CAP:** {m.get('version','?')}")
+            if m.get("status") == "SEALED":
+                st.markdown('<span class="b-seal">✓ SEALED</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="g-fail">⚠ NOT SEALED</span>', unsafe_allow_html=True)
 
         st.markdown("---")
-
-        # Run dir selector
-        run_dir = st.text_input("📁 Run directory", value="./runs/latest", key="run_dir_input",
-                                help="Chemin vers le dossier run CES (ex: ./runs/run_001)")
-        st.session_state["run_dir"] = run_dir
-
-        st.markdown("---")
-
         page = st.radio("Navigation", [
             "📊 Dashboard",
             "📚 CAP Explorer",
@@ -749,43 +750,53 @@ def main():
             "🧪 Tests (Orphelins)",
             "🔐 Gates & Intégrité",
             "🔶 Quarantine",
-            "💡 Best Ideas",
+            "🔒 Dev Notes",
         ], label_visibility="collapsed")
 
-    # ---- HEALTH BAR ----
-    chk = load_artefact("CHK_REPORT.json") or {}
-    pass_count = sum(1 for v in chk.values() if v == "PASS")
-    total_gates = max(len(chk), 12)
-    st.markdown(f"""<div style="background:#0f1329;padding:0.4rem 1rem;border-radius:8px;
-        font-size:0.75rem;color:#78909c;margin-bottom:0.5rem;
-        border:1px solid rgba(255,255,255,0.04)">
-        <b style="color:#e3f2fd">SMAXIA</b> · CAP: {meta['cap_id']} ·
-        Kernel: {meta['kernel_version']} · {meta['source_doctrine']} ·
-        Gates: <span class="badge-{'pass' if pass_count==total_gates else 'pending'}">{pass_count}/{total_gates}</span> ·
-        Quarantine: {artefact_status('QuarantineLedger.json')}
-    </div>""", unsafe_allow_html=True)
+    # ── NO CAP → STOP ──
+    if not cap:
+        st.markdown(hdr("⚠️ Aucun CAP chargé", "Placez CAP_*.json dans le run directory ou uploadez-le"), unsafe_allow_html=True)
+        st.markdown("""
+        **Pour démarrer :**  
+        1. Créez le dossier `./runs/latest/`  
+        2. Placez-y `CAP_FR.json` (ou tout `CAP_*.json` scellé)  
+        3. Rafraîchissez la page  
+        
+        *Ou utilisez l'uploader dans la sidebar.*
+        """)
+        return
 
-    # ---- ROUTING ----
-    if page == "📊 Dashboard":
-        page_dashboard(cap)
-    elif page == "📚 CAP Explorer":
-        page_cap_explorer(cap)
-    elif page == "🚀 CES Monitor":
-        page_ces_monitor(cap)
-    elif page == "📈 Chapitres & QC":
-        page_chapters_qc(cap)
-    elif page == "🔬 QC Detail (FRT/ARI)":
-        page_qc_detail(cap)
-    elif page == "🗺️ Mapping Qi→QC":
-        page_mapping(cap)
-    elif page == "🧪 Tests (Orphelins)":
-        page_tests(cap)
-    elif page == "🔐 Gates & Intégrité":
-        page_gates(cap)
-    elif page == "🔶 Quarantine":
-        page_quarantine(cap)
-    elif page == "💡 Best Ideas":
-        page_ideas()
+    # ── HEALTH BAR ──
+    m = cap["A_METADATA"]
+    chk = load_artefact(rd, "CHK_REPORT.json") or {}
+    pc = sum(1 for v in chk.values() if v == "PASS")
+    tc = len(chk) if chk else "?"
+    qs = "✅" if artefact_exists(rd, "QuarantineLedger.json") else "❌"
+    st.markdown(f'<div style="background:#0f1329;padding:0.35rem 0.9rem;border-radius:8px;'
+                f'font-size:0.72rem;color:#78909c;margin-bottom:0.5rem;'
+                f'border:1px solid rgba(255,255,255,0.04)">'
+                f'<b style="color:#e3f2fd">SMAXIA</b> · '
+                f'CAP: {m.get("cap_id","?")} · Kernel: {m.get("kernel_version","?")} · '
+                f'{m.get("source_doctrine","?")} · '
+                f'Gates: <span class="{"g-pass" if pc==tc and tc!="?" else "g-unk"}">{pc}/{tc}</span> · '
+                f'Quarantine: {qs}</div>', unsafe_allow_html=True)
+
+    # ── ROUTING ──
+    routes = {
+        "📊 Dashboard": pg_dashboard,
+        "📚 CAP Explorer": pg_cap,
+        "🚀 CES Monitor": pg_ces,
+        "📈 Chapitres & QC": pg_chapters,
+        "🔬 QC Detail (FRT/ARI)": pg_qc_detail,
+        "🗺️ Mapping Qi→QC": pg_mapping,
+        "🧪 Tests (Orphelins)": pg_tests,
+        "🔐 Gates & Intégrité": pg_gates,
+        "🔶 Quarantine": pg_quarantine,
+    }
+    if page == "🔒 Dev Notes":
+        pg_devnotes()
+    elif page in routes:
+        routes[page](cap, rd)
 
 if __name__ == "__main__":
     main()
