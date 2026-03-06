@@ -272,7 +272,8 @@ def pg_chapitres(cap,rd):
         chs=[ch for ch in su["chapters"] if not q or q.lower() in ch["chapter_name"].lower() or q.lower() in su["subject_name_local"].lower() or q.lower() in ln.lower()]
         if not chs:continue
         hdr_txt=f"{ln} — {su['subject_name_local']} ({su['chapter_count']} chap.)"
-        with st.expander(f"**{hdr_txt}** {SB(su.get('source_type',''))}"):
+        with st.expander(f"**{hdr_txt}**"):
+            st.markdown(SB(su.get('source_type','')),unsafe_allow_html=True)
             st.markdown(f'<div style="color:#546e7a;font-size:.66rem;margin-bottom:.3rem">{su.get("source_ref","")}</div>',unsafe_allow_html=True)
             for ch in chs:
                 st.markdown(f'<span style="color:var(--a);font-weight:700;font-family:JetBrains Mono;font-size:.78rem">'
